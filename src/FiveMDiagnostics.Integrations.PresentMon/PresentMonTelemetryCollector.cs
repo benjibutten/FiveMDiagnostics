@@ -101,19 +101,32 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
 
     private IEnumerable<FrameTelemetrySample> ReadNewSamples(string processName, Func<DateTimeOffset> utcNow)
     {
-        if (string.IsNullOrWhiteSpace(_currentOutputPath) || !File.Exists(_currentOutputPath))
+        string? outputPath;
+        long startPosition;
+        Dictionary<string, int>? headerIndex;
+
+        lock (_sync)
+        {
+            outputPath = _currentOutputPath;
+            startPosition = _lastFilePosition;
+            headerIndex = _headerIndex is null
+                ? null
+                : new Dictionary<string, int>(_headerIndex, StringComparer.OrdinalIgnoreCase);
+        }
+
+        if (string.IsNullOrWhiteSpace(outputPath) || !File.Exists(outputPath))
         {
             yield break;
         }
 
-        using var stream = new FileStream(_currentOutputPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        if (_lastFilePosition > stream.Length)
+        using var stream = new FileStream(outputPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        if (startPosition > stream.Length)
         {
-            _lastFilePosition = 0;
-            _headerIndex = null;
+            startPosition = 0;
+            headerIndex = null;
         }
 
-        stream.Seek(_lastFilePosition, SeekOrigin.Begin);
+        stream.Seek(startPosition, SeekOrigin.Begin);
         using var reader = new StreamReader(stream);
         string? line;
         while ((line = reader.ReadLine()) is not null)
@@ -123,21 +136,25 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
                 continue;
             }
 
-            if (_headerIndex is null)
+            if (headerIndex is null)
             {
-                _headerIndex = ParseHeader(line);
+                headerIndex = ParseHeader(line);
                 continue;
             }
 
             var cells = line.Split(',');
-            var sample = ParseSample(cells, _headerIndex, processName, utcNow());
+            var sample = ParseSample(cells, headerIndex, processName, utcNow());
             if (sample is not null)
             {
                 yield return sample;
             }
         }
 
-        _lastFilePosition = stream.Position;
+        lock (_sync)
+        {
+            _lastFilePosition = stream.Position;
+            _headerIndex = headerIndex;
+        }
     }
 
     private FrameTelemetrySample? ParseSample(string[] cells, IReadOnlyDictionary<string, int> headerIndex, string processName, DateTimeOffset fallbackTimestamp)

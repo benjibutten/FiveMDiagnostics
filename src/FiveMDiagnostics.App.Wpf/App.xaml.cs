@@ -51,7 +51,19 @@ public partial class App : System.Windows.Application
 
 	protected override void OnExit(System.Windows.ExitEventArgs e)
 	{
-		_sessionManager?.DisposeAsync().AsTask().GetAwaiter().GetResult();
+		if (_sessionManager is not null)
+		{
+			try
+			{
+				var shutdownTask = _sessionManager.DisposeAsync().AsTask();
+				_ = Task.WhenAny(shutdownTask, Task.Delay(TimeSpan.FromSeconds(2))).GetAwaiter().GetResult();
+			}
+			catch
+			{
+				// Ignore shutdown exceptions to avoid blocking process exit.
+			}
+		}
+
 		base.OnExit(e);
 	}
 }

@@ -265,7 +265,11 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
 
     private static bool TryGetBool(JsonElement element, string propertyName)
     {
-        return element.TryGetProperty(propertyName, out var property) && property.ValueKind == JsonValueKind.True
-            || (property.ValueKind == JsonValueKind.False ? false : false);
+        if (!element.TryGetProperty(propertyName, out var property))
+        {
+            return false;
+        }
+
+        return property.ValueKind == JsonValueKind.True;
     }
 }

@@ -11,6 +11,11 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
     private readonly PerformanceCounter? _totalCpuCounter;
     private readonly IReadOnlyList<PerformanceCounter> _perCoreCounters;
     private readonly Dictionary<int, ProcessMetricSnapshot> _previousSnapshots = new();
+    private readonly TimeSpan _processSampleInterval = TimeSpan.FromSeconds(2);
+
+    private DateTimeOffset _lastProcessSampleUtc = DateTimeOffset.MinValue;
+    private IReadOnlyList<ProcessActivity> _cachedTopCpu = [];
+    private IReadOnlyList<ProcessActivity> _cachedTopDisk = [];
 
     public SystemTelemetryCollector()
     {
@@ -129,30 +134,38 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
 
     private (IReadOnlyList<ProcessActivity> TopCpu, IReadOnlyList<ProcessActivity> TopDisk) SampleProcesses(DateTimeOffset timestamp)
     {
+        if (timestamp - _lastProcessSampleUtc < _processSampleInterval)
+        {
+            return (_cachedTopCpu, _cachedTopDisk);
+        }
+
         var samples = new List<ProcessActivity>();
         var activeProcessIds = new HashSet<int>();
 
         foreach (var process in Process.GetProcesses())
         {
-            if (!ProcessMetricsReader.TryRead(process, timestamp, out var snapshot))
+            using (process)
             {
-                continue;
+                if (!ProcessMetricsReader.TryRead(process, timestamp, out var snapshot))
+                {
+                    continue;
+                }
+
+                activeProcessIds.Add(snapshot.ProcessId);
+                var cpu = 0d;
+                var ioPerSecond = 0L;
+
+                if (_previousSnapshots.TryGetValue(snapshot.ProcessId, out var previous))
+                {
+                    cpu = ProcessMetricsReader.ComputeCpuPercent(snapshot, previous);
+                    ioPerSecond = ProcessMetricsReader.ComputeReadBytesPerSecond(snapshot, previous)
+                        + ProcessMetricsReader.ComputeWriteBytesPerSecond(snapshot, previous);
+                }
+
+                _previousSnapshots[snapshot.ProcessId] = snapshot;
+
+                samples.Add(new ProcessActivity(snapshot.ProcessName, snapshot.ProcessId, cpu, ioPerSecond));
             }
-
-            activeProcessIds.Add(snapshot.ProcessId);
-            var cpu = 0d;
-            var ioPerSecond = 0L;
-
-            if (_previousSnapshots.TryGetValue(snapshot.ProcessId, out var previous))
-            {
-                cpu = ProcessMetricsReader.ComputeCpuPercent(snapshot, previous);
-                ioPerSecond = ProcessMetricsReader.ComputeReadBytesPerSecond(snapshot, previous)
-                    + ProcessMetricsReader.ComputeWriteBytesPerSecond(snapshot, previous);
-            }
-
-            _previousSnapshots[snapshot.ProcessId] = snapshot;
-
-            samples.Add(new ProcessActivity(snapshot.ProcessName, snapshot.ProcessId, cpu, ioPerSecond));
         }
 
         foreach (var staleProcessId in _previousSnapshots.Keys.Where(processId => !activeProcessIds.Contains(processId)).ToArray())
@@ -160,8 +173,10 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
             _previousSnapshots.Remove(staleProcessId);
         }
 
-        return (
-            samples.OrderByDescending(item => item.CpuPercent).Take(5).ToArray(),
-            samples.OrderByDescending(item => item.IoBytesPerSecond).Take(5).ToArray());
+        _cachedTopCpu = samples.OrderByDescending(item => item.CpuPercent).Take(5).ToArray();
+        _cachedTopDisk = samples.OrderByDescending(item => item.IoBytesPerSecond).Take(5).ToArray();
+        _lastProcessSampleUtc = timestamp;
+
+        return (_cachedTopCpu, _cachedTopDisk);
     }
 }

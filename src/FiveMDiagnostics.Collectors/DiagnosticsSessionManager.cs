@@ -27,6 +27,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private Task? _pumpTask;
     private Task? _finalizeTask;
     private Task[] _collectorTasks = [];
+    private volatile bool _isSessionActive;
 
     public DiagnosticsSessionManager(
         DiagnosticsSettings settings,
@@ -54,7 +55,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
     public event EventHandler<IncidentRecord>? IncidentCompleted;
 
-    public bool IsSessionActive { get; private set; }
+    public bool IsSessionActive => _isSessionActive;
 
     public DiagnosticsSettings Settings => _settings;
 
@@ -112,7 +113,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         _pumpTask = Task.Run(() => PumpAsync(_channel.Reader, _sessionCts.Token));
         _finalizeTask = Task.Run(() => FinalizeLoopAsync(_sessionCts.Token));
         _collectorTasks = _collectors.Select(collector => Task.Run(() => RunCollectorSafeAsync(collector, context, _sessionCts.Token))).ToArray();
-        IsSessionActive = true;
+        _isSessionActive = true;
 
         Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), $"Session started for profile '{_settings.ServerProfile.Name}'.");
         OnStateChanged();
@@ -171,7 +172,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         _sessionCts = null;
         _channel = null;
         _collectorTasks = [];
-        IsSessionActive = false;
+        _isSessionActive = false;
 
         Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), "Session stopped.");
         OnStateChanged();

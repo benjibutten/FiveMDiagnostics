@@ -30,30 +30,43 @@ public sealed class FiveMTargetProcessResolver : ITargetProcessResolver
 
     private static TargetProcessInfo? Scan(DateTimeOffset now)
     {
-        var candidates = Process.GetProcesses()
-            .Where(process => CandidateTokens.Any(token => process.ProcessName.Contains(token, StringComparison.OrdinalIgnoreCase)))
-            .OrderByDescending(process => process.ProcessName.Contains("GTAProcess", StringComparison.OrdinalIgnoreCase))
-            .ThenByDescending(process => process.ProcessName.StartsWith("FiveM", StringComparison.OrdinalIgnoreCase))
-            .ToArray();
+        TargetProcessInfo? bestMatch = null;
+        var bestScore = int.MinValue;
 
-        foreach (var process in candidates)
+        foreach (var process in Process.GetProcesses())
         {
-            try
+            using (process)
             {
-                if (process.HasExited)
+                try
                 {
-                    continue;
-                }
+                    if (process.HasExited)
+                    {
+                        continue;
+                    }
 
-                return new TargetProcessInfo(process.Id, process.ProcessName, TryGetExecutablePath(process), now);
-            }
-            catch
-            {
-                // Ignore inaccessible or transient processes.
+                    var processName = process.ProcessName;
+                    if (!CandidateTokens.Any(token => processName.Contains(token, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        continue;
+                    }
+
+                    var score = Score(processName);
+                    if (score <= bestScore)
+                    {
+                        continue;
+                    }
+
+                    bestScore = score;
+                    bestMatch = new TargetProcessInfo(process.Id, processName, TryGetExecutablePath(process), now);
+                }
+                catch
+                {
+                    // Ignore inaccessible or transient processes.
+                }
             }
         }
 
-        return null;
+        return bestMatch;
     }
 
     private static bool IsRunning(TargetProcessInfo? processInfo)
@@ -65,12 +78,29 @@ public sealed class FiveMTargetProcessResolver : ITargetProcessResolver
 
         try
         {
-            return !Process.GetProcessById(processInfo.ProcessId).HasExited;
+            using var process = Process.GetProcessById(processInfo.ProcessId);
+            return !process.HasExited;
         }
         catch
         {
             return false;
         }
+    }
+
+    private static int Score(string processName)
+    {
+        var score = 0;
+        if (processName.Contains("GTAProcess", StringComparison.OrdinalIgnoreCase))
+        {
+            score += 2;
+        }
+
+        if (processName.StartsWith("FiveM", StringComparison.OrdinalIgnoreCase))
+        {
+            score += 1;
+        }
+
+        return score;
     }
 
     private static string? TryGetExecutablePath(Process process)

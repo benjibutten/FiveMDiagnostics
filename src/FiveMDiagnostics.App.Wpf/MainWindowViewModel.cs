@@ -14,6 +14,7 @@ public sealed class MainWindowViewModel : ObservableObject
     private readonly SettingsStore _settingsStore;
     private readonly IUserDialogService _dialogService;
     private readonly Dispatcher _dispatcher;
+    private readonly DispatcherTimer _stateRefreshTimer;
 
     private IncidentRecord? _selectedIncident;
     private bool _isSessionActive;
@@ -27,6 +28,7 @@ public sealed class MainWindowViewModel : ObservableObject
     private string _artifactDirectory = string.Empty;
     private bool _includeSensitiveFields;
     private bool _includeAttachedArtifacts;
+    private bool _stateRefreshPending;
 
     public MainWindowViewModel(DiagnosticsSessionManager sessionManager, SettingsStore settingsStore, DiagnosticsSettings settings, IUserDialogService dialogService)
     {
@@ -34,6 +36,11 @@ public sealed class MainWindowViewModel : ObservableObject
         _settingsStore = settingsStore;
         _dialogService = dialogService;
         _dispatcher = System.Windows.Application.Current.Dispatcher;
+        _stateRefreshTimer = new DispatcherTimer(DispatcherPriority.Background, _dispatcher)
+        {
+            Interval = TimeSpan.FromMilliseconds(250),
+        };
+        _stateRefreshTimer.Tick += (_, _) => FlushStateRefresh();
         Settings = settings;
 
         _serverProfileName = settings.ServerProfile.Name;
@@ -297,7 +304,7 @@ public sealed class MainWindowViewModel : ObservableObject
 
     private void OnSessionStateChanged(object? sender, EventArgs e)
     {
-        _dispatcher.Invoke(RefreshState);
+        RequestStateRefresh();
     }
 
     private void OnStatusReported(object? sender, DiagnosticStatusEntry status)
@@ -334,5 +341,33 @@ public sealed class MainWindowViewModel : ObservableObject
         MarkStutterCommand.RaiseCanExecuteChanged();
         MarkSevereStutterCommand.RaiseCanExecuteChanged();
         ExportSelectedIncidentCommand.RaiseCanExecuteChanged();
+    }
+
+    private void RequestStateRefresh()
+    {
+        if (_dispatcher.CheckAccess())
+        {
+            _stateRefreshPending = true;
+            if (!_stateRefreshTimer.IsEnabled)
+            {
+                _stateRefreshTimer.Start();
+            }
+
+            return;
+        }
+
+        _dispatcher.BeginInvoke(RequestStateRefresh);
+    }
+
+    private void FlushStateRefresh()
+    {
+        if (!_stateRefreshPending)
+        {
+            _stateRefreshTimer.Stop();
+            return;
+        }
+
+        _stateRefreshPending = false;
+        RefreshState();
     }
 }

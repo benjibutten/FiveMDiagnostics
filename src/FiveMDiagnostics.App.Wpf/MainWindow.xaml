@@ -215,7 +215,7 @@
                             </Grid.RowDefinitions>
 
                             <TextBlock Text="Incident Summary" FontSize="22" FontWeight="Bold" />
-                            <TextBox Grid.Row="1" Text="{Binding SelectedIncidentSummary}" Margin="0,14,0,18" IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" />
+                            <TextBox Grid.Row="1" Text="{Binding SelectedIncidentSummary, Mode=OneWay}" Margin="0,14,0,18" IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" />
 
                             <TextBlock Grid.Row="2" Text="Ranked Hypotheses" FontSize="22" FontWeight="Bold" />
                             <ListView Grid.Row="3" ItemsSource="{Binding SelectedHypotheses}" Margin="0,14,0,0">
