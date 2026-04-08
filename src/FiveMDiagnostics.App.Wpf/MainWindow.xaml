@@ -11,7 +11,8 @@
         MinWidth="1380"
         WindowStartupLocation="CenterScreen"
         Background="#14110F"
-        FontFamily="Bahnschrift SemiCondensed">
+        FontFamily="Bahnschrift SemiCondensed"
+        Icon="AppIcon.ico">
     <Window.Resources>
         <SolidColorBrush x:Key="ShellBrush" Color="#14110F" />
         <SolidColorBrush x:Key="PanelBrush" Color="#211C1A" />
@@ -30,34 +31,7 @@
             <Setter Property="BorderThickness" Value="1" />
         </Style>
 
-        <Style TargetType="Button">
-            <Setter Property="Padding" Value="14,10" />
-            <Setter Property="Margin" Value="0,0,10,10" />
-            <Setter Property="Foreground" Value="#14110F" />
-            <Setter Property="Background" Value="{StaticResource AccentBrush}" />
-            <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}" />
-            <Setter Property="FontSize" Value="14" />
-            <Setter Property="FontWeight" Value="SemiBold" />
-        </Style>
 
-        <Style TargetType="TextBox">
-            <Setter Property="Background" Value="#181412" />
-            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
-            <Setter Property="BorderBrush" Value="#473C37" />
-            <Setter Property="Padding" Value="10,7" />
-            <Setter Property="Margin" Value="0,4,0,10" />
-        </Style>
-
-        <Style TargetType="CheckBox">
-            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
-            <Setter Property="Margin" Value="0,0,0,8" />
-        </Style>
-
-        <Style TargetType="ListView">
-            <Setter Property="Background" Value="#181412" />
-            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}" />
-            <Setter Property="BorderBrush" Value="#473C37" />
-        </Style>
     </Window.Resources>
 
     <Grid Margin="20">
@@ -185,7 +159,7 @@
                 <Border Grid.Row="0" Style="{StaticResource PanelStyle}">
                     <DockPanel>
                         <TextBlock DockPanel.Dock="Top" Text="Recent Incidents" FontSize="22" FontWeight="Bold" Margin="0,0,0,14" />
-                        <ListView ItemsSource="{Binding Incidents}" SelectedItem="{Binding SelectedIncident}" HorizontalContentAlignment="Stretch">
+                        <ListView ItemsSource="{Binding Incidents}" SelectedItem="{Binding SelectedIncident}" HorizontalContentAlignment="Stretch" ItemContainerStyle="{StaticResource GridViewItemStyle}">
                             <ListView.View>
                                 <GridView>
                                     <GridViewColumn Header="Marked" Width="150" DisplayMemberBinding="{Binding Marker.MarkedAt, StringFormat={}{0:yyyy-MM-dd HH:mm:ss}}" />

@@ -16,7 +16,7 @@ public sealed class TrayIconService : IDisposable
 
         _notifyIcon = new Forms.NotifyIcon
         {
-            Icon = SystemIcons.Application,
+            Icon = LoadEmbeddedIcon(),
             Text = "FiveM Diagnostics",
             Visible = true,
             ContextMenuStrip = _menu,
@@ -39,5 +39,13 @@ public sealed class TrayIconService : IDisposable
         _notifyIcon.Visible = false;
         _notifyIcon.Dispose();
         _menu.Dispose();
+    }
+
+    private static Icon LoadEmbeddedIcon()
+    {
+        var info = System.Windows.Application.GetResourceStream(
+            new Uri("pack://application:,,,/AppIcon.ico", UriKind.Absolute));
+
+        return info?.Stream is { } stream ? new Icon(stream) : SystemIcons.Application;
     }
 }
