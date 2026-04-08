@@ -1,0 +1,21 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\FiveMDiagnostics.Core\FiveMDiagnostics.Core.csproj" />
+    <ProjectReference Include="..\FiveMDiagnostics.Collectors\FiveMDiagnostics.Collectors.csproj" />
+    <ProjectReference Include="..\FiveMDiagnostics.Analysis\FiveMDiagnostics.Analysis.csproj" />
+    <ProjectReference Include="..\FiveMDiagnostics.Export\FiveMDiagnostics.Export.csproj" />
+    <ProjectReference Include="..\FiveMDiagnostics.Integrations.PresentMon\FiveMDiagnostics.Integrations.PresentMon.csproj" />
+    <ProjectReference Include="..\FiveMDiagnostics.Integrations.Obs\FiveMDiagnostics.Integrations.Obs.csproj" />
+    <ProjectReference Include="..\FiveMDiagnostics.Integrations.Etw\FiveMDiagnostics.Integrations.Etw.csproj" />
+    <ProjectReference Include="..\FiveMDiagnostics.Fakes\FiveMDiagnostics.Fakes.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,16 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/FiveMDiagnostics.Analysis/FiveMDiagnostics.Analysis.csproj" />
+    <Project Path="src/FiveMDiagnostics.App.Wpf/FiveMDiagnostics.App.Wpf.csproj" />
+    <Project Path="src/FiveMDiagnostics.Collectors/FiveMDiagnostics.Collectors.csproj" />
+    <Project Path="src/FiveMDiagnostics.Core/FiveMDiagnostics.Core.csproj" />
+    <Project Path="src/FiveMDiagnostics.Export/FiveMDiagnostics.Export.csproj" />
+    <Project Path="src/FiveMDiagnostics.Fakes/FiveMDiagnostics.Fakes.csproj" />
+    <Project Path="src/FiveMDiagnostics.Integrations.Etw/FiveMDiagnostics.Integrations.Etw.csproj" />
+    <Project Path="src/FiveMDiagnostics.Integrations.Obs/FiveMDiagnostics.Integrations.Obs.csproj" />
+    <Project Path="src/FiveMDiagnostics.Integrations.PresentMon/FiveMDiagnostics.Integrations.PresentMon.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/FiveMDiagnostics.Tests/FiveMDiagnostics.Tests.csproj" />
+  </Folder>
+</Solution>
