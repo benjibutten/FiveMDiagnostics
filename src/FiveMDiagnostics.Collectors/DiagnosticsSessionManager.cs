@@ -282,7 +282,6 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         }
 
         StatusReported?.Invoke(this, entry);
-        OnStateChanged();
     }
 
     public async ValueTask DisposeAsync()

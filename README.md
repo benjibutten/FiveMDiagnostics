@@ -2,16 +2,16 @@
 
 FiveM Diagnostics is a Windows-only WPF desktop app for collecting local evidence around intermittent FiveM stutter incidents and ranking likely root causes.
 
-The default server profile is `The Path`, but the collection and analysis pipeline is designed to stay generic for other FiveM servers.
+The collection and analysis pipeline is designed to be generic and work with any FiveM server.
 
 ## What v1 does
 
 - WPF desktop app with tray mode
-- MVVM-based UI with global hotkeys
+- MVVM-based UI with tray context menu controls
 - Background collectors that only sample while a FiveM/GTA process is active
 - Ring buffer retention of at least 90 seconds in memory
 - Incident materialization with 30 seconds before and 60 seconds after a marker
-- PresentMon integration with safe fallback when the executable is missing
+- PresentMon integration with safe fallback and automatic discovery when the executable is installed
 - OBS websocket polling with safe fallback when OBS is absent
 - System, process and basic network telemetry on a unified timeline
 - Artifact import for `net_statsFile` CSV, profiler JSON, resmon/log evidence and ETL files
@@ -34,7 +34,7 @@ The analysis engine ranks these categories:
 
 ## Solution layout
 
-- `src/FiveMDiagnostics.App.Wpf`: desktop UI, tray mode, hotkeys, app composition
+- `src/FiveMDiagnostics.App.Wpf`: desktop UI, tray mode and app composition
 - `src/FiveMDiagnostics.Core`: domain models, settings, interfaces, ring buffer, incident materializer
 - `src/FiveMDiagnostics.Collectors`: session orchestration and local collectors
 - `src/FiveMDiagnostics.Analysis`: correlation engine and artifact parsers
@@ -76,16 +76,18 @@ Settings are stored locally at:
 
 The UI lets you edit:
 
-- server profile name
-- probe host/IP for lightweight RTT probing
-- endpoint hint
-- PresentMon executable path
-- working/export/artifact directories
+- optional server name used in exports and incident labels
+- optional ping host/IP for lightweight RTT probing
+- optional endpoint label for detected connections
+- language
+- advanced PresentMon/path settings when needed
 - export redaction toggles
 
 ### PresentMon notes
 
 The collector is designed to be resilient if PresentMon is not installed or not configured.
+
+If no path is configured, the app first tries to find `PresentMon.exe` through `PATH` and common install locations.
 
 Default argument template:
 
@@ -100,9 +102,10 @@ If you use a newer PresentMon build with a different CLI shape, update the argum
 ### Basic mode
 
 - No admin required
+- One-click start with the default settings
 - Collects system/process/network telemetry
 - Polls OBS if available
-- Uses PresentMon only if configured
+- Uses PresentMon only if it is configured or found automatically
 - Intended to stay low overhead
 
 ### Deep mode
@@ -112,11 +115,13 @@ If you use a newer PresentMon build with a different CLI shape, update the argum
 - Attempts to save an ETL file in the session working directory
 - If WPR requires elevation, the app reports that cleanly instead of crashing
 
-## Hotkeys
+All setup fields are optional. The app can start a session with the default paths and no network hints configured.
 
-- `Ctrl+Alt+F9`: mark stutter
-- `Ctrl+Alt+F10`: mark severe stutter
-- `Ctrl+Alt+F11`: export latest incident
+## Tray controls
+
+- right-click the tray icon to start or stop a session
+- right-click the tray icon to mark normal or severe stutter while a session is active
+- right-click the tray icon to export the latest incident or reopen the main window
 
 ## Export bundle
 

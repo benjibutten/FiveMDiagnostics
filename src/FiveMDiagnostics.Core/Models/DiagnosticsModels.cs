@@ -2,17 +2,6 @@ using System.Text.Json.Serialization;
 
 namespace FiveMDiagnostics.Core;
 
-[Flags]
-public enum HotKeyModifiers : uint
-{
-    None = 0,
-    Alt = 0x0001,
-    Control = 0x0002,
-    Shift = 0x0004,
-    Win = 0x0008,
-    NoRepeat = 0x4000,
-}
-
 public enum IncidentSeverity
 {
     Normal,
@@ -49,18 +38,9 @@ public enum StatusLevel
     Error,
 }
 
-public sealed record HotKeyBinding(uint VirtualKey, HotKeyModifiers Modifiers);
-
-public sealed record HotKeyOptions
-{
-    public HotKeyBinding MarkStutter { get; set; } = new(0x78, HotKeyModifiers.Control | HotKeyModifiers.Alt | HotKeyModifiers.NoRepeat);
-    public HotKeyBinding MarkSevereStutter { get; set; } = new(0x79, HotKeyModifiers.Control | HotKeyModifiers.Alt | HotKeyModifiers.NoRepeat);
-    public HotKeyBinding ExportCurrentIncident { get; set; } = new(0x7A, HotKeyModifiers.Control | HotKeyModifiers.Alt | HotKeyModifiers.NoRepeat);
-}
-
 public sealed record ServerProfile
 {
-    public string Name { get; set; } = "The Path";
+    public string Name { get; set; } = string.Empty;
     public string? ProbeHost { get; set; }
     public string? EndpointHint { get; set; }
 }
@@ -109,7 +89,7 @@ public sealed record DiagnosticsSettings
     public ObsOptions Obs { get; set; } = new();
     public DeepCaptureOptions DeepCapture { get; set; } = new();
     public PrivacyOptions Privacy { get; set; } = new();
-    public HotKeyOptions HotKeys { get; set; } = new();
+    public string Language { get; set; } = "en";
 
     public static DiagnosticsSettings CreateDefault()
     {

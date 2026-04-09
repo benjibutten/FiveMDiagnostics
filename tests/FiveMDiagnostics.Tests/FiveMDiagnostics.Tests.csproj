@@ -17,6 +17,7 @@
     <ProjectReference Include="..\..\src\FiveMDiagnostics.Analysis\FiveMDiagnostics.Analysis.csproj" />
     <ProjectReference Include="..\..\src\FiveMDiagnostics.Export\FiveMDiagnostics.Export.csproj" />
     <ProjectReference Include="..\..\src\FiveMDiagnostics.Fakes\FiveMDiagnostics.Fakes.csproj" />
+    <ProjectReference Include="..\..\src\FiveMDiagnostics.Integrations.PresentMon\FiveMDiagnostics.Integrations.PresentMon.csproj" />
     <Using Include="Xunit" />
   </ItemGroup>
 

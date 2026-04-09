@@ -8,6 +8,8 @@ using FiveMDiagnostics.Core;
 public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposable
 {
     private readonly object _sync = new();
+    private string? _resolvedExecutablePath;
+    private bool _reportedAutoDetectedExecutable;
     private bool _reportedMissingExecutable;
     private int? _currentProcessId;
     private string? _currentOutputPath;
@@ -22,8 +24,9 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
     {
         while (!cancellationToken.IsCancellationRequested)
         {
-            var executablePath = context.Settings.PresentMon.ExecutablePath;
-            if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath))
+            var discovery = PresentMonLocator.Discover(context.Settings.PresentMon.ExecutablePath);
+            var executablePath = discovery.ExecutablePath;
+            if (string.IsNullOrWhiteSpace(executablePath))
             {
                 if (!_reportedMissingExecutable)
                 {
@@ -33,6 +36,19 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
 
                 await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
                 continue;
+            }
+
+            if (!string.Equals(_resolvedExecutablePath, executablePath, StringComparison.OrdinalIgnoreCase))
+            {
+                StopCapture();
+                _resolvedExecutablePath = executablePath;
+            }
+
+            _reportedMissingExecutable = false;
+            if (discovery.Kind == PresentMonDiscoveryKind.AutoDetected && !_reportedAutoDetectedExecutable)
+            {
+                _reportedAutoDetectedExecutable = true;
+                context.StatusSink.Report(StatusLevel.Info, Name, $"PresentMon hittades automatiskt på {executablePath}.");
             }
 
             var target = context.ProcessResolver.TryGetTargetProcess();

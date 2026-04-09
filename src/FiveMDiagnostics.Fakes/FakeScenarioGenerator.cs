@@ -45,7 +45,7 @@ public static class FakeScenarioGenerator
             165,
             "Enabled",
             kind == FakeScenarioKind.ObsGpuContention,
-            "The Path",
+            "Example Server",
             markerTime.AddSeconds(-30),
             markerTime.AddSeconds(60));
 
@@ -104,7 +104,7 @@ public static class FakeScenarioGenerator
             events.Add(new SystemTelemetrySample(timestamp, 43, new Dictionary<string, double> { ["0"] = 39, ["1"] = 44 }, 49, 16384, [], []));
             events.Add(new ProcessTelemetrySample(timestamp, 9152, "FiveM_b2944_GTAProcess", 27, 6L * 1024 * 1024 * 1024, 5L * 1024 * 1024 * 1024, 138, 3 * 1024 * 1024, 1 * 1024 * 1024));
             events.Add(new ObsTelemetrySample(timestamp, false, null, null, null, null, null, null, false, false));
-            events.Add(new NetworkEndpointSample(timestamp, 9152, [new RemoteEndpointInfo("TCP", "203.0.113.14", 30120, "The Path")], [30120]));
+            events.Add(new NetworkEndpointSample(timestamp, 9152, [new RemoteEndpointInfo("TCP", "203.0.113.14", 30120, "Example Server")], [30120]));
             events.Add(new NetworkProbeSample(timestamp, "203.0.113.14", offset is >= 0 and <= 10 ? 145 + offset : 28, true));
         }
 

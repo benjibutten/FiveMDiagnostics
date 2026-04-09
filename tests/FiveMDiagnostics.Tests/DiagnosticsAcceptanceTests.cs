@@ -96,7 +96,7 @@ public sealed class DiagnosticsAcceptanceTests
             165,
             "Enabled",
             true,
-            "The Path",
+            "Example Server",
             baseTime.AddSeconds(-30),
             baseTime.AddSeconds(60));
     }

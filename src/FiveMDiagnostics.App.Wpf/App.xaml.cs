@@ -1,4 +1,5 @@
-﻿using FiveMDiagnostics.Analysis;
+﻿using System.Globalization;
+using FiveMDiagnostics.Analysis;
 using FiveMDiagnostics.Collectors;
 using FiveMDiagnostics.Core;
 using FiveMDiagnostics.Export;
@@ -18,6 +19,13 @@ public partial class App : System.Windows.Application
 
 		var settingsStore = new SettingsStore();
 		var settings = await settingsStore.LoadAsync().ConfigureAwait(true);
+
+		if (!string.IsNullOrEmpty(settings.Language))
+		{
+			var culture = new CultureInfo(settings.Language);
+			Thread.CurrentThread.CurrentUICulture = culture;
+			CultureInfo.DefaultThreadCurrentUICulture = culture;
+		}
 
 		var sessionManager = new DiagnosticsSessionManager(
 			settings,
