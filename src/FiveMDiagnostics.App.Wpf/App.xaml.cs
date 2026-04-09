@@ -1,5 +1,6 @@
 ﻿using System.Globalization;
 using FiveMDiagnostics.Analysis;
+using FiveMDiagnostics.App.Wpf.Properties;
 using FiveMDiagnostics.Collectors;
 using FiveMDiagnostics.Core;
 using FiveMDiagnostics.Export;
@@ -12,20 +13,23 @@ namespace FiveMDiagnostics.App.Wpf;
 public partial class App : System.Windows.Application
 {
 	private DiagnosticsSessionManager? _sessionManager;
+	private SingleInstanceManager? _singleInstanceManager;
 
 	protected override async void OnStartup(System.Windows.StartupEventArgs e)
 	{
 		base.OnStartup(e);
 
+		_singleInstanceManager = new SingleInstanceManager();
+		if (!_singleInstanceManager.IsPrimaryInstance)
+		{
+			await SingleInstanceManager.SignalFirstInstanceAsync().ConfigureAwait(true);
+			Shutdown();
+			return;
+		}
+
 		var settingsStore = new SettingsStore();
 		var settings = await settingsStore.LoadAsync().ConfigureAwait(true);
-
-		if (!string.IsNullOrEmpty(settings.Language))
-		{
-			var culture = new CultureInfo(settings.Language);
-			Thread.CurrentThread.CurrentUICulture = culture;
-			CultureInfo.DefaultThreadCurrentUICulture = culture;
-		}
+		ApplyCulture(settings.Language);
 
 		var sessionManager = new DiagnosticsSessionManager(
 			settings,
@@ -54,6 +58,14 @@ public partial class App : System.Windows.Application
 		var viewModel = new MainWindowViewModel(sessionManager, settingsStore, settings, new UserDialogService());
 		var mainWindow = new MainWindow(viewModel);
 		MainWindow = mainWindow;
+		_singleInstanceManager.ActivationRequested += (_, _) => Dispatcher.Invoke(() =>
+		{
+			if (MainWindow is MainWindow shell)
+			{
+				shell.ActivateFromExternalRequest();
+			}
+		});
+		_singleInstanceManager.StartListening();
 		mainWindow.Show();
 	}
 
@@ -72,7 +84,29 @@ public partial class App : System.Windows.Application
 			}
 		}
 
+		if (_singleInstanceManager is not null)
+		{
+			try
+			{
+				_singleInstanceManager.DisposeAsync().AsTask().GetAwaiter().GetResult();
+			}
+			catch
+			{
+				// Ignore single-instance shutdown exceptions.
+			}
+		}
+
 		base.OnExit(e);
+	}
+
+	private static void ApplyCulture(string? language)
+	{
+		var culture = new CultureInfo(string.IsNullOrWhiteSpace(language) ? "en" : language);
+		Strings.Culture = culture;
+		Thread.CurrentThread.CurrentUICulture = culture;
+		Thread.CurrentThread.CurrentCulture = culture;
+		CultureInfo.DefaultThreadCurrentUICulture = culture;
+		CultureInfo.DefaultThreadCurrentCulture = culture;
 	}
 }
 

@@ -82,6 +82,24 @@ public partial class MainWindow : Window
         Activate();
     }
 
+    public void ActivateFromExternalRequest()
+    {
+        if (!IsVisible || !ShowInTaskbar || WindowState == WindowState.Minimized)
+        {
+            RestoreFromTray();
+        }
+        else
+        {
+            Show();
+            WindowState = WindowState.Normal;
+            Activate();
+        }
+
+        Topmost = true;
+        Topmost = false;
+        Focus();
+    }
+
     private void HideToTray(string message)
     {
         ShowInTaskbar = false;

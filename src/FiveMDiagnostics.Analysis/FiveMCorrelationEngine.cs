@@ -18,6 +18,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         var artifacts = incident.GetEvents<ArtifactEvidence>();
 
         var metrics = BuildFrameMetrics(frameSamples);
+        var suspectedProcesses = AnalyzeSuspiciousProcesses(systemSamples);
         var hypotheses = new List<HypothesisScore>();
 
         AddObsHypothesis(hypotheses, metrics, obsSamples);
@@ -25,7 +26,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         AddResourceHypothesis(hypotheses, metrics, processSamples, artifacts, obsSamples, systemSamples);
         AddNetworkHypothesis(hypotheses, metrics, networkProbes, networkEndpoints, systemSamples, obsSamples);
         AddDiskHypothesis(hypotheses, metrics, processSamples, systemSamples, artifacts);
-        AddExternalProcessHypothesis(hypotheses, systemSamples);
+        AddExternalProcessHypothesis(hypotheses, suspectedProcesses);
         AddOsLatencyHypothesis(hypotheses, metrics, artifacts, systemSamples, obsSamples);
         AddCorruptionHypothesis(hypotheses, artifacts);
 
@@ -41,15 +42,16 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                 ["Det fanns inte tillräckligt med samstämmig telemetry för en säker klassificering."]));
         }
 
-        var highlights = BuildHighlights(incident, metrics, hypotheses.First(), artifacts, obsSamples, networkProbes);
+        var highlights = BuildHighlights(incident, metrics, hypotheses.First(), artifacts, obsSamples, networkProbes, suspectedProcesses);
         var top = hypotheses[0];
-        var summary = BuildSummary(top, metrics, obsSamples, artifacts, networkProbes);
+        var summary = BuildSummary(top, metrics, obsSamples, artifacts, networkProbes, suspectedProcesses);
 
         return new IncidentAnalysis(
             hypotheses,
             top.Category == RootCauseCategory.InsufficientEvidence,
             summary,
-            highlights);
+            highlights,
+            suspectedProcesses);
     }
 
     private static FrameMetrics BuildFrameMetrics(IReadOnlyList<FrameTelemetrySample> frameSamples)
@@ -283,29 +285,22 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         }
     }
 
-    private static void AddExternalProcessHypothesis(List<HypothesisScore> hypotheses, IReadOnlyList<SystemTelemetrySample> systemSamples)
+    private static void AddExternalProcessHypothesis(List<HypothesisScore> hypotheses, IReadOnlyList<SuspectedProcessImpact> suspectedProcesses)
     {
-        var offenders = systemSamples
-            .SelectMany(item => item.TopCpuProcesses.Concat(item.TopDiskProcesses))
-            .Where(item =>
-                !item.ProcessName.Contains("FiveM", StringComparison.OrdinalIgnoreCase) &&
-                !item.ProcessName.Contains("obs", StringComparison.OrdinalIgnoreCase) &&
-                (item.CpuPercent >= 20 || item.IoBytesPerSecond >= 20 * 1024 * 1024))
-            .GroupBy(item => item.ProcessName)
-            .OrderByDescending(group => group.Max(entry => Math.Max(entry.CpuPercent, ToMegabytes(entry.IoBytesPerSecond))))
-            .ToArray();
-
-        if (offenders.Length == 0)
+        if (suspectedProcesses.Count == 0)
         {
             return;
         }
 
-        var evidence = offenders
+        var evidence = suspectedProcesses
             .Take(3)
-            .Select(group => $"Processen {group.Key} konkurrerade med CPU/disk under incidenten.")
+            .Select(item => $"{item.ProcessName} misstänks störa med {item.Reason.ToLowerInvariant()} (peak CPU {item.PeakCpuPercent:F0}%, disk {item.PeakIoMegabytesPerSecond:F1} MB/s).")
             .ToArray();
 
-        hypotheses.Add(new HypothesisScore(RootCauseCategory.ExternalProcessInterference, 0.55, evidence));
+        hypotheses.Add(new HypothesisScore(
+            RootCauseCategory.ExternalProcessInterference,
+            Math.Min(0.45 + (suspectedProcesses.Count * 0.06), 0.78),
+            evidence));
     }
 
     private static void AddOsLatencyHypothesis(List<HypothesisScore> hypotheses, FrameMetrics metrics, IReadOnlyList<ArtifactEvidence> artifacts, IReadOnlyList<SystemTelemetrySample> systemSamples, IReadOnlyList<ObsTelemetrySample> obsSamples)
@@ -348,7 +343,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             corruption.Select(item => item.Summary).Distinct().ToArray()));
     }
 
-    private static IReadOnlyList<TimelineHighlight> BuildHighlights(IncidentRecord incident, FrameMetrics metrics, HypothesisScore top, IReadOnlyList<ArtifactEvidence> artifacts, IReadOnlyList<ObsTelemetrySample> obsSamples, IReadOnlyList<NetworkProbeSample> probes)
+    private static IReadOnlyList<TimelineHighlight> BuildHighlights(IncidentRecord incident, FrameMetrics metrics, HypothesisScore top, IReadOnlyList<ArtifactEvidence> artifacts, IReadOnlyList<ObsTelemetrySample> obsSamples, IReadOnlyList<NetworkProbeSample> probes, IReadOnlyList<SuspectedProcessImpact> suspectedProcesses)
     {
         var highlights = new List<TimelineHighlight>
         {
@@ -370,12 +365,18 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                 : $"Probe mot {probe.Host} misslyckades: {probe.FailureReason ?? "okänt fel"}."));
         }
 
+        var suspect = suspectedProcesses.FirstOrDefault();
+        if (suspect is not null)
+        {
+            highlights.Add(new(suspect.ProcessId is null ? incident.Marker.MarkedAt : incident.Marker.MarkedAt, "Processes", $"Misstänkt sidoprocess: {suspect.ProcessName} ({suspect.Reason}, peak CPU {suspect.PeakCpuPercent:F0}%, disk {suspect.PeakIoMegabytesPerSecond:F1} MB/s)."));
+        }
+
         highlights.AddRange(artifacts.Take(3).Select(item => new TimelineHighlight(item.Timestamp, item.Kind.ToString(), item.Summary)));
         highlights.Add(new(incident.Marker.MarkedAt, "Classification", $"Högst rankad hypotes: {ToLabel(top.Category)} ({top.Confidence:P0})."));
         return highlights.OrderBy(item => item.Timestamp).ToArray();
     }
 
-    private static string BuildSummary(HypothesisScore top, FrameMetrics metrics, IReadOnlyList<ObsTelemetrySample> obsSamples, IReadOnlyList<ArtifactEvidence> artifacts, IReadOnlyList<NetworkProbeSample> probes)
+    private static string BuildSummary(HypothesisScore top, FrameMetrics metrics, IReadOnlyList<ObsTelemetrySample> obsSamples, IReadOnlyList<ArtifactEvidence> artifacts, IReadOnlyList<NetworkProbeSample> probes, IReadOnlyList<SuspectedProcessImpact> suspectedProcesses)
     {
         if (top.Category == RootCauseCategory.InsufficientEvidence)
         {
@@ -385,8 +386,97 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         var obsActive = obsSamples.Any(item => item.IsConnected) ? "OBS var aktivt." : "OBS var inte aktivt.";
         var artifactHint = artifacts.Count > 0 ? $" {artifacts.Count} importerade artifacts bidrog till bedömningen." : string.Empty;
         var probeHint = probes.Any() ? " Nätprober fanns tillgängliga i incidentfönstret." : string.Empty;
+        var suspectHint = suspectedProcesses.FirstOrDefault() is { } suspect
+            ? $" Mest avvikande bakgrundsprocess: {suspect.ProcessName} ({suspect.Reason.ToLowerInvariant()})."
+            : string.Empty;
 
-        return $"Trolig rotorsak: {ToLabel(top.Category)} ({top.Confidence:P0}). Frametime-fönstret hade P95 {metrics.P95FrameTime:F1} ms och P99 {metrics.P99FrameTime:F1} ms. {obsActive}{artifactHint}{probeHint}";
+        return $"Trolig rotorsak: {ToLabel(top.Category)} ({top.Confidence:P0}). Frametime-fönstret hade P95 {metrics.P95FrameTime:F1} ms och P99 {metrics.P99FrameTime:F1} ms. {obsActive}{artifactHint}{probeHint}{suspectHint}";
+    }
+
+    private static IReadOnlyList<SuspectedProcessImpact> AnalyzeSuspiciousProcesses(IReadOnlyList<SystemTelemetrySample> systemSamples)
+    {
+        return systemSamples
+            .SelectMany(item => item.TopCpuProcesses.Concat(item.TopDiskProcesses))
+            .Where(item => IsRelevantExternalProcess(item.ProcessName))
+            .GroupBy(item => (item.ProcessName, item.ProcessId))
+            .Select(group =>
+            {
+                var peakCpu = group.Max(entry => entry.CpuPercent);
+                var peakIoMegabytes = group.Max(entry => ToMegabytes(entry.IoBytesPerSecond));
+
+                return new
+                {
+                    Impact = new SuspectedProcessImpact(
+                        group.Key.ProcessName,
+                        group.Key.ProcessId,
+                        Math.Round(peakCpu, 1),
+                        Math.Round(peakIoMegabytes, 1),
+                        group.Count(),
+                        DescribeProcessReason(group.Key.ProcessName, peakCpu, peakIoMegabytes)),
+                    Score = peakCpu + (peakIoMegabytes * 1.5) + (IsKnownOverlayOrHook(group.Key.ProcessName) ? 20 : 0),
+                };
+            })
+            .Where(item => item.Impact.PeakCpuPercent >= 12 || item.Impact.PeakIoMegabytesPerSecond >= 12 || IsKnownOverlayOrHook(item.Impact.ProcessName))
+            .OrderByDescending(item => item.Score)
+            .ThenByDescending(item => item.Impact.ObservedSamples)
+            .Select(item => item.Impact)
+            .Take(5)
+            .ToArray();
+    }
+
+    private static bool IsRelevantExternalProcess(string processName)
+    {
+        return !processName.Contains("FiveM", StringComparison.OrdinalIgnoreCase)
+            && !processName.Contains("GTA", StringComparison.OrdinalIgnoreCase)
+            && !processName.Contains("obs", StringComparison.OrdinalIgnoreCase)
+            && !processName.Contains("FiveMDiagnostics", StringComparison.OrdinalIgnoreCase)
+            && !processName.Equals("Idle", StringComparison.OrdinalIgnoreCase)
+            && !processName.Equals("System", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsKnownOverlayOrHook(string processName)
+    {
+        return processName.Contains("discord", StringComparison.OrdinalIgnoreCase)
+            || processName.Contains("steam", StringComparison.OrdinalIgnoreCase)
+            || processName.Contains("overwolf", StringComparison.OrdinalIgnoreCase)
+            || processName.Contains("rtss", StringComparison.OrdinalIgnoreCase)
+            || processName.Contains("afterburner", StringComparison.OrdinalIgnoreCase)
+            || processName.Contains("nvidia", StringComparison.OrdinalIgnoreCase)
+            || processName.Contains("shadowplay", StringComparison.OrdinalIgnoreCase)
+            || processName.Contains("medal", StringComparison.OrdinalIgnoreCase)
+            || processName.Contains("razer", StringComparison.OrdinalIgnoreCase)
+            || processName.Contains("amdsoftware", StringComparison.OrdinalIgnoreCase)
+            || processName.Contains("gamebar", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string DescribeProcessReason(string processName, double peakCpu, double peakIoMegabytes)
+    {
+        if (IsKnownOverlayOrHook(processName) && peakCpu >= 12)
+        {
+            return "overlay/hook-beteende och hög CPU-belastning";
+        }
+
+        if (IsKnownOverlayOrHook(processName))
+        {
+            return "overlay/hook-beteende";
+        }
+
+        if (peakCpu >= 20 && peakIoMegabytes >= 20)
+        {
+            return "både hög CPU- och diskbelastning";
+        }
+
+        if (peakCpu >= 20)
+        {
+            return "hög CPU-belastning";
+        }
+
+        if (peakIoMegabytes >= 20)
+        {
+            return "hög disk-I/O";
+        }
+
+        return "återkommande belastning i bakgrunden";
     }
 
     private static long Delta(IEnumerable<long?> samples)
