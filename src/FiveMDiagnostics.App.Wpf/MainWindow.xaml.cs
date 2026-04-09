@@ -1,18 +1,21 @@
 ﻿using System.ComponentModel;
 using System.Windows;
+using System.Windows.Input;
 
 namespace FiveMDiagnostics.App.Wpf;
 
+using FiveMDiagnostics.App.Wpf.Properties;
 using FiveMDiagnostics.App.Wpf.Services;
 
 public partial class MainWindow : Window
 {
     private readonly TrayIconService _trayIconService = new();
-    private readonly GlobalHotKeyManager _hotKeyManager = new();
+    private readonly MainWindowViewModel _viewModel;
     private bool _allowClose;
 
     public MainWindow(MainWindowViewModel viewModel)
     {
+        _viewModel = viewModel;
         InitializeComponent();
         DataContext = viewModel;
 
@@ -22,30 +25,31 @@ public partial class MainWindow : Window
         StateChanged += OnStateChanged;
 
         _trayIconService.ShowRequested += (_, _) => RestoreFromTray();
+        _trayIconService.StartSessionRequested += (_, _) => ExecuteTrayCommand(_viewModel.StartSessionCommand, Strings.TraySessionStartingMessage);
+        _trayIconService.StopSessionRequested += (_, _) => ExecuteTrayCommand(_viewModel.StopSessionCommand, Strings.TraySessionStoppedMessage);
+        _trayIconService.MarkStutterRequested += (_, _) => ExecuteTrayCommand(_viewModel.MarkStutterCommand, Strings.TrayMarkStutterMessage);
+        _trayIconService.MarkSevereRequested += (_, _) => ExecuteTrayCommand(_viewModel.MarkSevereStutterCommand, Strings.TrayMarkSevereMessage);
+        _trayIconService.ExportLatestRequested += (_, _) => ExecuteTrayCommand(_viewModel.ExportSelectedIncidentCommand, Strings.TrayExportStartingMessage);
         _trayIconService.ExitRequested += (_, _) => ExitApplication();
-        _hotKeyManager.Triggered += OnHotKeyTriggered;
-    }
 
-    protected override void OnSourceInitialized(EventArgs e)
-    {
-        base.OnSourceInitialized(e);
-
-        if (DataContext is MainWindowViewModel viewModel)
-        {
-            _hotKeyManager.Attach(this, viewModel.Settings.HotKeys);
-        }
+        _viewModel.StartSessionCommand.CanExecuteChanged += OnCommandAvailabilityChanged;
+        _viewModel.StopSessionCommand.CanExecuteChanged += OnCommandAvailabilityChanged;
+        _viewModel.MarkStutterCommand.CanExecuteChanged += OnCommandAvailabilityChanged;
+        _viewModel.MarkSevereStutterCommand.CanExecuteChanged += OnCommandAvailabilityChanged;
+        _viewModel.ExportSelectedIncidentCommand.CanExecuteChanged += OnCommandAvailabilityChanged;
     }
 
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
-        _trayIconService.ShowBalloon("FiveM Diagnostics", "Tray mode and global hotkeys are active.");
+        UpdateTrayMenuState();
+        _trayIconService.ShowBalloon(Strings.AppTitle, Strings.TrayReadyMessage);
     }
 
     private void OnStateChanged(object? sender, EventArgs e)
     {
         if (WindowState == WindowState.Minimized)
         {
-            HideToTray("Window minimized to tray.");
+            HideToTray(Strings.WindowMinimizedToTrayMessage);
         }
     }
 
@@ -57,12 +61,16 @@ public partial class MainWindow : Window
         }
 
         e.Cancel = true;
-        HideToTray("App hidden to tray. Diagnostics can keep running in the background.");
+        HideToTray(Strings.AppHiddenToTrayMessage);
     }
 
     private void OnClosed(object? sender, EventArgs e)
     {
-        _hotKeyManager.Dispose();
+        _viewModel.StartSessionCommand.CanExecuteChanged -= OnCommandAvailabilityChanged;
+        _viewModel.StopSessionCommand.CanExecuteChanged -= OnCommandAvailabilityChanged;
+        _viewModel.MarkStutterCommand.CanExecuteChanged -= OnCommandAvailabilityChanged;
+        _viewModel.MarkSevereStutterCommand.CanExecuteChanged -= OnCommandAvailabilityChanged;
+        _viewModel.ExportSelectedIncidentCommand.CanExecuteChanged -= OnCommandAvailabilityChanged;
         _trayIconService.Dispose();
     }
 
@@ -78,7 +86,7 @@ public partial class MainWindow : Window
     {
         ShowInTaskbar = false;
         Hide();
-        _trayIconService.ShowBalloon("FiveM Diagnostics", message);
+        _trayIconService.ShowBalloon(Strings.AppTitle, message);
     }
 
     private void ExitApplication()
@@ -87,24 +95,30 @@ public partial class MainWindow : Window
         Close();
     }
 
-    private void OnHotKeyTriggered(object? sender, HotKeyAction action)
+    private void OnCommandAvailabilityChanged(object? sender, EventArgs e)
     {
-        if (DataContext is not MainWindowViewModel viewModel)
+        UpdateTrayMenuState();
+    }
+
+    private void UpdateTrayMenuState()
+    {
+        _trayIconService.UpdateDiagnosticsActions(
+            _viewModel.StartSessionCommand.CanExecute(null),
+            _viewModel.StopSessionCommand.CanExecute(null),
+            _viewModel.MarkStutterCommand.CanExecute(null),
+            _viewModel.MarkSevereStutterCommand.CanExecute(null),
+            _viewModel.ExportSelectedIncidentCommand.CanExecute(null));
+    }
+
+    private void ExecuteTrayCommand(ICommand command, string balloonMessage)
+    {
+        if (!command.CanExecute(null))
         {
             return;
         }
 
-        switch (action)
-        {
-            case HotKeyAction.MarkStutter when viewModel.MarkStutterCommand.CanExecute(null):
-                viewModel.MarkStutterCommand.Execute(null);
-                break;
-            case HotKeyAction.MarkSevereStutter when viewModel.MarkSevereStutterCommand.CanExecute(null):
-                viewModel.MarkSevereStutterCommand.Execute(null);
-                break;
-            case HotKeyAction.ExportCurrentIncident when viewModel.ExportSelectedIncidentCommand.CanExecute(null):
-                viewModel.ExportSelectedIncidentCommand.Execute(null);
-                break;
-        }
+        command.Execute(null);
+        UpdateTrayMenuState();
+        _trayIconService.ShowBalloon(Strings.AppTitle, balloonMessage);
     }
 }

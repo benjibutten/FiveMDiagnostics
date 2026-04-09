@@ -75,13 +75,28 @@ jobs:
             -p:PublishSingleFile=true `
             -p:IncludeNativeLibrariesForSelfExtract=true `
             -p:EnableCompressionInSingleFile=false `
-            -p:PublishReadyToRun=true `
-            -p:AssemblyName=$env:PROJECT_NAME `
+            -p:PublishReadyToRun=false `
             -p:Version=${{ steps.meta.outputs.version }} `
             -p:AssemblyVersion=${{ steps.meta.outputs.assembly_version }} `
             -p:FileVersion=${{ steps.meta.outputs.assembly_version }} `
             -p:InformationalVersion="${{ steps.meta.outputs.version }}+${{ github.sha }}" `
             -o $publishDir
+
+          $publishedExeName = "$(Split-Path $env:PROJECT_PATH -LeafBase).exe"
+          $publishedExePath = Join-Path $publishDir $publishedExeName
+          $releaseExePath = Join-Path $publishDir "${{ steps.meta.outputs.asset_name }}"
+
+          if (!(Test-Path $publishedExePath))
+          {
+            throw "Expected published executable not found at $publishedExePath"
+          }
+
+          if (Test-Path $releaseExePath)
+          {
+            Remove-Item $releaseExePath -Force
+          }
+
+          Move-Item $publishedExePath $releaseExePath
 
       - name: Code sign executable (optional)
         if: ${{ env.WINDOWS_CODESIGN_CERT_PFX_BASE64 != '' && env.WINDOWS_CODESIGN_CERT_PASSWORD != '' }}
@@ -90,7 +105,7 @@ jobs:
           $certPath = Join-Path $env:RUNNER_TEMP "fivemdiagnostics-codesign.pfx"
           [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_CERT_PFX_BASE64))
 
-          $exePath = Join-Path $PWD "artifacts/publish/$env:RUNTIME_ID/$env:PROJECT_NAME.exe"
+          $exePath = Join-Path $PWD "artifacts/publish/$env:RUNTIME_ID/${{ steps.meta.outputs.asset_name }}"
           signtool sign `
             /fd SHA256 `
             /f $certPath `

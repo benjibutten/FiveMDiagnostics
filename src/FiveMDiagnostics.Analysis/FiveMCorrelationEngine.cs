@@ -379,7 +379,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
     {
         if (top.Category == RootCauseCategory.InsufficientEvidence)
         {
-            return "Insufficient evidence. Kör gärna en ny session med PresentMon aktivt, och bifoga gärna profiler/net_stats eller en kort deep capture för severe stutters.";
+            return "Insufficient evidence. Kör gärna en ny session i grundläge igen. Om du vill ha djupare framedata kan du lägga till PresentMon om det finns tillgängligt, eller bifoga profiler/net_stats eller en kort deep capture för severe stutters.";
         }
 
         var obsActive = obsSamples.Any(item => item.IsConnected) ? "OBS var aktivt." : "OBS var inte aktivt.";

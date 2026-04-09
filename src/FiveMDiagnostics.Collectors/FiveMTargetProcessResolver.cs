@@ -1,4 +1,4 @@
-using System.Diagnostics;
+using System.Runtime.InteropServices;
 
 namespace FiveMDiagnostics.Collectors;
 
@@ -6,9 +6,12 @@ using FiveMDiagnostics.Core;
 
 public sealed class FiveMTargetProcessResolver : ITargetProcessResolver
 {
+    private static readonly nint InvalidHandleValue = -1;
+    private const uint SnapshotProcessFlag = 0x00000002;
     private static readonly string[] CandidateTokens = ["FiveM", "GTAProcess"];
     private readonly object _sync = new();
-    private readonly TimeSpan _cacheDuration = TimeSpan.FromMilliseconds(500);
+    private readonly TimeSpan _activeCacheDuration = TimeSpan.FromMilliseconds(750);
+    private readonly TimeSpan _idleCacheDuration = TimeSpan.FromSeconds(3);
     private DateTimeOffset _lastRefreshUtc;
     private TargetProcessInfo? _cached;
 
@@ -17,7 +20,8 @@ public sealed class FiveMTargetProcessResolver : ITargetProcessResolver
         lock (_sync)
         {
             var now = DateTimeOffset.UtcNow;
-            if (now - _lastRefreshUtc <= _cacheDuration && IsRunning(_cached))
+            var cacheDuration = _cached is null ? _idleCacheDuration : _activeCacheDuration;
+            if (now - _lastRefreshUtc <= cacheDuration)
             {
                 return _cached;
             }
@@ -32,58 +36,49 @@ public sealed class FiveMTargetProcessResolver : ITargetProcessResolver
     {
         TargetProcessInfo? bestMatch = null;
         var bestScore = int.MinValue;
-
-        foreach (var process in Process.GetProcesses())
+        var snapshotHandle = CreateToolhelp32Snapshot(SnapshotProcessFlag, 0);
+        if (snapshotHandle == InvalidHandleValue)
         {
-            using (process)
-            {
-                try
-                {
-                    if (process.HasExited)
-                    {
-                        continue;
-                    }
-
-                    var processName = process.ProcessName;
-                    if (!CandidateTokens.Any(token => processName.Contains(token, StringComparison.OrdinalIgnoreCase)))
-                    {
-                        continue;
-                    }
-
-                    var score = Score(processName);
-                    if (score <= bestScore)
-                    {
-                        continue;
-                    }
-
-                    bestScore = score;
-                    bestMatch = new TargetProcessInfo(process.Id, processName, TryGetExecutablePath(process), now);
-                }
-                catch
-                {
-                    // Ignore inaccessible or transient processes.
-                }
-            }
-        }
-
-        return bestMatch;
-    }
-
-    private static bool IsRunning(TargetProcessInfo? processInfo)
-    {
-        if (processInfo is null)
-        {
-            return false;
+            return null;
         }
 
         try
         {
-            using var process = Process.GetProcessById(processInfo.ProcessId);
-            return !process.HasExited;
+            var entry = ProcessEntry32.Create();
+            if (!Process32First(snapshotHandle, ref entry))
+            {
+                return null;
+            }
+
+            do
+            {
+                if (entry.ProcessId == Environment.ProcessId)
+                {
+                    continue;
+                }
+
+                var processName = Path.GetFileNameWithoutExtension(entry.ExecutableFile);
+                if (string.IsNullOrWhiteSpace(processName) || !CandidateTokens.Any(token => processName.Contains(token, StringComparison.OrdinalIgnoreCase)))
+                {
+                    continue;
+                }
+
+                var score = Score(processName);
+                if (score <= bestScore)
+                {
+                    continue;
+                }
+
+                bestScore = score;
+                bestMatch = new TargetProcessInfo((int)entry.ProcessId, processName, null, now);
+            }
+            while (Process32Next(snapshotHandle, ref entry));
+
+            return bestMatch;
         }
-        catch
+        finally
         {
-            return false;
+            _ = CloseHandle(snapshotHandle);
         }
     }
 
@@ -103,15 +98,46 @@ public sealed class FiveMTargetProcessResolver : ITargetProcessResolver
         return score;
     }
 
-    private static string? TryGetExecutablePath(Process process)
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern nint CreateToolhelp32Snapshot(uint flags, uint processId);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Process32First(nint snapshotHandle, ref ProcessEntry32 entry);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Process32Next(nint snapshotHandle, ref ProcessEntry32 entry);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(nint handle);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct ProcessEntry32
     {
-        try
+        private const int MaxPath = 260;
+
+        public uint Size;
+        public uint Usage;
+        public uint ProcessId;
+        public nint DefaultHeapId;
+        public uint ModuleId;
+        public uint Threads;
+        public uint ParentProcessId;
+        public int PriorityClassBase;
+        public uint Flags;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = MaxPath)]
+        public string ExecutableFile;
+
+        public static ProcessEntry32 Create()
         {
-            return process.MainModule?.FileName;
-        }
-        catch
-        {
-            return null;
+            return new ProcessEntry32
+            {
+                Size = (uint)Marshal.SizeOf<ProcessEntry32>(),
+                ExecutableFile = string.Empty,
+            };
         }
     }
 }

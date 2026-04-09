@@ -12,6 +12,7 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
     private readonly IReadOnlyList<PerformanceCounter> _perCoreCounters;
     private readonly Dictionary<int, ProcessMetricSnapshot> _previousSnapshots = new();
     private readonly TimeSpan _processSampleInterval = TimeSpan.FromSeconds(2);
+    private readonly int _currentSessionId = Process.GetCurrentProcess().SessionId;
 
     private DateTimeOffset _lastProcessSampleUtc = DateTimeOffset.MinValue;
     private IReadOnlyList<ProcessActivity> _cachedTopCpu = [];
@@ -146,6 +147,18 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
         {
             using (process)
             {
+                try
+                {
+                    if (process.SessionId != _currentSessionId)
+                    {
+                        continue;
+                    }
+                }
+                catch
+                {
+                    continue;
+                }
+
                 if (!ProcessMetricsReader.TryRead(process, timestamp, out var snapshot))
                 {
                     continue;

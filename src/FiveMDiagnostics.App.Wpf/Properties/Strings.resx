@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <xsd:schema id="root" xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata">
+    <xsd:element name="root" msdata:IsDataSet="true">
+      <xsd:complexType>
+        <xsd:choice maxOccurs="unbounded">
+          <xsd:element name="data">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+                <xsd:element name="comment" type="xsd:string" minOccurs="0" msdata:Ordinal="2" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" />
+              <xsd:attribute name="type" type="xsd:string" />
+              <xsd:attribute name="mimetype" type="xsd:string" />
+              <xsd:attribute ref="xml:space" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="resheader">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" />
+            </xsd:complexType>
+          </xsd:element>
+        </xsd:choice>
+      </xsd:complexType>
+    </xsd:element>
+  </xsd:schema>
+  <resheader name="resmimetype"><value>text/microsoft-resx</value></resheader>
+  <resheader name="version"><value>2.0</value></resheader>
+  <resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+  <resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+
+  <!-- App-level -->
+  <data name="AppTitle" xml:space="preserve"><value>FiveM Diagnostics</value></data>
+  <data name="AppSubtitle" xml:space="preserve"><value>One-click local stutter diagnostics for FiveM. Start a basic session first and add extras only if you need them.</value></data>
+  <data name="StateLabel" xml:space="preserve"><value>State:</value></data>
+  <data name="ActiveProcessLabel" xml:space="preserve"><value>Active process:</value></data>
+  <data name="BasicModeHeader" xml:space="preserve"><value>Basic mode</value></data>
+  <data name="BasicModeIntro" xml:space="preserve"><value>Start a session and play. The default setup already collects system, process and network evidence.</value></data>
+  <data name="BasicModeStepOne" xml:space="preserve"><value>1. Start a basic session.</value></data>
+  <data name="BasicModeStepTwo" xml:space="preserve"><value>2. Mark stutter when it happens.</value></data>
+  <data name="BasicModeStepThree" xml:space="preserve"><value>3. Export the latest incident when you're done.</value></data>
+  <data name="PresentMonStatusLabel" xml:space="preserve"><value>Frame telemetry</value></data>
+  <data name="PresentMonStatusConfigured" xml:space="preserve"><value>PresentMon is configured. Frame telemetry will be included.</value></data>
+  <data name="PresentMonStatusAutoDetected" xml:space="preserve"><value>PresentMon was found automatically. No manual path is needed.</value></data>
+  <data name="PresentMonStatusMissing" xml:space="preserve"><value>PresentMon was not found. The app still works in basic mode without it; add it later under Advanced if you want deeper frame data.</value></data>
+  <data name="CaptureFeedbackHeader" xml:space="preserve"><value>Capture status</value></data>
+  <data name="CaptureFeedbackHint" xml:space="preserve"><value>When you mark stutter, the app keeps collecting for another 60 seconds before the finished incident appears in the list.</value></data>
+  <data name="CaptureFeedbackSessionStarted" xml:space="preserve"><value>Basic session started. The app is ready to capture a stutter marker.</value></data>
+  <data name="CaptureFeedbackCollectingFormat" xml:space="preserve"><value>{0} saved. The app understood the click and is collecting the rest of the capture window until {1}. Pending captures: {2}.</value></data>
+  <data name="CaptureFeedbackReadyFormat" xml:space="preserve"><value>{0} is now ready. Select it in the incident list to inspect the analysis.</value></data>
+  <data name="CaptureFeedbackReadyWithPendingFormat" xml:space="preserve"><value>{0} is now ready. There are still {1} capture(s) being collected.</value></data>
+  <data name="CaptureFeedbackSyntheticReady" xml:space="preserve"><value>Synthetic incident created immediately for testing.</value></data>
+
+  <!-- Controls -->
+  <data name="ControlsHeader" xml:space="preserve"><value>Controls</value></data>
+  <data name="SessionGroup" xml:space="preserve"><value>Quick start</value></data>
+  <data name="StartSession" xml:space="preserve"><value>Start basic session</value></data>
+  <data name="StopSession" xml:space="preserve"><value>Stop Session</value></data>
+  <data name="IncidentActionsGroup" xml:space="preserve"><value>During gameplay</value></data>
+  <data name="MarkStutter" xml:space="preserve"><value>Mark Stutter</value></data>
+  <data name="MarkSevere" xml:space="preserve"><value>Mark severe stutter</value></data>
+  <data name="DataGroup" xml:space="preserve"><value>Afterwards</value></data>
+  <data name="ExportLatest" xml:space="preserve"><value>Export Latest</value></data>
+  <data name="ImportArtifacts" xml:space="preserve"><value>Add extra files</value></data>
+
+  <!-- Settings -->
+  <data name="SettingsHeader" xml:space="preserve"><value>Optional setup</value></data>
+  <data name="SettingsIntro" xml:space="preserve"><value>Start with quick start. Everything below is optional and only needed for extra context or custom folders.</value></data>
+  <data name="ServerProfile" xml:space="preserve"><value>Server name (optional)</value></data>
+  <data name="ServerProfileHint" xml:space="preserve"><value>Only used as a label in the incident list and exports.</value></data>
+  <data name="NetworkHintsHeader" xml:space="preserve"><value>Optional network hints</value></data>
+  <data name="NetworkHintsDescription" xml:space="preserve"><value>Use these only if you want extra network context in the incident timeline.</value></data>
+  <data name="ProbeHost" xml:space="preserve"><value>Ping host or IP (optional)</value></data>
+  <data name="ProbeHostHint" xml:space="preserve"><value>Fill this in only if you know the game server host or IP and want ping samples. Otherwise leave it blank.</value></data>
+  <data name="EndpointHint" xml:space="preserve"><value>Endpoint label (optional host:port)</value></data>
+  <data name="EndpointHintDescription" xml:space="preserve"><value>Optional readable host:port label for detected connections. Leave blank if you are unsure.</value></data>
+  <data name="AdvancedSettings" xml:space="preserve"><value>Advanced paths and tools</value></data>
+  <data name="AdvancedSettingsDescription" xml:space="preserve"><value>Only open this if you need custom folders or want to override PresentMon/WPR paths.</value></data>
+  <data name="PresentMonPath" xml:space="preserve"><value>PresentMon executable path</value></data>
+  <data name="WorkingDirectory" xml:space="preserve"><value>Working directory</value></data>
+  <data name="ExportDirectory" xml:space="preserve"><value>Export directory</value></data>
+  <data name="ArtifactDirectory" xml:space="preserve"><value>Artifact directory</value></data>
+  <data name="IncludeSensitiveFields" xml:space="preserve"><value>Include sensitive fields in export</value></data>
+  <data name="IncludeAttachedArtifacts" xml:space="preserve"><value>Include attached artifacts in export</value></data>
+  <data name="SaveSettings" xml:space="preserve"><value>Save Settings</value></data>
+  <data name="LanguageLabel" xml:space="preserve"><value>Language</value></data>
+  <data name="LanguageChangeHint" xml:space="preserve"><value>Restart the app to apply language changes.</value></data>
+  <data name="EnglishLanguageName" xml:space="preserve"><value>English</value></data>
+  <data name="SwedishLanguageName" xml:space="preserve"><value>Swedish</value></data>
+  <data name="TrayHeader" xml:space="preserve"><value>Tray menu</value></data>
+  <data name="TrayIntro" xml:space="preserve"><value>Right-click the tray icon to control diagnostics without reopening the window.</value></data>
+  <data name="TrayStartStop" xml:space="preserve"><value>Start or stop sessions directly from the tray.</value></data>
+  <data name="TrayMark" xml:space="preserve"><value>Mark normal or severe stutter from the tray menu while a session is active.</value></data>
+  <data name="TrayExport" xml:space="preserve"><value>Export the latest incident from the tray when you want to capture evidence quickly.</value></data>
+  <data name="TrayShowWindow" xml:space="preserve"><value>Show window</value></data>
+  <data name="TrayExit" xml:space="preserve"><value>Exit</value></data>
+  <data name="TrayReadyMessage" xml:space="preserve"><value>Right-click the tray icon to control diagnostics.</value></data>
+  <data name="WindowMinimizedToTrayMessage" xml:space="preserve"><value>Window minimized to tray.</value></data>
+  <data name="AppHiddenToTrayMessage" xml:space="preserve"><value>App hidden to tray. Diagnostics can keep running in the background.</value></data>
+  <data name="TraySessionStartingMessage" xml:space="preserve"><value>Session starting in the background.</value></data>
+  <data name="TraySessionStoppedMessage" xml:space="preserve"><value>Session stopped.</value></data>
+  <data name="TrayMarkStutterMessage" xml:space="preserve"><value>Stutter marked.</value></data>
+  <data name="TrayMarkSevereMessage" xml:space="preserve"><value>Severe stutter marked.</value></data>
+  <data name="TrayExportStartingMessage" xml:space="preserve"><value>Exporting the latest incident.</value></data>
+
+  <!-- Fake Data -->
+  <data name="FakeDataHeader" xml:space="preserve"><value>Testing tools</value></data>
+  <data name="FakeDataDescription" xml:space="preserve"><value>Use this only when you want to validate the analysis engine without a live session.</value></data>
+  <data name="SimulateObs" xml:space="preserve"><value>Simulate OBS/GPU contention</value></data>
+  <data name="SimulateResource" xml:space="preserve"><value>Simulate FiveM resource spike</value></data>
+  <data name="SimulateNetwork" xml:space="preserve"><value>Simulate network issue</value></data>
+
+  <!-- Status and Incidents -->
+  <data name="StatusLogHeader" xml:space="preserve"><value>Activity log</value></data>
+  <data name="RecentIncidentsHeader" xml:space="preserve"><value>Recent Incidents</value></data>
+  <data name="MarkedColumn" xml:space="preserve"><value>Marked</value></data>
+  <data name="SeverityColumn" xml:space="preserve"><value>Severity</value></data>
+  <data name="ServerColumn" xml:space="preserve"><value>Server</value></data>
+  <data name="SummaryColumn" xml:space="preserve"><value>Summary</value></data>
+  <data name="IncidentSummaryHeader" xml:space="preserve"><value>Incident Summary</value></data>
+  <data name="RankedHypothesesHeader" xml:space="preserve"><value>Ranked Hypotheses</value></data>
+  <data name="TimelineHeader" xml:space="preserve"><value>Timeline</value></data>
+
+  <!-- ViewModel strings -->
+  <data name="SessionActive" xml:space="preserve"><value>Session active. Collectors sample only while FiveM/GTA is running.</value></data>
+  <data name="SessionIdle" xml:space="preserve"><value>Session idle.</value></data>
+  <data name="WaitingForProcess" xml:space="preserve"><value>Waiting for FiveM/GTA process</value></data>
+  <data name="SelectIncidentHint" xml:space="preserve"><value>Select an incident to inspect its summary and supporting evidence.</value></data>
+  <data name="SettingsSavedFormat" xml:space="preserve"><value>Settings saved to {0}.</value></data>
+  <data name="IncidentExportedTitle" xml:space="preserve"><value>Incident exported</value></data>
+</root>

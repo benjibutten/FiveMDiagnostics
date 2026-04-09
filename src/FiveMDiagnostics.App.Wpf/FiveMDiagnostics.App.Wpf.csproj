@@ -13,6 +13,18 @@
   </ItemGroup>
 
   <ItemGroup>
+    <EmbeddedResource Update="Properties\Strings.resx">
+      <Generator>PublicResXFileCodeGenerator</Generator>
+      <LastGenOutput>Strings.Designer.cs</LastGenOutput>
+    </EmbeddedResource>
+    <Compile Update="Properties\Strings.Designer.cs">
+      <AutoGen>True</AutoGen>
+      <DependentUpon>Strings.resx</DependentUpon>
+      <DesignTime>True</DesignTime>
+    </Compile>
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\FiveMDiagnostics.Core\FiveMDiagnostics.Core.csproj" />
     <ProjectReference Include="..\FiveMDiagnostics.Collectors\FiveMDiagnostics.Collectors.csproj" />
     <ProjectReference Include="..\FiveMDiagnostics.Analysis\FiveMDiagnostics.Analysis.csproj" />

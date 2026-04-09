@@ -55,6 +55,7 @@ public sealed class RelayCommand : ICommand
     }
 }
 
+public sealed record LanguageOption(string Code, string DisplayName);
 public sealed class AsyncRelayCommand : ICommand
 {
     private readonly Func<Task> _executeAsync;
