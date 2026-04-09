@@ -124,6 +124,14 @@ public sealed record TargetProcessInfo(
 
 public sealed record ProcessActivity(string ProcessName, int ProcessId, double CpuPercent, long IoBytesPerSecond);
 
+public sealed record SuspectedProcessImpact(
+    string ProcessName,
+    int? ProcessId,
+    double PeakCpuPercent,
+    double PeakIoMegabytesPerSecond,
+    int ObservedSamples,
+    string Reason);
+
 public sealed record RemoteEndpointInfo(string Protocol, string RemoteAddress, int RemotePort, string? EndpointHint = null);
 
 public sealed record ArtifactAttachment(
@@ -224,7 +232,8 @@ public sealed record IncidentAnalysis(
     IReadOnlyList<HypothesisScore> Hypotheses,
     bool InsufficientEvidence,
     string Summary,
-    IReadOnlyList<TimelineHighlight> TimelineHighlights);
+    IReadOnlyList<TimelineHighlight> TimelineHighlights,
+    IReadOnlyList<SuspectedProcessImpact> SuspectedProcesses);
 
 public sealed record IncidentRecord(
     Guid Id,
