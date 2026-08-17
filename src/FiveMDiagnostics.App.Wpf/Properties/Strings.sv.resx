@@ -132,4 +132,8 @@
   <data name="SelectIncidentHint" xml:space="preserve"><value>Välj en incident för att se sammanfattning och stödjande bevis.</value></data>
   <data name="SettingsSavedFormat" xml:space="preserve"><value>Inställningar sparade till {0}.</value></data>
   <data name="IncidentExportedTitle" xml:space="preserve"><value>Incident exporterad</value></data>
+  <data name="LiveCpuLabel" xml:space="preserve"><value>CPU:</value></data>
+  <data name="LiveMemoryLabel" xml:space="preserve"><value>RAM:</value></data>
+  <data name="LiveRamFreeFormat" xml:space="preserve"><value>{0} MB ledigt</value></data>
+  <data name="LiveStatsIdle" xml:space="preserve"><value>—</value></data>
 </root>

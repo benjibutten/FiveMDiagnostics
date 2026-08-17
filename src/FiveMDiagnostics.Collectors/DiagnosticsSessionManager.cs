@@ -55,6 +55,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
     public event EventHandler<IncidentRecord>? IncidentCompleted;
 
+    public event EventHandler<SystemTelemetrySample>? SystemTelemetryUpdated;
+
     public bool IsSessionActive => _isSessionActive;
 
     public DiagnosticsSettings Settings => _settings;
@@ -316,6 +318,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             while (reader.TryRead(out var telemetryEvent))
             {
                 _ringBuffer?.Add(telemetryEvent);
+
+                if (telemetryEvent is SystemTelemetrySample systemSample)
+                {
+                    SystemTelemetryUpdated?.Invoke(this, systemSample);
+                }
 
                 if (_incidentMaterializer is not null && Environment is not null)
                 {

@@ -41,6 +41,8 @@ public sealed class MainWindowViewModel : ObservableObject
     private string _presentMonStatusText = string.Empty;
     private string _captureFeedbackText = string.Empty;
     private DateTimeOffset _lastStateRefreshUtc = DateTimeOffset.MinValue;
+    private string _liveCpuText = Strings.LiveStatsIdle;
+    private string _liveMemoryText = Strings.LiveStatsIdle;
 
     public MainWindowViewModel(DiagnosticsSessionManager sessionManager, SettingsStore settingsStore, DiagnosticsSettings settings, IUserDialogService dialogService)
     {
@@ -81,6 +83,7 @@ public sealed class MainWindowViewModel : ObservableObject
         _sessionManager.StateChanged += OnSessionStateChanged;
         _sessionManager.StatusReported += OnStatusReported;
         _sessionManager.IncidentCompleted += OnIncidentCompleted;
+        _sessionManager.SystemTelemetryUpdated += OnSystemTelemetryUpdated;
 
         foreach (var incident in _sessionManager.GetRecentIncidents())
         {
@@ -147,6 +150,18 @@ public sealed class MainWindowViewModel : ObservableObject
     {
         get => _captureFeedbackText;
         private set => SetProperty(ref _captureFeedbackText, value);
+    }
+
+    public string LiveCpuText
+    {
+        get => _liveCpuText;
+        private set => SetProperty(ref _liveCpuText, value);
+    }
+
+    public string LiveMemoryText
+    {
+        get => _liveMemoryText;
+        private set => SetProperty(ref _liveMemoryText, value);
     }
 
     public string ServerProfileName
@@ -370,6 +385,17 @@ public sealed class MainWindowViewModel : ObservableObject
         RequestStateRefresh();
     }
 
+    private void OnSystemTelemetryUpdated(object? sender, SystemTelemetrySample sample)
+    {
+        var cpu = $"{sample.TotalCpuUsagePercent:F0}%";
+        var memory = string.Format(Strings.LiveRamFreeFormat, sample.AvailableMemoryMb.ToString("N0"));
+        _ = _dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+        {
+            LiveCpuText = cpu;
+            LiveMemoryText = memory;
+        }));
+    }
+
     private void OnStatusReported(object? sender, DiagnosticStatusEntry status)
     {
         _pendingStatusEntries.Enqueue(status);
@@ -395,6 +421,12 @@ public sealed class MainWindowViewModel : ObservableObject
         ActiveProcessText = _sessionManager.ActiveProcess is { } process
             ? $"{process.ProcessName} (PID {process.ProcessId})"
             : Strings.WaitingForProcess;
+
+        if (!IsSessionActive)
+        {
+            LiveCpuText = Strings.LiveStatsIdle;
+            LiveMemoryText = Strings.LiveStatsIdle;
+        }
 
         OnPropertyChanged(nameof(SessionStateText));
         StartSessionCommand.RaiseCanExecuteChanged();

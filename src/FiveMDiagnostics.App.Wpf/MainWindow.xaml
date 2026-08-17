@@ -76,6 +76,10 @@
                         <TextBlock Text="{Binding SessionStateText}" Foreground="#EAF4FB" Margin="4,0,0,0" />
                         <TextBlock Text="{x:Static props:Strings.ActiveProcessLabel}" Foreground="#EAF4FB" FontWeight="SemiBold" Margin="20,0,0,0" />
                         <TextBlock Text="{Binding ActiveProcessText}" Foreground="#EAF4FB" Margin="4,0,0,0" />
+                        <TextBlock Text="{x:Static props:Strings.LiveCpuLabel}" Foreground="#EAF4FB" FontWeight="SemiBold" Margin="20,0,0,0" />
+                        <TextBlock Text="{Binding LiveCpuText}" Foreground="#EAF4FB" Margin="4,0,0,0" />
+                        <TextBlock Text="{x:Static props:Strings.LiveMemoryLabel}" Foreground="#EAF4FB" FontWeight="SemiBold" Margin="20,0,0,0" />
+                        <TextBlock Text="{Binding LiveMemoryText}" Foreground="#EAF4FB" Margin="4,0,0,0" />
                     </StackPanel>
                 </StackPanel>
 

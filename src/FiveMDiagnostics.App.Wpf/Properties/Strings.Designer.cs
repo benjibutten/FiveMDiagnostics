@@ -109,4 +109,9 @@ public static class Strings
     public static string SelectIncidentHint => ResourceManager.GetString("SelectIncidentHint", Culture) ?? "";
     public static string SettingsSavedFormat => ResourceManager.GetString("SettingsSavedFormat", Culture) ?? "Settings saved to {0}.";
     public static string IncidentExportedTitle => ResourceManager.GetString("IncidentExportedTitle", Culture) ?? "Incident exported";
+
+    public static string LiveCpuLabel => ResourceManager.GetString("LiveCpuLabel", Culture) ?? "CPU:";
+    public static string LiveMemoryLabel => ResourceManager.GetString("LiveMemoryLabel", Culture) ?? "RAM:";
+    public static string LiveRamFreeFormat => ResourceManager.GetString("LiveRamFreeFormat", Culture) ?? "{0} MB free";
+    public static string LiveStatsIdle => ResourceManager.GetString("LiveStatsIdle", Culture) ?? "\u2014";
 }
