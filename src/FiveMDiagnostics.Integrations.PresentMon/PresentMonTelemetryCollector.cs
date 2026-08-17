@@ -16,64 +16,69 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
     private Process? _presentMonProcess;
     private long _lastFilePosition;
     private Dictionary<string, int>? _headerIndex;
-    private DateTimeOffset _captureStartTimeUtc;
+    private DateTimeOffset? _traceStartEstimateUtc;
 
     public string Name => "PresentMon";
 
     public async Task RunAsync(CollectorContext context, CancellationToken cancellationToken)
     {
-        while (!cancellationToken.IsCancellationRequested)
+        try
         {
-            var discovery = PresentMonLocator.Discover(context.Settings.PresentMon.ExecutablePath);
-            var executablePath = discovery.ExecutablePath;
-            if (string.IsNullOrWhiteSpace(executablePath))
+            while (!cancellationToken.IsCancellationRequested)
             {
-                if (!_reportedMissingExecutable)
+                var discovery = PresentMonLocator.Discover(context.Settings.PresentMon.ExecutablePath);
+                var executablePath = discovery.ExecutablePath;
+                if (string.IsNullOrWhiteSpace(executablePath))
                 {
-                    _reportedMissingExecutable = true;
-                    context.StatusSink.Report(StatusLevel.Warning, Name, "PresentMon hittades inte. Frame telemetry är begränsad tills executable path konfigureras.");
+                    if (!_reportedMissingExecutable)
+                    {
+                        _reportedMissingExecutable = true;
+                        context.StatusSink.Report(StatusLevel.Warning, Name, "PresentMon hittades inte. Frame telemetry är begränsad tills executable path konfigureras.");
+                    }
+
+                    await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
+                    continue;
                 }
 
-                await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
-                continue;
-            }
+                if (!string.Equals(_resolvedExecutablePath, executablePath, StringComparison.OrdinalIgnoreCase))
+                {
+                    StopCapture(context);
+                    _resolvedExecutablePath = executablePath;
+                }
 
-            if (!string.Equals(_resolvedExecutablePath, executablePath, StringComparison.OrdinalIgnoreCase))
-            {
-                StopCapture();
-                _resolvedExecutablePath = executablePath;
-            }
+                _reportedMissingExecutable = false;
+                if (discovery.Kind == PresentMonDiscoveryKind.AutoDetected && !_reportedAutoDetectedExecutable)
+                {
+                    _reportedAutoDetectedExecutable = true;
+                    context.StatusSink.Report(StatusLevel.Info, Name, $"PresentMon hittades automatiskt på {executablePath}.");
+                }
 
-            _reportedMissingExecutable = false;
-            if (discovery.Kind == PresentMonDiscoveryKind.AutoDetected && !_reportedAutoDetectedExecutable)
-            {
-                _reportedAutoDetectedExecutable = true;
-                context.StatusSink.Report(StatusLevel.Info, Name, $"PresentMon hittades automatiskt på {executablePath}.");
-            }
+                var target = context.ProcessResolver.TryGetTargetProcess();
+                if (target is null)
+                {
+                    StopCapture(context);
+                    await Task.Delay(context.Settings.PresentMon.PollingInterval, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
 
-            var target = context.ProcessResolver.TryGetTargetProcess();
-            if (target is null)
-            {
-                StopCapture();
+                EnsureCaptureStarted(context, executablePath, target.ProcessId);
+                foreach (var sample in ReadNewSamples(target.ProcessName, context.UtcNow))
+                {
+                    await context.Writer.WriteAsync(sample, cancellationToken).ConfigureAwait(false);
+                }
+
                 await Task.Delay(context.Settings.PresentMon.PollingInterval, cancellationToken).ConfigureAwait(false);
-                continue;
             }
-
-            EnsureCaptureStarted(context, executablePath, target.ProcessId);
-            foreach (var sample in ReadNewSamples(target.ProcessName, context.UtcNow))
-            {
-                await context.Writer.WriteAsync(sample, cancellationToken).ConfigureAwait(false);
-            }
-
-            await Task.Delay(context.Settings.PresentMon.PollingInterval, cancellationToken).ConfigureAwait(false);
         }
-
-        StopCapture();
+        finally
+        {
+            StopCapture(context);
+        }
     }
 
     public void Dispose()
     {
-        StopCapture();
+        StopCapture(null);
     }
 
     private void EnsureCaptureStarted(CollectorContext context, string executablePath, int processId)
@@ -85,10 +90,10 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
                 return;
             }
 
-            StopCapture();
+            StopCaptureLocked(context);
             _currentProcessId = processId;
             _currentOutputPath = Path.Combine(context.Settings.WorkingDirectory, $"presentmon_{processId}_{DateTimeOffset.UtcNow:yyyyMMdd_HHmmss}.csv");
-            _captureStartTimeUtc = DateTimeOffset.UtcNow;
+            _traceStartEstimateUtc = null;
 
             var arguments = context.Settings.PresentMon.ArgumentsTemplate
                 .Replace("{processId}", processId.ToString(CultureInfo.InvariantCulture), StringComparison.OrdinalIgnoreCase)
@@ -99,6 +104,7 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardError = true,
+                RedirectStandardOutput = true,
             };
 
             _presentMonProcess = Process.Start(startInfo);
@@ -111,7 +117,39 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
                 return;
             }
 
+            // PresentMon writes an elevation warning to stderr immediately. Nothing drained these pipes
+            // before, so once the 4 KB buffer filled PresentMon blocked forever.
+            DrainDiagnosticStream(_presentMonProcess, context);
+
             context.StatusSink.Report(StatusLevel.Info, Name, $"PresentMon capture startad för PID {processId}.");
+        }
+    }
+
+    private void DrainDiagnosticStream(Process process, CollectorContext context)
+    {
+        process.ErrorDataReceived += (_, args) =>
+        {
+            if (string.IsNullOrWhiteSpace(args.Data))
+            {
+                return;
+            }
+
+            var level = args.Data.Contains("error", StringComparison.OrdinalIgnoreCase)
+                ? StatusLevel.Warning
+                : StatusLevel.Info;
+            context.StatusSink.Report(level, Name, $"PresentMon: {args.Data.Trim()}");
+        };
+
+        process.OutputDataReceived += (_, _) => { };
+
+        try
+        {
+            process.BeginErrorReadLine();
+            process.BeginOutputReadLine();
+        }
+        catch (InvalidOperationException)
+        {
+            // Process exited before redirection could start.
         }
     }
 
@@ -130,11 +168,13 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
                 : new Dictionary<string, int>(_headerIndex, StringComparer.OrdinalIgnoreCase);
         }
 
+        // PresentMon creates the file lazily, only once it has frames to write.
         if (string.IsNullOrWhiteSpace(outputPath) || !File.Exists(outputPath))
         {
             yield break;
         }
 
+        var readUtc = utcNow();
         using var stream = new FileStream(outputPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         if (startPosition > stream.Length)
         {
@@ -144,6 +184,8 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
 
         stream.Seek(startPosition, SeekOrigin.Begin);
         using var reader = new StreamReader(stream);
+
+        var rows = new List<(string[] Cells, double? RelativeMs)>();
         string? line;
         while ((line = reader.ReadLine()) is not null)
         {
@@ -154,134 +196,100 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
 
             if (headerIndex is null)
             {
-                headerIndex = ParseHeader(line);
+                headerIndex = PresentMonCsvParser.ParseHeader(line);
                 continue;
             }
 
             var cells = line.Split(',');
-            var sample = ParseSample(cells, headerIndex, processName, utcNow());
+            rows.Add((cells, PresentMonCsvParser.ReadRelativeMs(cells, headerIndex)));
+        }
+
+        var position = stream.Position;
+        DateTimeOffset traceStart;
+
+        lock (_sync)
+        {
+            _lastFilePosition = position;
+            _headerIndex = headerIndex;
+            AnchorTraceStartLocked(rows, readUtc);
+            traceStart = _traceStartEstimateUtc ?? readUtc;
+        }
+
+        if (headerIndex is null)
+        {
+            yield break;
+        }
+
+        foreach (var (cells, relativeMs) in rows)
+        {
+            var timestamp = relativeMs is { } offset ? traceStart.AddMilliseconds(offset) : readUtc;
+            var sample = PresentMonCsvParser.ParseRow(cells, headerIndex, processName, timestamp);
             if (sample is not null)
             {
                 yield return sample;
             }
         }
-
-        lock (_sync)
-        {
-            _lastFilePosition = stream.Position;
-            _headerIndex = headerIndex;
-        }
     }
 
-    private FrameTelemetrySample? ParseSample(string[] cells, IReadOnlyDictionary<string, int> headerIndex, string processName, DateTimeOffset fallbackTimestamp)
+    /// <summary>
+    /// PresentMon reports frame times relative to the start of its trace, not as wall-clock. The read
+    /// always happens after the frame, so <c>readUtc - relativeMs</c> is an upper bound on the trace
+    /// start and the tightest bound seen so far is the best estimate. Keeping the minimum lets the
+    /// anchor converge as batches arrive instead of collapsing every frame onto the read time.
+    /// </summary>
+    private void AnchorTraceStartLocked(List<(string[] Cells, double? RelativeMs)> rows, DateTimeOffset readUtc)
     {
-        var frameTime = ReadDouble(cells, headerIndex, "msBetweenPresents", "msBetweenDisplayChange");
-        if (frameTime is null)
+        foreach (var (_, relativeMs) in rows)
         {
-            return null;
-        }
-
-        var timeInSeconds = ReadDouble(cells, headerIndex, "timeInSeconds", "timeindisplay");
-        var timestamp = timeInSeconds is not null
-            ? _captureStartTimeUtc.AddSeconds(timeInSeconds.Value)
-            : fallbackTimestamp;
-
-        return new FrameTelemetrySample(
-            timestamp,
-            frameTime.Value,
-            ReadDouble(cells, headerIndex, "msGPUActive", "msUntilRenderComplete"),
-            ReadDouble(cells, headerIndex, "msUntilDisplayed", "msUntilDisplayChange"),
-            ReadDouble(cells, headerIndex, "msBetweenPresents"),
-            ReadBool(cells, headerIndex, "Dropped"),
-            ReadString(cells, headerIndex, "ProcessName") ?? processName,
-            ReadDouble(cells, headerIndex, "msInPresentApi"));
-    }
-
-    private static Dictionary<string, int> ParseHeader(string headerLine)
-    {
-        return headerLine
-            .Split(',')
-            .Select((value, index) => (Header: value.Trim(), Index: index))
-            .ToDictionary(item => item.Header, item => item.Index, StringComparer.OrdinalIgnoreCase);
-    }
-
-    private static string? ReadString(string[] cells, IReadOnlyDictionary<string, int> headerIndex, params string[] columnNames)
-    {
-        foreach (var columnName in columnNames)
-        {
-            if (headerIndex.TryGetValue(columnName, out var index) && index < cells.Length)
-            {
-                return cells[index];
-            }
-        }
-
-        return null;
-    }
-
-    private static double? ReadDouble(string[] cells, IReadOnlyDictionary<string, int> headerIndex, params string[] columnNames)
-    {
-        foreach (var columnName in columnNames)
-        {
-            if (!headerIndex.TryGetValue(columnName, out var index) || index >= cells.Length)
+            if (relativeMs is not { } value)
             {
                 continue;
             }
 
-            if (double.TryParse(cells[index], NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+            var candidate = readUtc.AddMilliseconds(-value);
+            if (_traceStartEstimateUtc is null || candidate < _traceStartEstimateUtc)
             {
-                return value;
+                _traceStartEstimateUtc = candidate;
             }
         }
-
-        return null;
     }
 
-    private static bool ReadBool(string[] cells, IReadOnlyDictionary<string, int> headerIndex, params string[] columnNames)
-    {
-        foreach (var columnName in columnNames)
-        {
-            if (!headerIndex.TryGetValue(columnName, out var index) || index >= cells.Length)
-            {
-                continue;
-            }
-
-            var cell = cells[index];
-            if (bool.TryParse(cell, out var parsed))
-            {
-                return parsed;
-            }
-
-            if (int.TryParse(cell, NumberStyles.Integer, CultureInfo.InvariantCulture, out var numeric))
-            {
-                return numeric != 0;
-            }
-        }
-
-        return false;
-    }
-
-    private void StopCapture()
+    private void StopCapture(CollectorContext? context)
     {
         lock (_sync)
         {
-            if (_presentMonProcess is { HasExited: false })
+            StopCaptureLocked(context);
+        }
+    }
+
+    private void StopCaptureLocked(CollectorContext? context)
+    {
+        if (_presentMonProcess is { } process)
+        {
+            try
             {
-                try
+                if (!process.HasExited)
                 {
-                    _presentMonProcess.Kill(entireProcessTree: true);
-                }
-                catch
-                {
-                    // Ignore shutdown failures.
+                    // Killing PresentMon orphans its ETW session, which then blocks the next capture.
+                    // CloseMainWindow does not apply to a console app, so the session name is reclaimed
+                    // by --stop_existing_session on the next start; give it a chance to flush regardless.
+                    process.Kill(entireProcessTree: false);
+                    process.WaitForExit(2000);
                 }
             }
+            catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
+            {
+                context?.StatusSink.Report(StatusLevel.Info, Name, $"PresentMon avslutades inte rent: {ex.Message}");
+            }
 
-            _presentMonProcess?.Dispose();
-            _presentMonProcess = null;
-            _currentProcessId = null;
-            _currentOutputPath = null;
-            _lastFilePosition = 0;
-            _headerIndex = null;
+            process.Dispose();
         }
+
+        _presentMonProcess = null;
+        _currentProcessId = null;
+        _currentOutputPath = null;
+        _lastFilePosition = 0;
+        _headerIndex = null;
+        _traceStartEstimateUtc = null;
     }
 }
