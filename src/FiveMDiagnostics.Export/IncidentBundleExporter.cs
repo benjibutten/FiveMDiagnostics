@@ -1,6 +1,7 @@
 using System.IO.Compression;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace FiveMDiagnostics.Export;
 
@@ -11,6 +12,10 @@ public sealed class IncidentBundleExporter : IIncidentExporter
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
+
+        // Numeric enums make an export depend on declaration order: inserting a category shifts the
+        // meaning of every previously written file. Names are stable and readable on their own.
+        Converters = { new JsonStringEnumConverter() },
     };
 
     public async Task<string> ExportAsync(IncidentRecord incident, ExportBundleOptions options, CancellationToken cancellationToken)
@@ -140,12 +145,78 @@ public sealed class IncidentBundleExporter : IIncidentExporter
 
     private static IncidentRecord Sanitize(IncidentRecord incident)
     {
+        // Collect the addresses before redacting them: the analysis text is generated from these events
+        // and embeds the server address verbatim in summaries, timeline entries and hypothesis evidence.
+        // Redacting only the structured fields would still ship the IP in prose.
+        var sensitiveHosts = CollectSensitiveHosts(incident);
         var sanitizedEvents = incident.Events.Select(SanitizeEvent).ToArray();
         var sanitizedAttachments = incident.Attachments
             .Select(item => item with { FilePath = Path.GetFileName(item.FilePath) })
             .ToArray();
 
-        return incident with { Events = sanitizedEvents, Attachments = sanitizedAttachments };
+        return incident with
+        {
+            Events = sanitizedEvents,
+            Attachments = sanitizedAttachments,
+            Analysis = SanitizeAnalysis(incident.Analysis, sensitiveHosts),
+        };
+    }
+
+    private static IReadOnlyCollection<string> CollectSensitiveHosts(IncidentRecord incident)
+    {
+        var hosts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var telemetryEvent in incident.Events)
+        {
+            switch (telemetryEvent)
+            {
+                case NetworkProbeSample probe when !string.IsNullOrWhiteSpace(probe.Host):
+                    hosts.Add(probe.Host);
+                    break;
+                case NetworkEndpointSample endpoints:
+                    foreach (var endpoint in endpoints.RemoteEndpoints)
+                    {
+                        if (!string.IsNullOrWhiteSpace(endpoint.RemoteAddress))
+                        {
+                            hosts.Add(endpoint.RemoteAddress);
+                        }
+                    }
+
+                    break;
+            }
+        }
+
+        // Longest first, so an address is not partially replaced by a shorter overlapping match.
+        return hosts.OrderByDescending(item => item.Length).ToArray();
+    }
+
+    private static IncidentAnalysis? SanitizeAnalysis(IncidentAnalysis? analysis, IReadOnlyCollection<string> sensitiveHosts)
+    {
+        if (analysis is null || sensitiveHosts.Count == 0)
+        {
+            return analysis;
+        }
+
+        return analysis with
+        {
+            Summary = Redact(analysis.Summary, sensitiveHosts),
+            Hypotheses = analysis.Hypotheses
+                .Select(item => item with { Evidence = item.Evidence.Select(text => Redact(text, sensitiveHosts)).ToArray() })
+                .ToArray(),
+            TimelineHighlights = analysis.TimelineHighlights
+                .Select(item => item with { Summary = Redact(item.Summary, sensitiveHosts) })
+                .ToArray(),
+        };
+    }
+
+    private static string Redact(string value, IReadOnlyCollection<string> sensitiveHosts)
+    {
+        foreach (var host in sensitiveHosts)
+        {
+            value = value.Replace(host, "[redacted]", StringComparison.OrdinalIgnoreCase);
+        }
+
+        return value;
     }
 
     private static TelemetryEvent SanitizeEvent(TelemetryEvent telemetryEvent)
@@ -156,6 +227,7 @@ public sealed class IncidentBundleExporter : IIncidentExporter
             {
                 RemoteEndpoints = network.RemoteEndpoints.Select(item => item with { RemoteAddress = "[redacted]" }).ToArray(),
             },
+            NetworkProbeSample probe => probe with { Host = "[redacted]" },
             ArtifactEvidence artifact => artifact with { SourceFile = artifact.SourceFile is null ? null : Path.GetFileName(artifact.SourceFile) },
             _ => telemetryEvent,
         };
@@ -168,9 +240,28 @@ public sealed class IncidentBundleExporter : IIncidentExporter
             FrameTelemetrySample frame =>
             [
                 ("frameTimeMs", frame.FrameTimeMs.ToString("F2")),
+                ("cpuBusyMs", frame.CpuBusyMs?.ToString("F2") ?? string.Empty),
+                ("cpuWaitMs", frame.CpuWaitMs?.ToString("F2") ?? string.Empty),
                 ("gpuBusyMs", frame.GpuBusyMs?.ToString("F2") ?? string.Empty),
+                ("gpuWaitMs", frame.GpuWaitMs?.ToString("F2") ?? string.Empty),
+                ("gpuLatencyMs", frame.GpuLatencyMs?.ToString("F2") ?? string.Empty),
                 ("displayLatencyMs", frame.DisplayLatencyMs?.ToString("F2") ?? string.Empty),
+                ("flipDelayMs", frame.FlipDelayMs?.ToString("F2") ?? string.Empty),
+                ("inputLatencyMs", frame.InputLatencyMs?.ToString("F2") ?? string.Empty),
                 ("dropped", frame.Dropped.ToString()),
+            ],
+            GpuTelemetrySample gpu =>
+            [
+                ("isAvailable", gpu.IsAvailable.ToString()),
+                ("adapterName", gpu.AdapterName ?? string.Empty),
+                ("utilizationPercent", gpu.UtilizationPercent?.ToString("F0") ?? string.Empty),
+                ("vramUsedBytes", gpu.UsedVramBytes?.ToString() ?? string.Empty),
+                ("vramTotalBytes", gpu.TotalVramBytes?.ToString() ?? string.Empty),
+                ("vramUsagePercent", gpu.VramUsagePercent?.ToString("F1") ?? string.Empty),
+                ("encoderUtilizationPercent", gpu.EncoderUtilizationPercent?.ToString("F0") ?? string.Empty),
+                ("decoderUtilizationPercent", gpu.DecoderUtilizationPercent?.ToString("F0") ?? string.Empty),
+                ("temperatureCelsius", gpu.TemperatureCelsius?.ToString() ?? string.Empty),
+                ("throttleReasons", string.Join(';', gpu.ThrottleReasons)),
             ],
             SystemTelemetrySample system =>
             [

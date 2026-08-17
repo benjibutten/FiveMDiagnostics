@@ -28,6 +28,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private Task? _finalizeTask;
     private Task[] _collectorTasks = [];
     private volatile bool _isSessionActive;
+    private volatile IReadOnlyList<ArtifactAttachment>? _attachmentsSnapshot;
 
     public DiagnosticsSessionManager(
         DiagnosticsSettings settings,
@@ -55,7 +56,12 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
     public event EventHandler<IncidentRecord>? IncidentCompleted;
 
+    /// <summary>Raised when an existing incident is re-analysed, e.g. after an artifact import.</summary>
+    public event EventHandler<IncidentRecord>? IncidentUpdated;
+
     public event EventHandler<SystemTelemetrySample>? SystemTelemetryUpdated;
+
+    public event EventHandler<GpuTelemetrySample>? GpuTelemetryUpdated;
 
     public bool IsSessionActive => _isSessionActive;
 
@@ -240,15 +246,18 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             lock (_sync)
             {
                 _attachments.Add(result.Attachment);
+                InvalidateAttachmentsSnapshot();
             }
 
             results.Add(result);
             foreach (var evidence in result.Evidence)
             {
-                if (_channel?.Writer.TryWrite(evidence) != true)
-                {
-                    TryAttachEvidenceToLatestIncident(evidence, result.Attachment);
-                }
+                // Two distinct destinations. The channel feeds incidents whose post-window is still
+                // open. An incident that has already been materialized will never see the channel
+                // again, so it has to be updated directly — otherwise importing net_stats for the
+                // stutter you just marked silently does nothing, which is the normal workflow.
+                _ = _channel?.Writer.TryWrite(evidence);
+                TryAttachEvidenceToLatestIncident(evidence, result.Attachment);
             }
 
             Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), $"Artifact importerad: {result.Attachment.DisplayName}.");
@@ -294,6 +303,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         {
             disposable.Dispose();
         }
+
+        (_deepCaptureService as IDisposable)?.Dispose();
     }
 
     private async Task RunCollectorSafeAsync(ITelemetryCollector collector, CollectorContext context, CancellationToken cancellationToken)
@@ -322,6 +333,10 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 if (telemetryEvent is SystemTelemetrySample systemSample)
                 {
                     SystemTelemetryUpdated?.Invoke(this, systemSample);
+                }
+                else if (telemetryEvent is GpuTelemetrySample gpuSample)
+                {
+                    GpuTelemetryUpdated?.Invoke(this, gpuSample);
                 }
 
                 if (_incidentMaterializer is not null && Environment is not null)
@@ -374,16 +389,37 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         }
     }
 
+    /// <summary>
+    /// Attachments change only on import, but the telemetry pump needs them on every event. Caching the
+    /// snapshot keeps that path free of a lock and an array copy per event.
+    /// </summary>
     private IReadOnlyList<ArtifactAttachment> GetAttachments()
     {
+        var cached = _attachmentsSnapshot;
+        if (cached is not null)
+        {
+            return cached;
+        }
+
         lock (_sync)
         {
-            return _attachments.ToArray();
+            return _attachmentsSnapshot = _attachments.ToArray();
         }
     }
 
+    private void InvalidateAttachmentsSnapshot()
+    {
+        _attachmentsSnapshot = null;
+    }
+
+    /// <summary>
+    /// Adds imported evidence to the most recent completed incident and re-runs the analysis, so the
+    /// ranking reflects the new input rather than the state at materialization time.
+    /// </summary>
     private void TryAttachEvidenceToLatestIncident(ArtifactEvidence evidence, ArtifactAttachment attachment)
     {
+        IncidentRecord updated;
+
         lock (_sync)
         {
             if (_incidents.Count == 0)
@@ -392,15 +428,26 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             }
 
             var latest = _incidents[^1];
+            if (latest.Attachments.Any(item => string.Equals(item.FilePath, attachment.FilePath, StringComparison.OrdinalIgnoreCase))
+                && latest.Events.OfType<ArtifactEvidence>().Any(item => item.Summary == evidence.Summary))
+            {
+                return;
+            }
+
             latest = latest with
             {
                 Events = latest.Events.Concat([evidence]).OrderBy(item => item.Timestamp).ToArray(),
-                Attachments = latest.Attachments.Concat([attachment]).ToArray(),
+                Attachments = latest.Attachments.Any(item => string.Equals(item.FilePath, attachment.FilePath, StringComparison.OrdinalIgnoreCase))
+                    ? latest.Attachments
+                    : latest.Attachments.Concat([attachment]).ToArray(),
             };
 
-            latest = latest with { Analysis = _analysisEngine.Analyze(latest) };
-            _incidents[^1] = latest;
+            updated = latest with { Analysis = _analysisEngine.Analyze(latest) };
+            _incidents[^1] = updated;
         }
+
+        IncidentUpdated?.Invoke(this, updated);
+        OnStateChanged();
     }
 
     private async Task CaptureDeepTraceAsync(IncidentMarker marker, CancellationToken cancellationToken)
@@ -415,6 +462,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 lock (_sync)
                 {
                     _attachments.Add(new ArtifactAttachment(result.CapturePath, ArtifactKind.EtlTrace, Path.GetFileName(result.CapturePath), DateTimeOffset.UtcNow, Sensitive: true));
+                    InvalidateAttachmentsSnapshot();
                 }
             }
         }
