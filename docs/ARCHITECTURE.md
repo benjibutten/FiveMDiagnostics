@@ -41,7 +41,17 @@ The collectors write into a bounded channel to keep backpressure explicit.
 - rule-based correlation engine
 - parsers for common FiveM-side artifacts
 
-The analysis intentionally prefers evidence correlation over averages. It also emits `insufficient evidence` if the signals are weak.
+The analysis intentionally prefers evidence correlation over averages. It also emits `insufficient evidence` if the signals are weak, naming which missing input would help most.
+
+Two decisions shape the scoring:
+
+- **Spike thresholds are derived, not fixed.** They come from `max(median frame time, display refresh
+  interval)`, because stutter is deviation from the achieved cadence. A fixed threshold either misses
+  every hitch on a high-refresh display or fires constantly on a low-refresh one.
+- **Slow frames are attributed, not guessed.** The PresentMon v2 CPU/GPU breakdown decides whether a
+  spike was CPU-bound, GPU-bound or present-bound. Without that breakdown the engine falls back to
+  frame-time-only reasoning but caps its confidence lower, so a measured attribution always outranks
+  an inferred one.
 
 ## `FiveMDiagnostics.Export`
 
@@ -54,6 +64,13 @@ The analysis intentionally prefers evidence correlation over averages. It also e
 - tails CSV output incrementally
 - converts rows into frame telemetry samples
 - degrades safely if the dependency is missing
+
+## `FiveMDiagnostics.Integrations.Nvml`
+
+- thin `nvml.dll` binding for GPU utilization, VRAM occupancy, NVENC load and throttle reasons
+- VRAM occupancy is what distinguishes "the GPU is busy" from "the driver is evicting textures over
+  PCIe"; the latter stalls the whole system rather than merely slowing frames
+- degrades to unavailable samples on non-NVIDIA hardware
 
 ## `FiveMDiagnostics.Integrations.Obs`
 
@@ -87,6 +104,7 @@ All telemetry streams share a common base type:
 Important concrete event types:
 
 - `FrameTelemetrySample`
+- `GpuTelemetrySample`
 - `SystemTelemetrySample`
 - `ProcessTelemetrySample`
 - `ObsTelemetrySample`
