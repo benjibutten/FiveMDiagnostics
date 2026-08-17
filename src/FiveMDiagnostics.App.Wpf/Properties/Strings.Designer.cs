@@ -114,4 +114,7 @@ public static class Strings
     public static string LiveMemoryLabel => ResourceManager.GetString("LiveMemoryLabel", Culture) ?? "RAM:";
     public static string LiveRamFreeFormat => ResourceManager.GetString("LiveRamFreeFormat", Culture) ?? "{0} MB free";
     public static string LiveStatsIdle => ResourceManager.GetString("LiveStatsIdle", Culture) ?? "\u2014";
+    public static string LiveVramLabel => ResourceManager.GetString("LiveVramLabel", Culture) ?? "VRAM:";
+    public static string LiveVramFormat => ResourceManager.GetString("LiveVramFormat", Culture) ?? "{0} of {1} GB ({2}%)";
+    public static string LiveVramUnavailable => ResourceManager.GetString("LiveVramUnavailable", Culture) ?? "n/a";
 }

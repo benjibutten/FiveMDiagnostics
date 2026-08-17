@@ -43,6 +43,7 @@ public sealed class MainWindowViewModel : ObservableObject
     private DateTimeOffset _lastStateRefreshUtc = DateTimeOffset.MinValue;
     private string _liveCpuText = Strings.LiveStatsIdle;
     private string _liveMemoryText = Strings.LiveStatsIdle;
+    private string _liveVramText = Strings.LiveStatsIdle;
 
     public MainWindowViewModel(DiagnosticsSessionManager sessionManager, SettingsStore settingsStore, DiagnosticsSettings settings, IUserDialogService dialogService)
     {
@@ -83,7 +84,9 @@ public sealed class MainWindowViewModel : ObservableObject
         _sessionManager.StateChanged += OnSessionStateChanged;
         _sessionManager.StatusReported += OnStatusReported;
         _sessionManager.IncidentCompleted += OnIncidentCompleted;
+        _sessionManager.IncidentUpdated += OnIncidentUpdated;
         _sessionManager.SystemTelemetryUpdated += OnSystemTelemetryUpdated;
+        _sessionManager.GpuTelemetryUpdated += OnGpuTelemetryUpdated;
 
         foreach (var incident in _sessionManager.GetRecentIncidents())
         {
@@ -162,6 +165,12 @@ public sealed class MainWindowViewModel : ObservableObject
     {
         get => _liveMemoryText;
         private set => SetProperty(ref _liveMemoryText, value);
+    }
+
+    public string LiveVramText
+    {
+        get => _liveVramText;
+        private set => SetProperty(ref _liveVramText, value);
     }
 
     public string ServerProfileName
@@ -396,6 +405,19 @@ public sealed class MainWindowViewModel : ObservableObject
         }));
     }
 
+    private void OnGpuTelemetryUpdated(object? sender, GpuTelemetrySample sample)
+    {
+        var text = sample is { IsAvailable: true, UsedVramBytes: { } used, TotalVramBytes: { } total } && total > 0
+            ? string.Format(
+                Strings.LiveVramFormat,
+                (used / 1024d / 1024d / 1024d).ToString("F1"),
+                (total / 1024d / 1024d / 1024d).ToString("F1"),
+                (sample.VramUsagePercent ?? 0).ToString("F0"))
+            : Strings.LiveVramUnavailable;
+
+        _ = _dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() => LiveVramText = text));
+    }
+
     private void OnStatusReported(object? sender, DiagnosticStatusEntry status)
     {
         _pendingStatusEntries.Enqueue(status);
@@ -415,6 +437,39 @@ public sealed class MainWindowViewModel : ObservableObject
         }));
     }
 
+    /// <summary>
+    /// Incidents are immutable records, so a re-analysis produces a new instance that has to replace the
+    /// old one in the list — and be re-selected if the user was looking at it.
+    /// </summary>
+    private void OnIncidentUpdated(object? sender, IncidentRecord incident)
+    {
+        _ = _dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+        {
+            var index = -1;
+            for (var position = 0; position < Incidents.Count; position++)
+            {
+                if (Incidents[position].Id == incident.Id)
+                {
+                    index = position;
+                    break;
+                }
+            }
+
+            if (index < 0)
+            {
+                return;
+            }
+
+            var wasSelected = SelectedIncident?.Id == incident.Id;
+            Incidents[index] = incident;
+
+            if (wasSelected)
+            {
+                SelectedIncident = incident;
+            }
+        }));
+    }
+
     private void RefreshState()
     {
         IsSessionActive = _sessionManager.IsSessionActive;
@@ -426,6 +481,7 @@ public sealed class MainWindowViewModel : ObservableObject
         {
             LiveCpuText = Strings.LiveStatsIdle;
             LiveMemoryText = Strings.LiveStatsIdle;
+            LiveVramText = Strings.LiveStatsIdle;
         }
 
         OnPropertyChanged(nameof(SessionStateText));

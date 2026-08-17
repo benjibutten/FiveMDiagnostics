@@ -136,4 +136,7 @@
   <data name="LiveMemoryLabel" xml:space="preserve"><value>RAM:</value></data>
   <data name="LiveRamFreeFormat" xml:space="preserve"><value>{0} MB ledigt</value></data>
   <data name="LiveStatsIdle" xml:space="preserve"><value>—</value></data>
+  <data name="LiveVramLabel" xml:space="preserve"><value>VRAM:</value></data>
+  <data name="LiveVramFormat" xml:space="preserve"><value>{0} av {1} GB ({2}%)</value></data>
+  <data name="LiveVramUnavailable" xml:space="preserve"><value>saknas</value></data>
 </root>

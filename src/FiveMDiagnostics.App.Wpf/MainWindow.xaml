@@ -80,6 +80,8 @@
                         <TextBlock Text="{Binding LiveCpuText}" Foreground="#EAF4FB" Margin="4,0,0,0" />
                         <TextBlock Text="{x:Static props:Strings.LiveMemoryLabel}" Foreground="#EAF4FB" FontWeight="SemiBold" Margin="20,0,0,0" />
                         <TextBlock Text="{Binding LiveMemoryText}" Foreground="#EAF4FB" Margin="4,0,0,0" />
+                        <TextBlock Text="{x:Static props:Strings.LiveVramLabel}" Foreground="#EAF4FB" FontWeight="SemiBold" Margin="20,0,0,0" />
+                        <TextBlock Text="{Binding LiveVramText}" Foreground="#EAF4FB" Margin="4,0,0,0" />
                     </StackPanel>
                 </StackPanel>
 
