@@ -1,5 +1,6 @@
 using System.IO;
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace FiveMDiagnostics.App.Wpf;
@@ -9,6 +10,7 @@ public sealed class SingleInstanceManager : IAsyncDisposable
     private const string MutexName = "FiveMDiagnostics.App.Wpf.SingleInstance";
     private const string PipeName = "FiveMDiagnostics.App.Wpf.Activation";
     private const string ActivationMessage = "ACTIVATE";
+    private const int AllowAnyProcess = -1;
 
     private readonly Mutex _mutex;
     private readonly CancellationTokenSource _shutdown = new();
@@ -39,6 +41,11 @@ public sealed class SingleInstanceManager : IAsyncDisposable
     {
         try
         {
+            // Windows only lets the foreground process hand its right to raise a window to someone else.
+            // This process still holds that right during startup, so release it before signalling; without
+            // this the first instance can only flash in the taskbar instead of coming to the front.
+            AllowSetForegroundWindow(AllowAnyProcess);
+
             using var client = new NamedPipeClientStream(".", PipeName, PipeDirection.Out, PipeOptions.Asynchronous);
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeout.CancelAfter(TimeSpan.FromSeconds(2));
@@ -80,6 +87,10 @@ public sealed class SingleInstanceManager : IAsyncDisposable
 
         _mutex.Dispose();
     }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AllowSetForegroundWindow(int processId);
 
     private async Task ListenAsync(CancellationToken cancellationToken)
     {

@@ -21,16 +21,21 @@ public partial class App : System.Windows.Application
 		base.OnStartup(e);
 
 		_singleInstanceManager = new SingleInstanceManager();
-		if (!_singleInstanceManager.IsPrimaryInstance)
-		{
-			await SingleInstanceManager.SignalFirstInstanceAsync().ConfigureAwait(true);
-			Shutdown();
-			return;
-		}
 
 		var settingsStore = new SettingsStore();
 		var settings = await settingsStore.LoadAsync().ConfigureAwait(true);
 		ApplyCulture(settings.Language);
+
+		if (!_singleInstanceManager.IsPrimaryInstance)
+		{
+			if (!await SingleInstanceManager.SignalFirstInstanceAsync().ConfigureAwait(true))
+			{
+				new UserDialogService().ShowInfo(Strings.AppTitle, Strings.AlreadyRunningMessage);
+			}
+
+			Shutdown();
+			return;
+		}
 
 		var sessionManager = new DiagnosticsSessionManager(
 			settings,

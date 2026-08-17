@@ -35,21 +35,23 @@
 
   <!-- App-level -->
   <data name="AppTitle" xml:space="preserve"><value>FiveM Diagnostics</value></data>
-  <data name="AppSubtitle" xml:space="preserve"><value>Ett klick för lokal stutterdiagnostik i FiveM. Starta grundläge först och lägg bara till extra verktyg om du behöver dem.</value></data>
+  <data name="AppSubtitle" xml:space="preserve"><value>Ett klick för lokal stutterdiagnostik i FiveM. Starta en session först och lägg bara till extra verktyg om du behöver dem.</value></data>
+  <data name="AlreadyRunningMessage" xml:space="preserve"><value>FiveM Diagnostics körs redan, men det befintliga fönstret svarade inte. Leta efter ikonen i meddelandefältet.</value></data>
   <data name="StateLabel" xml:space="preserve"><value>Tillstånd:</value></data>
   <data name="ActiveProcessLabel" xml:space="preserve"><value>Aktiv process:</value></data>
-  <data name="BasicModeHeader" xml:space="preserve"><value>Grundläge</value></data>
-  <data name="BasicModeIntro" xml:space="preserve"><value>Starta en session och spela. Standardläget samlar redan system-, process- och nätverksdata.</value></data>
-  <data name="BasicModeStepOne" xml:space="preserve"><value>1. Starta grundläge.</value></data>
-  <data name="BasicModeStepTwo" xml:space="preserve"><value>2. Markera stutter när det händer.</value></data>
-  <data name="BasicModeStepThree" xml:space="preserve"><value>3. Exportera senaste incidenten när du är klar.</value></data>
+  <data name="QuickStartHeader" xml:space="preserve"><value>Så funkar det</value></data>
+  <data name="QuickStartIntro" xml:space="preserve"><value>Starta en session och spela. Det finns inget läge att välja — appen samlar alltid system-, process- och nätverksdata.</value></data>
+  <data name="QuickStartStepOne" xml:space="preserve"><value>1. Starta sessionen.</value></data>
+  <data name="QuickStartStepTwo" xml:space="preserve"><value>2. Markera stutter när det händer.</value></data>
+  <data name="QuickStartStepThree" xml:space="preserve"><value>3. Exportera senaste incidenten när du är klar.</value></data>
+  <data name="QuickStartDeepNote" xml:space="preserve"><value>Markera allvarlig stutter startar dessutom en kort WPR-spårning. Det sker automatiskt och kräver att appen körs som administratör.</value></data>
   <data name="PresentMonStatusLabel" xml:space="preserve"><value>Bildrutetelemetri</value></data>
   <data name="PresentMonStatusConfigured" xml:space="preserve"><value>PresentMon är konfigurerat. Bildrutetelemetri kommer att samlas in.</value></data>
   <data name="PresentMonStatusAutoDetected" xml:space="preserve"><value>PresentMon hittades automatiskt. Du behöver inte ange någon sökväg.</value></data>
-  <data name="PresentMonStatusMissing" xml:space="preserve"><value>PresentMon hittades inte. Appen fungerar ändå i grundläge utan det. Lägg till det senare under Avancerat om du vill ha djupare framedata.</value></data>
+  <data name="PresentMonStatusMissing" xml:space="preserve"><value>PresentMon hittades inte. Appen fungerar ändå utan det. Lägg till det senare under Avancerat om du vill ha djupare framedata.</value></data>
   <data name="CaptureFeedbackHeader" xml:space="preserve"><value>Insamlingsstatus</value></data>
   <data name="CaptureFeedbackHint" xml:space="preserve"><value>När du markerar stutter fortsätter appen samla data i ytterligare 60 sekunder innan den färdiga incidenten dyker upp i listan.</value></data>
-  <data name="CaptureFeedbackSessionStarted" xml:space="preserve"><value>Grundläge startat. Appen är redo att ta emot en stutter-markering.</value></data>
+  <data name="CaptureFeedbackSessionStarted" xml:space="preserve"><value>Session startad. Appen är redo att ta emot en stutter-markering.</value></data>
   <data name="CaptureFeedbackCollectingFormat" xml:space="preserve"><value>{0} sparad. Appen fattade klicket och samlar resten av fönstret till {1}. Väntande insamlingar: {2}.</value></data>
   <data name="CaptureFeedbackReadyFormat" xml:space="preserve"><value>{0} är nu klar. Välj den i incidentlistan för att se analysen.</value></data>
   <data name="CaptureFeedbackReadyWithPendingFormat" xml:space="preserve"><value>{0} är nu klar. Det finns fortfarande {1} insamling(ar) som pågår.</value></data>
@@ -58,7 +60,7 @@
   <!-- Controls -->
   <data name="ControlsHeader" xml:space="preserve"><value>Kontroller</value></data>
   <data name="SessionGroup" xml:space="preserve"><value>Snabbstart</value></data>
-  <data name="StartSession" xml:space="preserve"><value>Starta grundläge</value></data>
+  <data name="StartSession" xml:space="preserve"><value>Starta session</value></data>
   <data name="StopSession" xml:space="preserve"><value>Stoppa session</value></data>
   <data name="IncidentActionsGroup" xml:space="preserve"><value>Under spel</value></data>
   <data name="MarkStutter" xml:space="preserve"><value>Markera stutter</value></data>

@@ -87,11 +87,12 @@
 
                 <Border Grid.Column="1" Background="#0F1A22" CornerRadius="16" Padding="16" Width="360">
                     <StackPanel>
-                        <TextBlock Text="{x:Static props:Strings.BasicModeHeader}" FontSize="20" FontWeight="Bold" />
-                        <TextBlock Text="{x:Static props:Strings.BasicModeIntro}" Foreground="#DBE9F4" TextWrapping="Wrap" Margin="0,8,0,8" />
-                        <TextBlock Text="{x:Static props:Strings.BasicModeStepOne}" Foreground="{StaticResource AccentBrush}" FontWeight="SemiBold" Margin="0,4,0,0" />
-                        <TextBlock Text="{x:Static props:Strings.BasicModeStepTwo}" Foreground="#DBE9F4" TextWrapping="Wrap" Margin="0,4,0,0" />
-                        <TextBlock Text="{x:Static props:Strings.BasicModeStepThree}" Foreground="#DBE9F4" TextWrapping="Wrap" Margin="0,4,0,0" />
+                        <TextBlock Text="{x:Static props:Strings.QuickStartHeader}" FontSize="20" FontWeight="Bold" />
+                        <TextBlock Text="{x:Static props:Strings.QuickStartIntro}" Foreground="#DBE9F4" TextWrapping="Wrap" Margin="0,8,0,8" />
+                        <TextBlock Text="{x:Static props:Strings.QuickStartStepOne}" Foreground="{StaticResource AccentBrush}" FontWeight="SemiBold" Margin="0,4,0,0" />
+                        <TextBlock Text="{x:Static props:Strings.QuickStartStepTwo}" Foreground="#DBE9F4" TextWrapping="Wrap" Margin="0,4,0,0" />
+                        <TextBlock Text="{x:Static props:Strings.QuickStartStepThree}" Foreground="#DBE9F4" TextWrapping="Wrap" Margin="0,4,0,0" />
+                        <TextBlock Text="{x:Static props:Strings.QuickStartDeepNote}" Foreground="{StaticResource AccentMutedBrush}" TextWrapping="Wrap" Margin="0,10,0,0" />
                         <TextBlock Text="{x:Static props:Strings.PresentMonStatusLabel}" Foreground="{StaticResource AccentMutedBrush}" FontWeight="SemiBold" Margin="0,12,0,0" />
                         <TextBlock Text="{Binding PresentMonStatusText}" Foreground="#DBE9F4" TextWrapping="Wrap" Margin="0,4,0,0" />
                     </StackPanel>

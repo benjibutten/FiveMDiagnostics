@@ -145,9 +145,12 @@ GPU sampling uses `nvml.dll`, which ships with the NVIDIA display driver and nee
 On a non-NVIDIA machine the collector reports once that NVML is unavailable and then emits samples marked
 unavailable, leaving every other collector untouched.
 
-## Capture modes
+## Capture depth
 
-### Basic mode
+There is no mode selector in the UI. Every session runs the standard capture; the deeper WPR capture is
+switched on automatically by `Mark Severe` and by nothing else.
+
+### Standard capture
 
 - No admin required
 - One-click start with the default settings
@@ -156,7 +159,7 @@ unavailable, leaving every other collector untouched.
 - Uses PresentMon only if it is configured or found automatically
 - Intended to stay low overhead
 
-### Deep mode
+### Deep capture
 
 - Triggered automatically on `Mark Severe`
 - **Requires the app to run as administrator.** `wpr.exe` cannot self-elevate, so the app checks up front
@@ -199,7 +202,7 @@ evidence, so redacting only the event fields would still ship it in prose.
 
 ## Notes on network evidence
 
-In basic mode the app captures:
+Without a deep capture the app captures:
 
 - TCP remote endpoints for the active FiveM/GTA PID
 - UDP local ports for the active PID
@@ -232,7 +235,7 @@ The tests assert that the rule engine distinguishes the OBS/GPU and FiveM resour
 ## Limitations in v1
 
 - PresentMon CLI variants differ between releases, so the executable path and arguments may need adjustment
-- UDP remote endpoint ownership is not fully reconstructed in basic mode without heavier tracing
+- UDP remote endpoint ownership is not fully reconstructed without heavier tracing
 - GPU telemetry is NVIDIA-only; AMD and Intel GPUs report as unavailable
 - GPU samples cover the whole adapter, not per-process VRAM attribution, so the VRAM pressure hypothesis
   requires corroborating present-bound frame spikes before it will fire at all
