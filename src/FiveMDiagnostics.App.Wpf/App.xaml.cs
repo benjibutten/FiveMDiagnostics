@@ -5,6 +5,7 @@ using FiveMDiagnostics.Collectors;
 using FiveMDiagnostics.Core;
 using FiveMDiagnostics.Export;
 using FiveMDiagnostics.Integrations.Etw;
+using FiveMDiagnostics.Integrations.Nvml;
 using FiveMDiagnostics.Integrations.Obs;
 using FiveMDiagnostics.Integrations.PresentMon;
 
@@ -43,6 +44,7 @@ public partial class App : System.Windows.Application
 				new FiveMProcessTelemetryCollector(),
 				new NetworkTelemetryCollector(),
 				new PresentMonTelemetryCollector(),
+				new NvmlGpuTelemetryCollector(),
 				new ObsTelemetryCollector(),
 			],
 			artifactParsers:
