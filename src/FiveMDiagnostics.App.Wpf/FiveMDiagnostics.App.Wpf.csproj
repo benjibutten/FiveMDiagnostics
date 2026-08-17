@@ -32,6 +32,7 @@
     <ProjectReference Include="..\FiveMDiagnostics.Integrations.PresentMon\FiveMDiagnostics.Integrations.PresentMon.csproj" />
     <ProjectReference Include="..\FiveMDiagnostics.Integrations.Obs\FiveMDiagnostics.Integrations.Obs.csproj" />
     <ProjectReference Include="..\FiveMDiagnostics.Integrations.Etw\FiveMDiagnostics.Integrations.Etw.csproj" />
+    <ProjectReference Include="..\FiveMDiagnostics.Integrations.Nvml\FiveMDiagnostics.Integrations.Nvml.csproj" />
     <ProjectReference Include="..\FiveMDiagnostics.Fakes\FiveMDiagnostics.Fakes.csproj" />
   </ItemGroup>
 

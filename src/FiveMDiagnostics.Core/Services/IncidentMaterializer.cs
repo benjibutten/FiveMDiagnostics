@@ -7,6 +7,7 @@ public sealed class IncidentMaterializer
     private readonly TimeSpan _preWindow;
     private readonly TimeSpan _postWindow;
     private readonly Dictionary<Guid, PendingIncident> _pending = new();
+    private int _pendingCount;
 
     public IncidentMaterializer(TimeWindowRingBuffer<TelemetryEvent> ringBuffer, TimeSpan preWindow, TimeSpan postWindow)
     {
@@ -32,6 +33,7 @@ public sealed class IncidentMaterializer
         lock (_sync)
         {
             _pending[marker.Id] = pending;
+            Volatile.Write(ref _pendingCount, _pending.Count);
         }
 
         return marker;
@@ -39,6 +41,13 @@ public sealed class IncidentMaterializer
 
     public IReadOnlyList<IncidentRecord> OnTelemetry(TelemetryEvent telemetryEvent, EnvironmentMetadata environment, IReadOnlyList<ArtifactAttachment> attachments)
     {
+        // Called once per telemetry event, which at PresentMon frame rates is hundreds of times a
+        // second. With nothing pending there is no work to do, so skip the lock and the allocation.
+        if (Volatile.Read(ref _pendingCount) == 0)
+        {
+            return [];
+        }
+
         lock (_sync)
         {
             foreach (var incident in _pending.Values)
@@ -63,12 +72,18 @@ public sealed class IncidentMaterializer
 
     private IReadOnlyList<IncidentRecord> FinalizeDueLocked(DateTimeOffset now, EnvironmentMetadata environment, IReadOnlyList<ArtifactAttachment> attachments)
     {
+        if (_pending.Count == 0)
+        {
+            return [];
+        }
+
         var completed = new List<IncidentRecord>();
         var due = _pending.Values.Where(item => item.WindowEnd <= now).ToArray();
 
         foreach (var pending in due)
         {
             _pending.Remove(pending.Marker.Id);
+            Volatile.Write(ref _pendingCount, _pending.Count);
             var relatedAttachments = attachments
                 .Where(item => item.ImportedAt >= pending.WindowStart && item.ImportedAt <= pending.WindowEnd)
                 .OrderBy(item => item.ImportedAt)

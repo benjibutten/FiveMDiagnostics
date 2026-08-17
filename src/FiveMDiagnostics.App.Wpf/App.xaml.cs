@@ -5,6 +5,7 @@ using FiveMDiagnostics.Collectors;
 using FiveMDiagnostics.Core;
 using FiveMDiagnostics.Export;
 using FiveMDiagnostics.Integrations.Etw;
+using FiveMDiagnostics.Integrations.Nvml;
 using FiveMDiagnostics.Integrations.Obs;
 using FiveMDiagnostics.Integrations.PresentMon;
 
@@ -20,16 +21,21 @@ public partial class App : System.Windows.Application
 		base.OnStartup(e);
 
 		_singleInstanceManager = new SingleInstanceManager();
-		if (!_singleInstanceManager.IsPrimaryInstance)
-		{
-			await SingleInstanceManager.SignalFirstInstanceAsync().ConfigureAwait(true);
-			Shutdown();
-			return;
-		}
 
 		var settingsStore = new SettingsStore();
 		var settings = await settingsStore.LoadAsync().ConfigureAwait(true);
 		ApplyCulture(settings.Language);
+
+		if (!_singleInstanceManager.IsPrimaryInstance)
+		{
+			if (!await SingleInstanceManager.SignalFirstInstanceAsync().ConfigureAwait(true))
+			{
+				new UserDialogService().ShowInfo(Strings.AppTitle, Strings.AlreadyRunningMessage);
+			}
+
+			Shutdown();
+			return;
+		}
 
 		var sessionManager = new DiagnosticsSessionManager(
 			settings,
@@ -43,6 +49,7 @@ public partial class App : System.Windows.Application
 				new FiveMProcessTelemetryCollector(),
 				new NetworkTelemetryCollector(),
 				new PresentMonTelemetryCollector(),
+				new NvmlGpuTelemetryCollector(),
 				new ObsTelemetryCollector(),
 			],
 			artifactParsers:

@@ -49,23 +49,21 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
     {
         while (!cancellationToken.IsCancellationRequested)
         {
-            if (context.ProcessResolver.TryGetTargetProcess() is not null)
-            {
-                var timestamp = context.UtcNow();
-                var (memoryPressure, availableMb) = ReadMemorySnapshot();
-                var (topCpu, topDisk) = SampleProcesses(timestamp);
+            var timestamp = context.UtcNow();
+            var (memoryPressure, availableMb) = ReadMemorySnapshot();
+            var hasTarget = context.ProcessResolver.TryGetTargetProcess() is not null;
+            var (topCpu, topDisk) = hasTarget ? SampleProcesses(timestamp) : ([], []);
 
-                await context.Writer.WriteAsync(
-                    new SystemTelemetrySample(
-                        timestamp,
-                        ReadCpuUsage(_totalCpuCounter),
-                        ReadPerCoreCpuUsage(),
-                        memoryPressure,
-                        availableMb,
-                        topCpu,
-                        topDisk),
-                    cancellationToken).ConfigureAwait(false);
-            }
+            await context.Writer.WriteAsync(
+                new SystemTelemetrySample(
+                    timestamp,
+                    ReadCpuUsage(_totalCpuCounter),
+                    ReadPerCoreCpuUsage(),
+                    memoryPressure,
+                    availableMb,
+                    topCpu,
+                    topDisk),
+                cancellationToken).ConfigureAwait(false);
 
             await Task.Delay(context.Settings.SystemPollingInterval, cancellationToken).ConfigureAwait(false);
         }

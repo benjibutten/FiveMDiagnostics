@@ -30,9 +30,59 @@ public sealed class SettingsStore
             return defaults;
         }
 
-        await using var stream = File.OpenRead(SettingsPath);
-        var settings = await JsonSerializer.DeserializeAsync<DiagnosticsSettings>(stream, JsonOptions, cancellationToken).ConfigureAwait(false);
-        return settings ?? DiagnosticsSettings.CreateDefault();
+        DiagnosticsSettings? settings;
+        await using (var stream = File.OpenRead(SettingsPath))
+        {
+            settings = await JsonSerializer.DeserializeAsync<DiagnosticsSettings>(stream, JsonOptions, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (settings is null)
+        {
+            return DiagnosticsSettings.CreateDefault();
+        }
+
+        if (Migrate(settings))
+        {
+            await SaveAsync(settings, cancellationToken).ConfigureAwait(false);
+        }
+
+        return settings;
+    }
+
+    /// <summary>
+    /// Brings settings persisted by earlier builds up to date. A stale argument template silently keeps
+    /// frame telemetry broken, and a dropped WPR profile silently changes what deep capture records, so
+    /// both are rewritten rather than ignored.
+    /// </summary>
+    private static bool Migrate(DiagnosticsSettings settings)
+    {
+        var changed = false;
+        var template = settings.PresentMon.ArgumentsTemplate?.Trim();
+
+        if (string.IsNullOrWhiteSpace(template)
+            || PresentMonOptions.SupersededArgumentsTemplates.Any(superseded =>
+                string.Equals(template, superseded, StringComparison.OrdinalIgnoreCase)))
+        {
+            settings.PresentMon.ArgumentsTemplate = PresentMonOptions.DefaultArgumentsTemplate;
+            changed = true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(settings.DeepCapture.Profile))
+        {
+            var legacyProfile = settings.DeepCapture.Profile!.Trim();
+
+            // Only a profile the user actually customised is worth carrying over; the old default is
+            // already the first entry of the new stack.
+            if (!settings.DeepCapture.Profiles.Contains(legacyProfile, StringComparer.OrdinalIgnoreCase))
+            {
+                settings.DeepCapture.Profiles.Insert(0, legacyProfile);
+            }
+
+            settings.DeepCapture.Profile = null;
+            changed = true;
+        }
+
+        return changed;
     }
 
     public async Task SaveAsync(DiagnosticsSettings settings, CancellationToken cancellationToken = default)

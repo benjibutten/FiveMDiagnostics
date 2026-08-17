@@ -50,6 +50,51 @@ public static class PresentMonLocator
             }
 
             yield return normalized;
+
+            // Releases ship as PresentMon-2.4.1-x64.exe rather than a plain PresentMon.exe, so probe
+            // the containing directory for a versioned build too.
+            foreach (var versioned in EnumerateVersionedCandidates(normalized))
+            {
+                if (seen.Add(versioned))
+                {
+                    yield return versioned;
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<string> EnumerateVersionedCandidates(string candidate)
+    {
+        string? directory;
+        try
+        {
+            directory = Path.GetDirectoryName(candidate);
+        }
+        catch
+        {
+            yield break;
+        }
+
+        if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
+        {
+            yield break;
+        }
+
+        string[] matches;
+        try
+        {
+            matches = Directory.GetFiles(directory, "PresentMon*.exe", SearchOption.TopDirectoryOnly);
+        }
+        catch
+        {
+            yield break;
+        }
+
+        // Highest version name last alphabetically is a good enough proxy for "newest".
+        Array.Sort(matches, StringComparer.OrdinalIgnoreCase);
+        for (var index = matches.Length - 1; index >= 0; index--)
+        {
+            yield return matches[index];
         }
     }
 
@@ -74,6 +119,11 @@ public static class PresentMonLocator
         AddCandidate(candidates, Environment.SpecialFolder.ProgramFilesX86, "PresentMon", ExecutableName);
         AddCandidate(candidates, Environment.SpecialFolder.LocalApplicationData, "Programs", "PresentMon", ExecutableName);
         AddCandidate(candidates, Environment.SpecialFolder.CommonApplicationData, "PresentMon", ExecutableName);
+
+        foreach (var root in new[] { "C:\\Tools\\PresentMon", "C:\\PresentMon" })
+        {
+            candidates.Add(Path.Combine(root, ExecutableName));
+        }
 
         return candidates;
     }

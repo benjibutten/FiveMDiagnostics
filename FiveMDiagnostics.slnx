@@ -7,6 +7,7 @@
     <Project Path="src/FiveMDiagnostics.Export/FiveMDiagnostics.Export.csproj" />
     <Project Path="src/FiveMDiagnostics.Fakes/FiveMDiagnostics.Fakes.csproj" />
     <Project Path="src/FiveMDiagnostics.Integrations.Etw/FiveMDiagnostics.Integrations.Etw.csproj" />
+    <Project Path="src/FiveMDiagnostics.Integrations.Nvml/FiveMDiagnostics.Integrations.Nvml.csproj" />
     <Project Path="src/FiveMDiagnostics.Integrations.Obs/FiveMDiagnostics.Integrations.Obs.csproj" />
     <Project Path="src/FiveMDiagnostics.Integrations.PresentMon/FiveMDiagnostics.Integrations.PresentMon.csproj" />
   </Folder>

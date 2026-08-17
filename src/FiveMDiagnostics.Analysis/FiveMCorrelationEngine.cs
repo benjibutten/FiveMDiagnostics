@@ -1,30 +1,43 @@
-using System.Globalization;
-using System.Text.Json;
-
 namespace FiveMDiagnostics.Analysis;
 
 using FiveMDiagnostics.Core;
 
 public sealed class FiveMCorrelationEngine : IAnalysisEngine
 {
+    /// <summary>
+    /// Stutter is deviation from the cadence the machine is actually achieving, not absolute frame time.
+    /// A fixed 25 ms threshold misses every hitch on a 120 Hz display and fires constantly on a 30 fps
+    /// one, so thresholds are derived from the observed median and the display's refresh interval.
+    /// </summary>
+    private const double SpikeMultiplier = 1.5;
+    private const double SevereMultiplier = 2.5;
+
+    /// <summary>VRAM occupancy at which the driver starts evicting resources across PCIe.</summary>
+    private const double VramPressurePercent = 90;
+    private const double VramCriticalPercent = 95;
+
     public IncidentAnalysis Analyze(IncidentRecord incident)
     {
         var frameSamples = incident.GetEvents<FrameTelemetrySample>();
         var systemSamples = incident.GetEvents<SystemTelemetrySample>();
         var processSamples = incident.GetEvents<ProcessTelemetrySample>();
         var obsSamples = incident.GetEvents<ObsTelemetrySample>();
+        var gpuSamples = incident.GetEvents<GpuTelemetrySample>();
         var networkProbes = incident.GetEvents<NetworkProbeSample>();
         var networkEndpoints = incident.GetEvents<NetworkEndpointSample>();
         var artifacts = incident.GetEvents<ArtifactEvidence>();
 
-        var metrics = BuildFrameMetrics(frameSamples);
+        var metrics = BuildFrameMetrics(frameSamples, incident.Environment.DisplayRefreshRateHz);
+        var gpu = BuildGpuMetrics(gpuSamples);
+        var cores = BuildCoreMetrics(systemSamples);
         var suspectedProcesses = AnalyzeSuspiciousProcesses(systemSamples);
         var hypotheses = new List<HypothesisScore>();
 
-        AddObsHypothesis(hypotheses, metrics, obsSamples);
-        AddGpuHypothesis(hypotheses, metrics, obsSamples, systemSamples);
-        AddResourceHypothesis(hypotheses, metrics, processSamples, artifacts, obsSamples, systemSamples);
-        AddNetworkHypothesis(hypotheses, metrics, networkProbes, networkEndpoints, systemSamples, obsSamples);
+        AddVramHypothesis(hypotheses, metrics, gpu);
+        AddObsHypothesis(hypotheses, metrics, obsSamples, gpu);
+        AddGpuHypothesis(hypotheses, metrics, obsSamples, systemSamples, gpu);
+        AddResourceHypothesis(hypotheses, metrics, processSamples, artifacts, obsSamples, systemSamples, cores);
+        AddNetworkHypothesis(hypotheses, metrics, networkProbes, networkEndpoints, artifacts, systemSamples, obsSamples);
         AddDiskHypothesis(hypotheses, metrics, processSamples, systemSamples, artifacts);
         AddExternalProcessHypothesis(hypotheses, suspectedProcesses);
         AddOsLatencyHypothesis(hypotheses, metrics, artifacts, systemSamples, obsSamples);
@@ -42,9 +55,9 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                 ["Det fanns inte tillräckligt med samstämmig telemetry för en säker klassificering."]));
         }
 
-        var highlights = BuildHighlights(incident, metrics, hypotheses.First(), artifacts, obsSamples, networkProbes, suspectedProcesses);
+        var highlights = BuildHighlights(incident, metrics, hypotheses.First(), artifacts, obsSamples, gpu, networkProbes, suspectedProcesses);
         var top = hypotheses[0];
-        var summary = BuildSummary(top, metrics, obsSamples, artifacts, networkProbes, suspectedProcesses);
+        var summary = BuildSummary(top, metrics, obsSamples, gpu, artifacts, networkProbes, suspectedProcesses);
 
         return new IncidentAnalysis(
             hypotheses,
@@ -54,30 +67,218 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             suspectedProcesses);
     }
 
-    private static FrameMetrics BuildFrameMetrics(IReadOnlyList<FrameTelemetrySample> frameSamples)
+    private static FrameMetrics BuildFrameMetrics(IReadOnlyList<FrameTelemetrySample> frameSamples, double? refreshRateHz)
     {
         if (frameSamples.Count == 0)
         {
-            return new FrameMetrics(0, 0, 0, 0, 0, 0);
+            return FrameMetrics.Empty;
         }
 
         var sorted = frameSamples.Select(item => item.FrameTimeMs).OrderBy(value => value).ToArray();
-        var p95Index = Math.Clamp((int)Math.Floor(sorted.Length * 0.95) - 1, 0, sorted.Length - 1);
-        var p99Index = Math.Clamp((int)Math.Floor(sorted.Length * 0.99) - 1, 0, sorted.Length - 1);
-        var spikeCount = frameSamples.Count(item => item.FrameTimeMs >= 25);
-        var severeCount = frameSamples.Count(item => item.FrameTimeMs >= 40);
-        var longestSpike = frameSamples.Where(item => item.FrameTimeMs >= 25).Select(item => item.FrameTimeMs).DefaultIfEmpty().Max();
+        var median = Percentile(sorted, 0.50);
+        var refreshInterval = refreshRateHz is > 0 ? 1000d / refreshRateHz.Value : 1000d / 60;
+
+        // Take whichever is larger: a game locked to 60 fps on a 165 Hz panel is not stuttering, so the
+        // achieved cadence is the honest baseline; a game that should hit 120 Hz should not get graded
+        // against a median that a bad window has already dragged upwards.
+        var baseline = Math.Max(median, refreshInterval);
+        var spikeThreshold = Math.Max(baseline * SpikeMultiplier, 10);
+        var severeThreshold = Math.Max(baseline * SevereMultiplier, 16);
+
+        var spikes = frameSamples.Where(item => item.FrameTimeMs >= spikeThreshold).ToArray();
+        // Attribution needs BOTH sides. PresentMon v1 supplies msGPUActive but no CPU figure, and a
+        // missing CPU value is indistinguishable from an idle CPU — which would silently turn every
+        // v1 spike into a "GPU-bound" or "present-bound" verdict the data cannot support.
+        var breakdownSamples = frameSamples.Where(item => item.CpuBusyMs is not null && item.GpuBusyMs is not null).ToArray();
+
+        var cpuBound = 0;
+        var gpuBound = 0;
+        var presentBound = 0;
+
+        foreach (var spike in spikes)
+        {
+            switch (ClassifySpike(spike, baseline))
+            {
+                case SpikeKind.CpuBound:
+                    cpuBound++;
+                    break;
+                case SpikeKind.GpuBound:
+                    gpuBound++;
+                    break;
+                case SpikeKind.PresentBound:
+                    presentBound++;
+                    break;
+            }
+        }
 
         return new FrameMetrics(
+            frameSamples.Count,
+            median,
+            baseline,
+            spikeThreshold,
+            severeThreshold,
             frameSamples.Average(item => item.FrameTimeMs),
-            sorted[p95Index],
-            sorted[p99Index],
-            spikeCount,
-            severeCount,
-            longestSpike);
+            Percentile(sorted, 0.95),
+            Percentile(sorted, 0.99),
+            spikes.Length,
+            frameSamples.Count(item => item.FrameTimeMs >= severeThreshold),
+            spikes.Select(item => item.FrameTimeMs).DefaultIfEmpty().Max(),
+            breakdownSamples.Length > 0,
+            cpuBound,
+            gpuBound,
+            presentBound,
+            frameSamples.Select(item => item.CpuBusyMs ?? 0).DefaultIfEmpty().Max(),
+            frameSamples.Select(item => item.GpuBusyMs ?? 0).DefaultIfEmpty().Max(),
+            frameSamples.Select(item => item.GpuWaitMs ?? 0).DefaultIfEmpty().Max(),
+            frameSamples.Select(item => item.FlipDelayMs ?? 0).DefaultIfEmpty().Max(),
+            frameSamples.Count(item => item.Dropped));
     }
 
-    private static void AddObsHypothesis(List<HypothesisScore> hypotheses, FrameMetrics metrics, IReadOnlyList<ObsTelemetrySample> obsSamples)
+    /// <summary>
+    /// Attributes a single slow frame. This is the whole point of the PresentMon v2 breakdown: a spike
+    /// where the CPU was busy is a script/resource problem, one where the GPU was busy is contention,
+    /// and one where neither was busy is the present or display path stalling.
+    /// </summary>
+    private static SpikeKind ClassifySpike(FrameTelemetrySample sample, double baseline)
+    {
+        // Both figures are required: treating a missing value as zero would fabricate an attribution.
+        if (sample.CpuBusyMs is not { } cpu || sample.GpuBusyMs is not { } gpu)
+        {
+            return SpikeKind.Unknown;
+        }
+
+        if (cpu > gpu && cpu >= baseline)
+        {
+            return SpikeKind.CpuBound;
+        }
+
+        if (gpu >= cpu && gpu >= baseline)
+        {
+            return SpikeKind.GpuBound;
+        }
+
+        // Frame took long but neither engine was working: the time went into waiting to present.
+        return SpikeKind.PresentBound;
+    }
+
+    private static GpuMetrics BuildGpuMetrics(IReadOnlyList<GpuTelemetrySample> samples)
+    {
+        var available = samples.Where(item => item.IsAvailable).ToArray();
+        if (available.Length == 0)
+        {
+            return GpuMetrics.Empty;
+        }
+
+        var throttleReasons = available
+            .SelectMany(item => item.ThrottleReasons)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        return new GpuMetrics(
+            HasData: true,
+            available[^1].AdapterName,
+            available.Select(item => item.UtilizationPercent ?? 0).DefaultIfEmpty().Max(),
+            available.Select(item => item.VramUsagePercent ?? 0).DefaultIfEmpty().Max(),
+            available.Select(item => ToGigabytes(item.UsedVramBytes ?? 0)).DefaultIfEmpty().Max(),
+            available.Select(item => ToGigabytes(item.TotalVramBytes ?? 0)).DefaultIfEmpty().Max(),
+            available.Select(item => item.EncoderUtilizationPercent ?? 0).DefaultIfEmpty().Max(),
+            throttleReasons);
+    }
+
+    /// <summary>
+    /// FiveM's main thread is the practical bottleneck for script work, so one core pinned while the
+    /// machine as a whole is idle is much stronger evidence of a resource spike than total CPU load.
+    /// </summary>
+    private static CoreMetrics BuildCoreMetrics(IReadOnlyList<SystemTelemetrySample> systemSamples)
+    {
+        var withCores = systemSamples.Where(item => item.PerCoreUsagePercent.Count > 0).ToArray();
+        if (withCores.Length == 0)
+        {
+            return CoreMetrics.Empty;
+        }
+
+        var saturated = 0;
+        double peakSingleCore = 0;
+
+        foreach (var sample in withCores)
+        {
+            var maxCore = sample.PerCoreUsagePercent.Values.DefaultIfEmpty().Max();
+            peakSingleCore = Math.Max(peakSingleCore, maxCore);
+
+            if (maxCore >= 92 && sample.TotalCpuUsagePercent < 65)
+            {
+                saturated++;
+            }
+        }
+
+        return new CoreMetrics(
+            withCores.Length,
+            saturated,
+            Math.Round(peakSingleCore, 1),
+            systemSamples.Select(item => item.TotalCpuUsagePercent).DefaultIfEmpty().Max());
+    }
+
+    /// <summary>
+    /// High VRAM occupancy on its own is not a fault — a game is supposed to use the memory it has, and
+    /// NVML reports the whole adapter rather than this process. It only becomes a root cause when the
+    /// frame data shows the stalls that eviction produces, so occupancy alone never raises a hypothesis.
+    /// </summary>
+    private static void AddVramHypothesis(List<HypothesisScore> hypotheses, FrameMetrics metrics, GpuMetrics gpu)
+    {
+        if (!gpu.HasData || gpu.PeakVramPercent < VramPressurePercent || metrics.SpikeCount == 0)
+        {
+            return;
+        }
+
+        // The signature of eviction is a long frame where neither engine was working. Without the
+        // per-frame breakdown that distinction cannot be made, so this stays a weak correlation.
+        if (metrics.HasCpuGpuBreakdown && metrics.PresentBoundSpikes == 0)
+        {
+            return;
+        }
+
+        var evidence = new List<string>();
+        double confidence;
+
+        if (gpu.PeakVramPercent >= VramCriticalPercent)
+        {
+            confidence = 0.4;
+            evidence.Add($"VRAM låg på {gpu.PeakVramPercent:F0}% ({gpu.PeakVramUsedGb:F1} av {gpu.TotalVramGb:F1} GB). Vid den nivån börjar drivrutinen evakuera resurser över PCIe.");
+        }
+        else
+        {
+            confidence = 0.25;
+            evidence.Add($"VRAM toppade på {gpu.PeakVramPercent:F0}% ({gpu.PeakVramUsedGb:F1} av {gpu.TotalVramGb:F1} GB), nära gränsen där eviction börjar.");
+        }
+
+        if (metrics.HasCpuGpuBreakdown)
+        {
+            var share = (double)metrics.PresentBoundSpikes / metrics.SpikeCount;
+            confidence += share >= 0.5 ? 0.3 : 0.15;
+            evidence.Add($"{metrics.PresentBoundSpikes} av {metrics.SpikeCount} frametime-spikes hade varken CPU- eller GPU-arbete igång, vilket är signaturen för att vänta på minnesflytt snarare än på beräkning.");
+        }
+        else
+        {
+            evidence.Add($"{metrics.SpikeCount} frametime-spikes sammanföll med det höga VRAM-trycket, men utan PresentMon --v2_metrics går det inte att bekräfta att de var present-bundna.");
+        }
+
+        if (metrics.SevereSpikeCount > 0)
+        {
+            confidence += 0.15;
+            evidence.Add($"{metrics.SevereSpikeCount} spikes över {metrics.SevereThresholdMs:F0} ms inträffade under samma fönster.");
+        }
+
+        if (gpu.PeakEncoderPercent >= 25)
+        {
+            confidence += 0.1;
+            evidence.Add($"NVENC låg på {gpu.PeakEncoderPercent:F0}%, så encodern konkurrerade om samma GPU-minne.");
+        }
+
+        evidence.Add("Obs: VRAM mäts per grafikkort, inte per process, så andra program bidrar till siffran.");
+        hypotheses.Add(new HypothesisScore(RootCauseCategory.GpuVramPressure, Math.Min(confidence, 0.95), evidence));
+    }
+
+    private static void AddObsHypothesis(List<HypothesisScore> hypotheses, FrameMetrics metrics, IReadOnlyList<ObsTelemetrySample> obsSamples, GpuMetrics gpu)
     {
         if (obsSamples.Count == 0)
         {
@@ -118,7 +319,13 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         if (metrics.SevereSpikeCount > 0)
         {
             confidence += 0.15;
-            evidence.Add($"Frametime hade {metrics.SevereSpikeCount} spikes över 40 ms samtidigt som OBS var aktivt.");
+            evidence.Add($"Frametime hade {metrics.SevereSpikeCount} spikes över {metrics.SevereThresholdMs:F0} ms samtidigt som OBS var aktivt.");
+        }
+
+        if (gpu.HasData && gpu.PeakEncoderPercent >= 40)
+        {
+            confidence += 0.1;
+            evidence.Add($"NVENC-encodern toppade på {gpu.PeakEncoderPercent:F0}%.");
         }
 
         if (confidence > 0)
@@ -127,42 +334,70 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         }
     }
 
-    private static void AddGpuHypothesis(List<HypothesisScore> hypotheses, FrameMetrics metrics, IReadOnlyList<ObsTelemetrySample> obsSamples, IReadOnlyList<SystemTelemetrySample> systemSamples)
+    private static void AddGpuHypothesis(
+        List<HypothesisScore> hypotheses,
+        FrameMetrics metrics,
+        IReadOnlyList<ObsTelemetrySample> obsSamples,
+        IReadOnlyList<SystemTelemetrySample> systemSamples,
+        GpuMetrics gpu)
     {
         var evidence = new List<string>();
         double confidence = 0;
 
-        if (metrics.P99FrameTime >= 30)
+        // With the v2 breakdown this stops being a guess: only count it as GPU contention when the GPU
+        // was actually the busy party during the slow frames.
+        if (metrics.HasCpuGpuBreakdown && metrics.GpuBoundSpikes > 0)
         {
-            confidence += 0.25;
-            evidence.Add($"P99 frametime låg på {metrics.P99FrameTime:F1} ms.");
+            confidence += 0.4;
+            evidence.Add($"{metrics.GpuBoundSpikes} av {metrics.SpikeCount} frametime-spikes var GPU-bundna (GPU busy dominerade frametiden).");
         }
 
-        if (metrics.LongestSpikeMs >= 45)
+        if (metrics.MaxGpuWaitMs >= 5)
         {
             confidence += 0.2;
-            evidence.Add($"Längsta frametime-spiken nådde {metrics.LongestSpikeMs:F1} ms.");
+            evidence.Add($"GPU wait nådde {metrics.MaxGpuWaitMs:F1} ms, vilket pekar på köbildning mot GPU:n.");
         }
 
-        if (systemSamples.Any(item => item.TotalCpuUsagePercent < 85) && obsSamples.All(item => !item.IsConnected))
+        if (gpu.HasData && gpu.PeakUtilizationPercent >= 97)
+        {
+            confidence += 0.2;
+            evidence.Add($"GPU-utilization låg på {gpu.PeakUtilizationPercent:F0}%.");
+        }
+
+        if (gpu.ThrottleReasons.Count > 0)
+        {
+            confidence += 0.2;
+            evidence.Add($"GPU:n rapporterade throttling: {string.Join(", ", gpu.ThrottleReasons)}.");
+        }
+
+        if (metrics.P99FrameTime >= metrics.SevereThresholdMs)
         {
             confidence += 0.15;
-            evidence.Add("Lokalt CPU-tryck såg inte extremt ut och OBS var inte en medverkande faktor.");
+            evidence.Add($"P99 frametime låg på {metrics.P99FrameTime:F1} ms mot en baseline på {metrics.BaselineFrameTime:F1} ms.");
         }
 
-        if (metrics.SpikeCount >= 4)
+        // Without a breakdown the old frame-time-only reasoning is all that is available, so keep it but
+        // do not let it reach the same confidence as a measured attribution.
+        if (!metrics.HasCpuGpuBreakdown && metrics.SpikeCount >= 4 && systemSamples.Any(item => item.TotalCpuUsagePercent < 85) && obsSamples.All(item => !item.IsConnected))
         {
-            confidence += 0.2;
-            evidence.Add($"Det fanns {metrics.SpikeCount} frametime-spikes över 25 ms i fönstret.");
+            confidence += 0.25;
+            evidence.Add($"Det fanns {metrics.SpikeCount} frametime-spikes över {metrics.SpikeThresholdMs:F0} ms utan tydligt CPU- eller OBS-tryck.");
         }
 
         if (confidence > 0)
         {
-            hypotheses.Add(new HypothesisScore(RootCauseCategory.GpuFrametimeContention, Math.Min(confidence, 0.85), evidence));
+            hypotheses.Add(new HypothesisScore(RootCauseCategory.GpuFrametimeContention, Math.Min(confidence, 0.9), evidence));
         }
     }
 
-    private static void AddResourceHypothesis(List<HypothesisScore> hypotheses, FrameMetrics metrics, IReadOnlyList<ProcessTelemetrySample> processSamples, IReadOnlyList<ArtifactEvidence> artifacts, IReadOnlyList<ObsTelemetrySample> obsSamples, IReadOnlyList<SystemTelemetrySample> systemSamples)
+    private static void AddResourceHypothesis(
+        List<HypothesisScore> hypotheses,
+        FrameMetrics metrics,
+        IReadOnlyList<ProcessTelemetrySample> processSamples,
+        IReadOnlyList<ArtifactEvidence> artifacts,
+        IReadOnlyList<ObsTelemetrySample> obsSamples,
+        IReadOnlyList<SystemTelemetrySample> systemSamples,
+        CoreMetrics cores)
     {
         var evidence = new List<string>();
         double confidence = 0;
@@ -172,6 +407,18 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         {
             confidence += 0.45;
             evidence.AddRange(profilerEvidence.Select(item => item.Summary));
+        }
+
+        if (metrics.HasCpuGpuBreakdown && metrics.CpuBoundSpikes > 0)
+        {
+            confidence += 0.35;
+            evidence.Add($"{metrics.CpuBoundSpikes} av {metrics.SpikeCount} frametime-spikes var CPU-bundna (CPU busy dominerade frametiden).");
+        }
+
+        if (cores.HasData && cores.SaturatedCoreSamples > 0)
+        {
+            confidence += 0.2;
+            evidence.Add($"En enskild kärna toppade på {cores.PeakSingleCoreUsage:F0}% medan totala CPU-lasten låg lågt i {cores.SaturatedCoreSamples} mätpunkter, vilket är typiskt för FiveM:s main thread.");
         }
 
         var maxFiveMCpu = processSamples.Select(item => item.CpuUsagePercent).DefaultIfEmpty().Max();
@@ -190,7 +437,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         if (metrics.SpikeCount > 0)
         {
             confidence += 0.1;
-            evidence.Add($"Frametime-problemet syns tydligt lokalt med {metrics.SpikeCount} spikes.");
+            evidence.Add($"Frametime-problemet syns tydligt lokalt med {metrics.SpikeCount} spikes över {metrics.SpikeThresholdMs:F0} ms.");
         }
 
         if (confidence > 0)
@@ -199,10 +446,49 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         }
     }
 
-    private static void AddNetworkHypothesis(List<HypothesisScore> hypotheses, FrameMetrics metrics, IReadOnlyList<NetworkProbeSample> probes, IReadOnlyList<NetworkEndpointSample> endpoints, IReadOnlyList<SystemTelemetrySample> systemSamples, IReadOnlyList<ObsTelemetrySample> obsSamples)
+    private static void AddNetworkHypothesis(
+        List<HypothesisScore> hypotheses,
+        FrameMetrics metrics,
+        IReadOnlyList<NetworkProbeSample> probes,
+        IReadOnlyList<NetworkEndpointSample> endpoints,
+        IReadOnlyList<ArtifactEvidence> artifacts,
+        IReadOnlyList<SystemTelemetrySample> systemSamples,
+        IReadOnlyList<ObsTelemetrySample> obsSamples)
     {
         var evidence = new List<string>();
         double confidence = 0;
+
+        // net_statsFile is the client's own view of the connection and is far stronger evidence than an
+        // ICMP probe, which only measures the path and not the game protocol.
+        foreach (var netStats in artifacts.Where(item => item.Kind == ArtifactKind.NetStatsCsv))
+        {
+            var packetLoss = netStats.Metrics.GetValueOrDefault("avgPacketLossPercent", 0);
+            var peakPing = netStats.Metrics.GetValueOrDefault("max_avgPingMs", 0);
+            var jitter = netStats.Metrics.GetValueOrDefault("avgJitterMs", 0);
+
+            if (packetLoss >= 1)
+            {
+                confidence += packetLoss >= 3 ? 0.4 : 0.25;
+                evidence.Add($"net_statsFile visade {packetLoss:F1}% packet loss.");
+            }
+
+            if (jitter >= 30)
+            {
+                confidence += 0.25;
+                evidence.Add($"net_statsFile visade {jitter:F0} ms jitter.");
+            }
+
+            if (peakPing >= 120)
+            {
+                confidence += 0.2;
+                evidence.Add($"net_statsFile visade ping upp till {peakPing:F0} ms.");
+            }
+
+            if (packetLoss < 1 && jitter < 30 && peakPing < 120)
+            {
+                evidence.Add($"net_statsFile såg friskt ut (ping {netStats.Metrics.GetValueOrDefault("avgPingMs", 0):F0} ms, jitter {jitter:F0} ms, loss {packetLoss:F1}%), vilket talar emot en nätorsak.");
+            }
+        }
 
         var successfulProbes = probes.Where(item => item.Success && item.RoundTripTimeMs is not null).ToArray();
         var failedProbes = probes.Count(item => !item.Success);
@@ -233,7 +519,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             evidence.Add("Aktiva remote endpoints fanns under incidenten.");
         }
 
-        if (metrics.P95FrameTime < 28 && systemSamples.Any(item => item.TotalCpuUsagePercent < 75) && obsSamples.All(item => !item.IsConnected))
+        // A network incident should look like a healthy local machine that is nonetheless hitching.
+        if (metrics.SpikeCount == 0 && systemSamples.Any(item => item.TotalCpuUsagePercent < 75) && obsSamples.All(item => !item.IsConnected))
         {
             confidence += 0.2;
             evidence.Add("Lokal maskin såg stabil ut trots försämrat nätbeteende.");
@@ -245,7 +532,12 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         }
     }
 
-    private static void AddDiskHypothesis(List<HypothesisScore> hypotheses, FrameMetrics metrics, IReadOnlyList<ProcessTelemetrySample> processSamples, IReadOnlyList<SystemTelemetrySample> systemSamples, IReadOnlyList<ArtifactEvidence> artifacts)
+    private static void AddDiskHypothesis(
+        List<HypothesisScore> hypotheses,
+        FrameMetrics metrics,
+        IReadOnlyList<ProcessTelemetrySample> processSamples,
+        IReadOnlyList<SystemTelemetrySample> systemSamples,
+        IReadOnlyList<ArtifactEvidence> artifacts)
     {
         var evidence = new List<string>();
         double confidence = 0;
@@ -303,20 +595,54 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             evidence));
     }
 
-    private static void AddOsLatencyHypothesis(List<HypothesisScore> hypotheses, FrameMetrics metrics, IReadOnlyList<ArtifactEvidence> artifacts, IReadOnlyList<SystemTelemetrySample> systemSamples, IReadOnlyList<ObsTelemetrySample> obsSamples)
+    private static void AddOsLatencyHypothesis(
+        List<HypothesisScore> hypotheses,
+        FrameMetrics metrics,
+        IReadOnlyList<ArtifactEvidence> artifacts,
+        IReadOnlyList<SystemTelemetrySample> systemSamples,
+        IReadOnlyList<ObsTelemetrySample> obsSamples)
     {
-        var latencyArtifacts = artifacts.Where(item => item.Kind == ArtifactKind.EtlTrace || item.Summary.Contains("DPC", StringComparison.OrdinalIgnoreCase) || item.Summary.Contains("ISR", StringComparison.OrdinalIgnoreCase)).ToArray();
+        var latencyArtifacts = artifacts
+            .Where(item => item.Kind == ArtifactKind.EtlTrace
+                || item.Summary.Contains("DPC", StringComparison.OrdinalIgnoreCase)
+                || item.Summary.Contains("ISR", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+
         if (latencyArtifacts.Length == 0)
         {
             return;
         }
 
-        double confidence = 0.35;
+        double confidence = 0.3;
         var evidence = latencyArtifacts.Select(item => item.Summary).Distinct().ToList();
+
+        // Measured DPC duration is the actual discriminator; event counts alone say nothing.
+        var maxDpcMs = latencyArtifacts.Select(item => item.Metrics.GetValueOrDefault("dpcMaxMs", 0)).DefaultIfEmpty().Max();
+        var maxIsrMs = latencyArtifacts.Select(item => item.Metrics.GetValueOrDefault("isrMaxMs", 0)).DefaultIfEmpty().Max();
+        var worstLatency = Math.Max(maxDpcMs, maxIsrMs);
+
+        if (worstLatency >= 4)
+        {
+            confidence += 0.35;
+            evidence.Add($"Längsta DPC/ISR höll CPU:n i {worstLatency:F2} ms, vilket blockerar schemaläggaren och drabbar alla trådar samtidigt.");
+        }
+        else if (worstLatency >= 1)
+        {
+            confidence += 0.15;
+            evidence.Add($"Längsta DPC/ISR låg på {worstLatency:F2} ms.");
+        }
+
+        // A stall that hits the present path without CPU or GPU work is what an OS-level freeze looks
+        // like from the frame data's point of view.
+        if (metrics.PresentBoundSpikes > 0)
+        {
+            confidence += 0.15;
+            evidence.Add($"{metrics.PresentBoundSpikes} spikes saknade både CPU- och GPU-arbete, vilket stämmer med en systemwide stall.");
+        }
 
         if (metrics.SevereSpikeCount > 0)
         {
-            confidence += 0.15;
+            confidence += 0.1;
             evidence.Add("Severe frametime-spikes syns samtidigt som ETW-latency-signaler.");
         }
 
@@ -326,7 +652,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             evidence.Add("Ingen annan stark lokal contention-stack överröstade ETW-fynden.");
         }
 
-        hypotheses.Add(new HypothesisScore(RootCauseCategory.OsOrDriverLatency, Math.Min(confidence, 0.82), evidence));
+        hypotheses.Add(new HypothesisScore(RootCauseCategory.OsOrDriverLatency, Math.Min(confidence, 0.9), evidence));
     }
 
     private static void AddCorruptionHypothesis(List<HypothesisScore> hypotheses, IReadOnlyList<ArtifactEvidence> artifacts)
@@ -343,13 +669,37 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             corruption.Select(item => item.Summary).Distinct().ToArray()));
     }
 
-    private static IReadOnlyList<TimelineHighlight> BuildHighlights(IncidentRecord incident, FrameMetrics metrics, HypothesisScore top, IReadOnlyList<ArtifactEvidence> artifacts, IReadOnlyList<ObsTelemetrySample> obsSamples, IReadOnlyList<NetworkProbeSample> probes, IReadOnlyList<SuspectedProcessImpact> suspectedProcesses)
+    private static IReadOnlyList<TimelineHighlight> BuildHighlights(
+        IncidentRecord incident,
+        FrameMetrics metrics,
+        HypothesisScore top,
+        IReadOnlyList<ArtifactEvidence> artifacts,
+        IReadOnlyList<ObsTelemetrySample> obsSamples,
+        GpuMetrics gpu,
+        IReadOnlyList<NetworkProbeSample> probes,
+        IReadOnlyList<SuspectedProcessImpact> suspectedProcesses)
     {
         var highlights = new List<TimelineHighlight>
         {
             new(incident.Marker.MarkedAt, "Marker", $"{incident.Marker.Label} markerad {incident.Marker.MarkedAt:HH:mm:ss}."),
-            new(incident.Marker.MarkedAt, "Frame", $"P95 {metrics.P95FrameTime:F1} ms, P99 {metrics.P99FrameTime:F1} ms, {metrics.SpikeCount} spikes över 25 ms."),
+            new(incident.Marker.MarkedAt, "Frame", $"Baseline {metrics.BaselineFrameTime:F1} ms, P95 {metrics.P95FrameTime:F1} ms, P99 {metrics.P99FrameTime:F1} ms, {metrics.SpikeCount} spikes över {metrics.SpikeThresholdMs:F0} ms."),
         };
+
+        if (metrics.HasCpuGpuBreakdown && metrics.SpikeCount > 0)
+        {
+            highlights.Add(new(
+                incident.Marker.MarkedAt,
+                "Frame attribution",
+                $"Spikes fördelade som CPU-bundna {metrics.CpuBoundSpikes}, GPU-bundna {metrics.GpuBoundSpikes}, present/display {metrics.PresentBoundSpikes}."));
+        }
+
+        if (gpu.HasData)
+        {
+            highlights.Add(new(
+                incident.Marker.MarkedAt,
+                "GPU",
+                $"{gpu.AdapterName ?? "GPU"}: peak {gpu.PeakUtilizationPercent:F0}% util, VRAM {gpu.PeakVramUsedGb:F1}/{gpu.TotalVramGb:F1} GB ({gpu.PeakVramPercent:F0}%), NVENC {gpu.PeakEncoderPercent:F0}%."));
+        }
 
         var obs = obsSamples.LastOrDefault(item => item.IsConnected);
         if (obs is not null)
@@ -368,7 +718,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         var suspect = suspectedProcesses.FirstOrDefault();
         if (suspect is not null)
         {
-            highlights.Add(new(suspect.ProcessId is null ? incident.Marker.MarkedAt : incident.Marker.MarkedAt, "Processes", $"Misstänkt sidoprocess: {suspect.ProcessName} ({suspect.Reason}, peak CPU {suspect.PeakCpuPercent:F0}%, disk {suspect.PeakIoMegabytesPerSecond:F1} MB/s)."));
+            highlights.Add(new(incident.Marker.MarkedAt, "Processes", $"Misstänkt sidoprocess: {suspect.ProcessName} ({suspect.Reason}, peak CPU {suspect.PeakCpuPercent:F0}%, disk {suspect.PeakIoMegabytesPerSecond:F1} MB/s)."));
         }
 
         highlights.AddRange(artifacts.Take(3).Select(item => new TimelineHighlight(item.Timestamp, item.Kind.ToString(), item.Summary)));
@@ -376,21 +726,54 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         return highlights.OrderBy(item => item.Timestamp).ToArray();
     }
 
-    private static string BuildSummary(HypothesisScore top, FrameMetrics metrics, IReadOnlyList<ObsTelemetrySample> obsSamples, IReadOnlyList<ArtifactEvidence> artifacts, IReadOnlyList<NetworkProbeSample> probes, IReadOnlyList<SuspectedProcessImpact> suspectedProcesses)
+    private static string BuildSummary(
+        HypothesisScore top,
+        FrameMetrics metrics,
+        IReadOnlyList<ObsTelemetrySample> obsSamples,
+        GpuMetrics gpu,
+        IReadOnlyList<ArtifactEvidence> artifacts,
+        IReadOnlyList<NetworkProbeSample> probes,
+        IReadOnlyList<SuspectedProcessImpact> suspectedProcesses)
     {
         if (top.Category == RootCauseCategory.InsufficientEvidence)
         {
-            return "Insufficient evidence. Kör gärna en ny session i grundläge igen. Om du vill ha djupare framedata kan du lägga till PresentMon om det finns tillgängligt, eller bifoga profiler/net_stats eller en kort deep capture för severe stutters.";
+            var missing = new List<string>();
+            if (!metrics.HasCpuGpuBreakdown)
+            {
+                missing.Add("PresentMon med --v2_metrics (ger CPU/GPU-uppdelning per frame)");
+            }
+
+            if (!gpu.HasData)
+            {
+                missing.Add("GPU-telemetri (VRAM och encoder-last)");
+            }
+
+            if (artifacts.Count == 0)
+            {
+                missing.Add("profiler/net_stats eller en deep capture");
+            }
+
+            var hint = missing.Count > 0
+                ? $" Starkast förbättring just nu: {string.Join(", ", missing)}."
+                : string.Empty;
+
+            return $"Insufficient evidence. Kör gärna en ny session i grundläge igen.{hint}";
         }
 
         var obsActive = obsSamples.Any(item => item.IsConnected) ? "OBS var aktivt." : "OBS var inte aktivt.";
+        var attribution = metrics.HasCpuGpuBreakdown && metrics.SpikeCount > 0
+            ? $" Av {metrics.SpikeCount} spikes var {metrics.CpuBoundSpikes} CPU-bundna, {metrics.GpuBoundSpikes} GPU-bundna och {metrics.PresentBoundSpikes} present/display-bundna."
+            : string.Empty;
+        var vramHint = gpu.HasData
+            ? $" VRAM toppade på {gpu.PeakVramPercent:F0}% ({gpu.PeakVramUsedGb:F1}/{gpu.TotalVramGb:F1} GB)."
+            : string.Empty;
         var artifactHint = artifacts.Count > 0 ? $" {artifacts.Count} importerade artifacts bidrog till bedömningen." : string.Empty;
         var probeHint = probes.Any() ? " Nätprober fanns tillgängliga i incidentfönstret." : string.Empty;
         var suspectHint = suspectedProcesses.FirstOrDefault() is { } suspect
             ? $" Mest avvikande bakgrundsprocess: {suspect.ProcessName} ({suspect.Reason.ToLowerInvariant()})."
             : string.Empty;
 
-        return $"Trolig rotorsak: {ToLabel(top.Category)} ({top.Confidence:P0}). Frametime-fönstret hade P95 {metrics.P95FrameTime:F1} ms och P99 {metrics.P99FrameTime:F1} ms. {obsActive}{artifactHint}{probeHint}{suspectHint}";
+        return $"Trolig rotorsak: {ToLabel(top.Category)} ({top.Confidence:P0}). Frametime-fönstret hade baseline {metrics.BaselineFrameTime:F1} ms, P95 {metrics.P95FrameTime:F1} ms och P99 {metrics.P99FrameTime:F1} ms.{attribution}{vramHint} {obsActive}{artifactHint}{probeHint}{suspectHint}";
     }
 
     private static IReadOnlyList<SuspectedProcessImpact> AnalyzeSuspiciousProcesses(IReadOnlyList<SystemTelemetrySample> systemSamples)
@@ -479,6 +862,17 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         return "återkommande belastning i bakgrunden";
     }
 
+    private static double Percentile(double[] sortedValues, double percentile)
+    {
+        if (sortedValues.Length == 0)
+        {
+            return 0;
+        }
+
+        var index = Math.Clamp((int)Math.Floor(sortedValues.Length * percentile) - 1, 0, sortedValues.Length - 1);
+        return sortedValues[index];
+    }
+
     private static long Delta(IEnumerable<long?> samples)
     {
         var values = samples.Where(item => item.HasValue).Select(item => item!.Value).ToArray();
@@ -490,11 +884,17 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         return bytes / 1024d / 1024d;
     }
 
+    private static double ToGigabytes(ulong bytes)
+    {
+        return bytes / 1024d / 1024d / 1024d;
+    }
+
     private static string ToLabel(RootCauseCategory category)
     {
         return category switch
         {
             RootCauseCategory.GpuFrametimeContention => "GPU/frametime contention",
+            RootCauseCategory.GpuVramPressure => "GPU VRAM pressure (texture eviction)",
             RootCauseCategory.ObsRenderOutputContention => "OBS/render/output contention",
             RootCauseCategory.FiveMResourceSpike => "FiveM resource/script spike",
             RootCauseCategory.NetworkJitterOrPacketLoss => "Network jitter/packet loss/routing issue",
@@ -506,180 +906,60 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         };
     }
 
-    private sealed record FrameMetrics(double AverageFrameTime, double P95FrameTime, double P99FrameTime, int SpikeCount, int SevereSpikeCount, double LongestSpikeMs);
-}
-
-public sealed class NetStatsCsvArtifactParser : IArtifactParser
-{
-    public bool CanParse(string path)
+    private enum SpikeKind
     {
-        return Path.GetExtension(path).Equals(".csv", StringComparison.OrdinalIgnoreCase)
-            && Path.GetFileName(path).Contains("net", StringComparison.OrdinalIgnoreCase);
+        Unknown,
+        CpuBound,
+        GpuBound,
+        PresentBound,
     }
 
-    public async Task<ArtifactParseResult?> ParseAsync(string path, CancellationToken cancellationToken)
+    private sealed record FrameMetrics(
+        int SampleCount,
+        double MedianFrameTime,
+        double BaselineFrameTime,
+        double SpikeThresholdMs,
+        double SevereThresholdMs,
+        double AverageFrameTime,
+        double P95FrameTime,
+        double P99FrameTime,
+        int SpikeCount,
+        int SevereSpikeCount,
+        double LongestSpikeMs,
+        bool HasCpuGpuBreakdown,
+        int CpuBoundSpikes,
+        int GpuBoundSpikes,
+        int PresentBoundSpikes,
+        double MaxCpuBusyMs,
+        double MaxGpuBusyMs,
+        double MaxGpuWaitMs,
+        double MaxFlipDelayMs,
+        int DroppedCount)
     {
-        var lines = await File.ReadAllLinesAsync(path, cancellationToken).ConfigureAwait(false);
-        if (lines.Length < 2)
-        {
-            return CreateResult(path, ArtifactKind.NetStatsCsv, [], ["CSV-filen var tom eller saknade datapunkter."]);
-        }
-
-        var headers = lines[0].Split(',').Select(item => item.Trim()).ToArray();
-        var rows = lines.Skip(1).Select(line => line.Split(',')).ToArray();
-        var metrics = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
-
-        ExtractColumnMetric(headers, rows, metrics, "ping", "avgPingMs");
-        ExtractColumnMetric(headers, rows, metrics, "jitter", "avgJitterMs");
-        ExtractColumnMetric(headers, rows, metrics, "loss", "avgPacketLossPercent");
-
-        var evidence = new List<ArtifactEvidence>();
-        if (metrics.Count > 0)
-        {
-            var summary = $"net_statsFile visade ping {metrics.GetValueOrDefault("avgPingMs", 0):F0} ms, jitter {metrics.GetValueOrDefault("avgJitterMs", 0):F0} ms och packet loss {metrics.GetValueOrDefault("avgPacketLossPercent", 0):F1}%";
-            evidence.Add(new ArtifactEvidence(DateTimeOffset.UtcNow, ArtifactKind.NetStatsCsv, summary, metrics, path));
-        }
-
-        return CreateResult(path, ArtifactKind.NetStatsCsv, evidence, []);
+        public static FrameMetrics Empty { get; } = new(0, 0, 16.67, 25, 40, 0, 0, 0, 0, 0, 0, false, 0, 0, 0, 0, 0, 0, 0, 0);
     }
 
-    private static void ExtractColumnMetric(string[] headers, string[][] rows, Dictionary<string, double> metrics, string nameHint, string outputKey)
+    private sealed record GpuMetrics(
+        bool HasData,
+        string? AdapterName,
+        double PeakUtilizationPercent,
+        double PeakVramPercent,
+        double PeakVramUsedGb,
+        double TotalVramGb,
+        double PeakEncoderPercent,
+        IReadOnlyList<string> ThrottleReasons)
     {
-        var index = Array.FindIndex(headers, header => header.Contains(nameHint, StringComparison.OrdinalIgnoreCase));
-        if (index < 0)
-        {
-            return;
-        }
-
-        var values = rows
-            .Where(row => row.Length > index && double.TryParse(row[index], NumberStyles.Float, CultureInfo.InvariantCulture, out _))
-            .Select(row => double.Parse(row[index], CultureInfo.InvariantCulture))
-            .ToArray();
-
-        if (values.Length > 0)
-        {
-            metrics[outputKey] = values.Average();
-            metrics[$"max_{outputKey}"] = values.Max();
-        }
+        public static GpuMetrics Empty { get; } = new(false, null, 0, 0, 0, 0, 0, []);
     }
 
-    private static ArtifactParseResult CreateResult(string path, ArtifactKind kind, IReadOnlyList<ArtifactEvidence> evidence, IReadOnlyList<string> notes)
+    private sealed record CoreMetrics(
+        int TotalSamples,
+        int SaturatedCoreSamples,
+        double PeakSingleCoreUsage,
+        double PeakTotalUsage)
     {
-        return new ArtifactParseResult(
-            new ArtifactAttachment(path, kind, Path.GetFileName(path), DateTimeOffset.UtcNow, Sensitive: true),
-            evidence,
-            notes);
-    }
-}
+        public static CoreMetrics Empty { get; } = new(0, 0, 0, 0);
 
-public sealed class ProfilerJsonArtifactParser : IArtifactParser
-{
-    public bool CanParse(string path)
-    {
-        return Path.GetExtension(path).Equals(".json", StringComparison.OrdinalIgnoreCase)
-            && Path.GetFileName(path).Contains("profile", StringComparison.OrdinalIgnoreCase);
-    }
-
-    public async Task<ArtifactParseResult?> ParseAsync(string path, CancellationToken cancellationToken)
-    {
-        await using var stream = File.OpenRead(path);
-        using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
-
-        var evidence = new List<ArtifactEvidence>();
-        if (document.RootElement.TryGetProperty("resources", out var resources) && resources.ValueKind == JsonValueKind.Array)
-        {
-            var heaviest = resources.EnumerateArray()
-                .Select(resource => new
-                {
-                    Name = resource.TryGetProperty("name", out var name) ? name.GetString() : "unknown",
-                    TimeMs = TryGetNumber(resource, "timeMs") ?? TryGetNumber(resource, "cpuMs") ?? 0,
-                })
-                .OrderByDescending(item => item.TimeMs)
-                .FirstOrDefault();
-
-            if (heaviest is not null)
-            {
-                evidence.Add(new ArtifactEvidence(
-                    DateTimeOffset.UtcNow,
-                    ArtifactKind.ProfilerJson,
-                    $"Profiler JSON pekade ut resource '{heaviest.Name}' med {heaviest.TimeMs:F1} ms.",
-                    new Dictionary<string, double> { ["topResourceMs"] = heaviest.TimeMs },
-                    path));
-            }
-        }
-
-        if (evidence.Count == 0)
-        {
-            evidence.Add(new ArtifactEvidence(
-                DateTimeOffset.UtcNow,
-                ArtifactKind.ProfilerJson,
-                "Profiler JSON importerades men kunde bara analyseras generiskt. Kontrollera filformatet för mer detaljerad resursklassning.",
-                new Dictionary<string, double>(),
-                path));
-        }
-
-        return new ArtifactParseResult(
-            new ArtifactAttachment(path, ArtifactKind.ProfilerJson, Path.GetFileName(path), DateTimeOffset.UtcNow, Sensitive: true),
-            evidence,
-            []);
-    }
-
-    private static double? TryGetNumber(JsonElement element, string propertyName)
-    {
-        return element.TryGetProperty(propertyName, out var property) && property.TryGetDouble(out var value)
-            ? value
-            : null;
-    }
-}
-
-public sealed class ResmonArtifactParser : IArtifactParser
-{
-    public bool CanParse(string path)
-    {
-        var fileName = Path.GetFileName(path);
-        return fileName.Contains("resmon", StringComparison.OrdinalIgnoreCase)
-            || fileName.Contains("resource", StringComparison.OrdinalIgnoreCase);
-    }
-
-    public async Task<ArtifactParseResult?> ParseAsync(string path, CancellationToken cancellationToken)
-    {
-        var content = await File.ReadAllTextAsync(path, cancellationToken).ConfigureAwait(false);
-        var lines = content.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
-        var suspiciousLine = lines.FirstOrDefault(line => line.Contains("ms", StringComparison.OrdinalIgnoreCase) || line.Contains("cpu", StringComparison.OrdinalIgnoreCase));
-        var summary = suspiciousLine is null
-            ? "resmon/export importerades som manuellt bevis."
-            : $"resmon/export antyder resource-spike: {suspiciousLine.Trim()}";
-
-        return new ArtifactParseResult(
-            new ArtifactAttachment(path, ArtifactKind.ResmonSnapshot, Path.GetFileName(path), DateTimeOffset.UtcNow, Sensitive: true),
-            [new ArtifactEvidence(DateTimeOffset.UtcNow, ArtifactKind.ResmonSnapshot, summary, new Dictionary<string, double>(), path)],
-            []);
-    }
-}
-
-public sealed class LogArtifactParser : IArtifactParser
-{
-    private static readonly string[] Keywords = ["cache", "corrupt", "stream", "timeout", "failed to load", "resource"];
-
-    public bool CanParse(string path)
-    {
-        var extension = Path.GetExtension(path);
-        return extension.Equals(".log", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".txt", StringComparison.OrdinalIgnoreCase);
-    }
-
-    public async Task<ArtifactParseResult?> ParseAsync(string path, CancellationToken cancellationToken)
-    {
-        var lines = await File.ReadAllLinesAsync(path, cancellationToken).ConfigureAwait(false);
-        var hits = lines.Where(line => Keywords.Any(keyword => line.Contains(keyword, StringComparison.OrdinalIgnoreCase))).Take(10).ToArray();
-
-        var evidence = hits.Length == 0
-            ? [new ArtifactEvidence(DateTimeOffset.UtcNow, ArtifactKind.LogFile, "Loggfil importerades utan starka signaturer i snabbparsen.", new Dictionary<string, double>(), path)]
-            : hits.Select(line => new ArtifactEvidence(DateTimeOffset.UtcNow, ArtifactKind.LogFile, $"Logghint: {line.Trim()}", new Dictionary<string, double>(), path)).ToArray();
-
-        return new ArtifactParseResult(
-            new ArtifactAttachment(path, ArtifactKind.LogFile, Path.GetFileName(path), DateTimeOffset.UtcNow, Sensitive: true),
-            evidence,
-            []);
+        public bool HasData => TotalSamples > 0;
     }
 }

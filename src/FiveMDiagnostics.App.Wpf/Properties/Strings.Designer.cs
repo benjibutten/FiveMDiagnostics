@@ -18,20 +18,22 @@ public static class Strings
 
     public static string AppTitle => ResourceManager.GetString("AppTitle", Culture) ?? "FiveM Diagnostics";
     public static string AppSubtitle => ResourceManager.GetString("AppSubtitle", Culture) ?? "";
-    public static string StateLabel => ResourceManager.GetString("StateLabel", Culture) ?? "State:";
+    public static string AlreadyRunningMessage => ResourceManager.GetString("AlreadyRunningMessage", Culture) ?? "FiveM Diagnostics is already running, but the running window did not respond. Look for the icon in the notification area.";
+    public static string StateLabel =>ResourceManager.GetString("StateLabel", Culture) ?? "State:";
     public static string ActiveProcessLabel => ResourceManager.GetString("ActiveProcessLabel", Culture) ?? "Active process:";
-    public static string BasicModeHeader => ResourceManager.GetString("BasicModeHeader", Culture) ?? "Basic mode";
-    public static string BasicModeIntro => ResourceManager.GetString("BasicModeIntro", Culture) ?? "Start a session and play. The default setup already collects system, process and network evidence.";
-    public static string BasicModeStepOne => ResourceManager.GetString("BasicModeStepOne", Culture) ?? "1. Start a basic session.";
-    public static string BasicModeStepTwo => ResourceManager.GetString("BasicModeStepTwo", Culture) ?? "2. Mark stutter when it happens.";
-    public static string BasicModeStepThree => ResourceManager.GetString("BasicModeStepThree", Culture) ?? "3. Export the latest incident when you're done.";
+    public static string QuickStartHeader => ResourceManager.GetString("QuickStartHeader", Culture) ?? "How it works";
+    public static string QuickStartIntro => ResourceManager.GetString("QuickStartIntro", Culture) ?? "Start a session and play. There is no mode to pick — the app always collects system, process and network evidence.";
+    public static string QuickStartStepOne => ResourceManager.GetString("QuickStartStepOne", Culture) ?? "1. Start the session.";
+    public static string QuickStartStepTwo => ResourceManager.GetString("QuickStartStepTwo", Culture) ?? "2. Mark stutter when it happens.";
+    public static string QuickStartStepThree => ResourceManager.GetString("QuickStartStepThree", Culture) ?? "3. Export the latest incident when you're done.";
+    public static string QuickStartDeepNote => ResourceManager.GetString("QuickStartDeepNote", Culture) ?? "Mark severe stutter additionally starts a short WPR trace. That is automatic and requires the app to run as administrator.";
     public static string PresentMonStatusLabel => ResourceManager.GetString("PresentMonStatusLabel", Culture) ?? "Frame telemetry";
     public static string PresentMonStatusConfigured => ResourceManager.GetString("PresentMonStatusConfigured", Culture) ?? "PresentMon is configured. Frame telemetry will be included.";
     public static string PresentMonStatusAutoDetected => ResourceManager.GetString("PresentMonStatusAutoDetected", Culture) ?? "PresentMon was found automatically. No manual path is needed.";
-    public static string PresentMonStatusMissing => ResourceManager.GetString("PresentMonStatusMissing", Culture) ?? "PresentMon was not found. The app still works in basic mode without it; add it later under Advanced if you want deeper frame data.";
+    public static string PresentMonStatusMissing => ResourceManager.GetString("PresentMonStatusMissing", Culture) ?? "PresentMon was not found. The app still works without it; add it later under Advanced if you want deeper frame data.";
     public static string CaptureFeedbackHeader => ResourceManager.GetString("CaptureFeedbackHeader", Culture) ?? "Capture status";
     public static string CaptureFeedbackHint => ResourceManager.GetString("CaptureFeedbackHint", Culture) ?? "When you mark stutter, the app keeps collecting for another 60 seconds before the finished incident appears in the list.";
-    public static string CaptureFeedbackSessionStarted => ResourceManager.GetString("CaptureFeedbackSessionStarted", Culture) ?? "Basic session started. The app is ready to capture a stutter marker.";
+    public static string CaptureFeedbackSessionStarted => ResourceManager.GetString("CaptureFeedbackSessionStarted", Culture) ?? "Session started. The app is ready to capture a stutter marker.";
     public static string CaptureFeedbackCollectingFormat => ResourceManager.GetString("CaptureFeedbackCollectingFormat", Culture) ?? "{0} saved. The app understood the click and is collecting the rest of the capture window until {1}. Pending captures: {2}.";
     public static string CaptureFeedbackReadyFormat => ResourceManager.GetString("CaptureFeedbackReadyFormat", Culture) ?? "{0} is now ready. Select it in the incident list to inspect the analysis.";
     public static string CaptureFeedbackReadyWithPendingFormat => ResourceManager.GetString("CaptureFeedbackReadyWithPendingFormat", Culture) ?? "{0} is now ready. There are still {1} capture(s) being collected.";
@@ -39,7 +41,7 @@ public static class Strings
 
     public static string ControlsHeader => ResourceManager.GetString("ControlsHeader", Culture) ?? "Controls";
     public static string SessionGroup => ResourceManager.GetString("SessionGroup", Culture) ?? "Quick start";
-    public static string StartSession => ResourceManager.GetString("StartSession", Culture) ?? "Start basic session";
+    public static string StartSession => ResourceManager.GetString("StartSession", Culture) ?? "Start session";
     public static string StopSession => ResourceManager.GetString("StopSession", Culture) ?? "Stop Session";
     public static string IncidentActionsGroup => ResourceManager.GetString("IncidentActionsGroup", Culture) ?? "During gameplay";
     public static string MarkStutter => ResourceManager.GetString("MarkStutter", Culture) ?? "Mark Stutter";
@@ -109,4 +111,12 @@ public static class Strings
     public static string SelectIncidentHint => ResourceManager.GetString("SelectIncidentHint", Culture) ?? "";
     public static string SettingsSavedFormat => ResourceManager.GetString("SettingsSavedFormat", Culture) ?? "Settings saved to {0}.";
     public static string IncidentExportedTitle => ResourceManager.GetString("IncidentExportedTitle", Culture) ?? "Incident exported";
+
+    public static string LiveCpuLabel => ResourceManager.GetString("LiveCpuLabel", Culture) ?? "CPU:";
+    public static string LiveMemoryLabel => ResourceManager.GetString("LiveMemoryLabel", Culture) ?? "RAM:";
+    public static string LiveRamFreeFormat => ResourceManager.GetString("LiveRamFreeFormat", Culture) ?? "{0} MB free";
+    public static string LiveStatsIdle => ResourceManager.GetString("LiveStatsIdle", Culture) ?? "\u2014";
+    public static string LiveVramLabel => ResourceManager.GetString("LiveVramLabel", Culture) ?? "VRAM:";
+    public static string LiveVramFormat => ResourceManager.GetString("LiveVramFormat", Culture) ?? "{0} of {1} GB ({2}%)";
+    public static string LiveVramUnavailable => ResourceManager.GetString("LiveVramUnavailable", Culture) ?? "n/a";
 }

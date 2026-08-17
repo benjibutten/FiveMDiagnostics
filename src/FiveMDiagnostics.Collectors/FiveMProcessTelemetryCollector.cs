@@ -22,7 +22,7 @@ public sealed class FiveMProcessTelemetryCollector : ITelemetryCollector
                 {
                     using var process = Process.GetProcessById(target.ProcessId);
                     var timestamp = context.UtcNow();
-                    if (ProcessMetricsReader.TryRead(process, timestamp, out var snapshot))
+                    if (ProcessMetricsReader.TryRead(process, timestamp, out var snapshot, includeThreadCount: true))
                     {
                         var cpu = _previousSnapshot is { } previous && previous.ProcessId == snapshot.ProcessId
                             ? ProcessMetricsReader.ComputeCpuPercent(snapshot, previous)

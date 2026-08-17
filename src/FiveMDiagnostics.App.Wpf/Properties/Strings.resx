@@ -35,21 +35,23 @@
 
   <!-- App-level -->
   <data name="AppTitle" xml:space="preserve"><value>FiveM Diagnostics</value></data>
-  <data name="AppSubtitle" xml:space="preserve"><value>One-click local stutter diagnostics for FiveM. Start a basic session first and add extras only if you need them.</value></data>
+  <data name="AppSubtitle" xml:space="preserve"><value>One-click local stutter diagnostics for FiveM. Start a session first and add extras only if you need them.</value></data>
+  <data name="AlreadyRunningMessage" xml:space="preserve"><value>FiveM Diagnostics is already running, but the running window did not respond. Look for the icon in the notification area.</value></data>
   <data name="StateLabel" xml:space="preserve"><value>State:</value></data>
   <data name="ActiveProcessLabel" xml:space="preserve"><value>Active process:</value></data>
-  <data name="BasicModeHeader" xml:space="preserve"><value>Basic mode</value></data>
-  <data name="BasicModeIntro" xml:space="preserve"><value>Start a session and play. The default setup already collects system, process and network evidence.</value></data>
-  <data name="BasicModeStepOne" xml:space="preserve"><value>1. Start a basic session.</value></data>
-  <data name="BasicModeStepTwo" xml:space="preserve"><value>2. Mark stutter when it happens.</value></data>
-  <data name="BasicModeStepThree" xml:space="preserve"><value>3. Export the latest incident when you're done.</value></data>
+  <data name="QuickStartHeader" xml:space="preserve"><value>How it works</value></data>
+  <data name="QuickStartIntro" xml:space="preserve"><value>Start a session and play. There is no mode to pick — the app always collects system, process and network evidence.</value></data>
+  <data name="QuickStartStepOne" xml:space="preserve"><value>1. Start the session.</value></data>
+  <data name="QuickStartStepTwo" xml:space="preserve"><value>2. Mark stutter when it happens.</value></data>
+  <data name="QuickStartStepThree" xml:space="preserve"><value>3. Export the latest incident when you're done.</value></data>
+  <data name="QuickStartDeepNote" xml:space="preserve"><value>Mark severe stutter additionally starts a short WPR trace. That is automatic and requires the app to run as administrator.</value></data>
   <data name="PresentMonStatusLabel" xml:space="preserve"><value>Frame telemetry</value></data>
   <data name="PresentMonStatusConfigured" xml:space="preserve"><value>PresentMon is configured. Frame telemetry will be included.</value></data>
   <data name="PresentMonStatusAutoDetected" xml:space="preserve"><value>PresentMon was found automatically. No manual path is needed.</value></data>
-  <data name="PresentMonStatusMissing" xml:space="preserve"><value>PresentMon was not found. The app still works in basic mode without it; add it later under Advanced if you want deeper frame data.</value></data>
+  <data name="PresentMonStatusMissing" xml:space="preserve"><value>PresentMon was not found. The app still works without it; add it later under Advanced if you want deeper frame data.</value></data>
   <data name="CaptureFeedbackHeader" xml:space="preserve"><value>Capture status</value></data>
   <data name="CaptureFeedbackHint" xml:space="preserve"><value>When you mark stutter, the app keeps collecting for another 60 seconds before the finished incident appears in the list.</value></data>
-  <data name="CaptureFeedbackSessionStarted" xml:space="preserve"><value>Basic session started. The app is ready to capture a stutter marker.</value></data>
+  <data name="CaptureFeedbackSessionStarted" xml:space="preserve"><value>Session started. The app is ready to capture a stutter marker.</value></data>
   <data name="CaptureFeedbackCollectingFormat" xml:space="preserve"><value>{0} saved. The app understood the click and is collecting the rest of the capture window until {1}. Pending captures: {2}.</value></data>
   <data name="CaptureFeedbackReadyFormat" xml:space="preserve"><value>{0} is now ready. Select it in the incident list to inspect the analysis.</value></data>
   <data name="CaptureFeedbackReadyWithPendingFormat" xml:space="preserve"><value>{0} is now ready. There are still {1} capture(s) being collected.</value></data>
@@ -58,7 +60,7 @@
   <!-- Controls -->
   <data name="ControlsHeader" xml:space="preserve"><value>Controls</value></data>
   <data name="SessionGroup" xml:space="preserve"><value>Quick start</value></data>
-  <data name="StartSession" xml:space="preserve"><value>Start basic session</value></data>
+  <data name="StartSession" xml:space="preserve"><value>Start session</value></data>
   <data name="StopSession" xml:space="preserve"><value>Stop Session</value></data>
   <data name="IncidentActionsGroup" xml:space="preserve"><value>During gameplay</value></data>
   <data name="MarkStutter" xml:space="preserve"><value>Mark Stutter</value></data>
@@ -132,4 +134,11 @@
   <data name="SelectIncidentHint" xml:space="preserve"><value>Select an incident to inspect its summary and supporting evidence.</value></data>
   <data name="SettingsSavedFormat" xml:space="preserve"><value>Settings saved to {0}.</value></data>
   <data name="IncidentExportedTitle" xml:space="preserve"><value>Incident exported</value></data>
+  <data name="LiveCpuLabel" xml:space="preserve"><value>CPU:</value></data>
+  <data name="LiveMemoryLabel" xml:space="preserve"><value>RAM:</value></data>
+  <data name="LiveRamFreeFormat" xml:space="preserve"><value>{0} MB free</value></data>
+  <data name="LiveStatsIdle" xml:space="preserve"><value>—</value></data>
+  <data name="LiveVramLabel" xml:space="preserve"><value>VRAM:</value></data>
+  <data name="LiveVramFormat" xml:space="preserve"><value>{0} of {1} GB ({2}%)</value></data>
+  <data name="LiveVramUnavailable" xml:space="preserve"><value>n/a</value></data>
 </root>

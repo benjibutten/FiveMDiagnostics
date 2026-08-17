@@ -8,7 +8,14 @@ public sealed class FiveMTargetProcessResolver : ITargetProcessResolver
 {
     private static readonly nint InvalidHandleValue = -1;
     private const uint SnapshotProcessFlag = 0x00000002;
-    private static readonly string[] CandidateTokens = ["FiveM", "GTAProcess"];
+    private static readonly string[] CandidateTokens = ["FiveM", "GTAProcess", "GTA5"];
+
+    /// <summary>
+    /// This app's own name contains "FiveM", so without an explicit exclusion a second instance is a
+    /// perfectly good candidate and the whole session ends up profiling the diagnostics tool itself.
+    /// </summary>
+    private static readonly string[] ExcludedTokens = ["FiveMDiagnostics"];
+
     private readonly object _sync = new();
     private readonly TimeSpan _activeCacheDuration = TimeSpan.FromMilliseconds(750);
     private readonly TimeSpan _idleCacheDuration = TimeSpan.FromSeconds(3);
@@ -58,7 +65,7 @@ public sealed class FiveMTargetProcessResolver : ITargetProcessResolver
                 }
 
                 var processName = Path.GetFileNameWithoutExtension(entry.ExecutableFile);
-                if (string.IsNullOrWhiteSpace(processName) || !CandidateTokens.Any(token => processName.Contains(token, StringComparison.OrdinalIgnoreCase)))
+                if (!IsCandidate(processName))
                 {
                     continue;
                 }
@@ -82,20 +89,38 @@ public sealed class FiveMTargetProcessResolver : ITargetProcessResolver
         }
     }
 
-    private static int Score(string processName)
+    internal static bool IsCandidate(string? processName)
     {
-        var score = 0;
+        if (string.IsNullOrWhiteSpace(processName))
+        {
+            return false;
+        }
+
+        if (ExcludedTokens.Any(token => processName.Contains(token, StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        return CandidateTokens.Any(token => processName.Contains(token, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Prefers the process that actually renders. FiveM's launcher and the game process are both named
+    /// "FiveM*", but only <c>FiveM_bXXXX_GTAProcess</c> presents frames.
+    /// </summary>
+    internal static int Score(string processName)
+    {
         if (processName.Contains("GTAProcess", StringComparison.OrdinalIgnoreCase))
         {
-            score += 2;
+            return 100;
         }
 
-        if (processName.StartsWith("FiveM", StringComparison.OrdinalIgnoreCase))
+        if (processName.StartsWith("GTA5", StringComparison.OrdinalIgnoreCase))
         {
-            score += 1;
+            return 80;
         }
 
-        return score;
+        return processName.StartsWith("FiveM", StringComparison.OrdinalIgnoreCase) ? 20 : 10;
     }
 
     [DllImport("kernel32.dll", SetLastError = true)]
