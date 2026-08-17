@@ -11,6 +11,7 @@ public enum IncidentSeverity
 public enum RootCauseCategory
 {
     GpuFrametimeContention,
+    GpuVramPressure,
     ObsRenderOutputContention,
     FiveMResourceSpike,
     NetworkJitterOrPacketLoss,
@@ -47,9 +48,40 @@ public sealed record ServerProfile
 
 public sealed record PresentMonOptions
 {
+    /// <summary>
+    /// Templates shipped by earlier builds. Stored settings matching one of these are migrated to
+    /// <see cref="DefaultArgumentsTemplate"/> on load.
+    /// </summary>
+    public static readonly IReadOnlyList<string> SupersededArgumentsTemplates =
+    [
+        // PresentMon 1.x style, before 2.x support landed.
+        "-process_id {processId} -output_file \"{outputPath}\"",
+
+        // Passed --v2_metrics, which actually selects a *narrower* column scheme (FrameTime/CPUBusy
+        // instead of MsBetweenPresents/MsCPUBusy) than PresentMon's own default.
+        "--process_id {processId} --output_file \"{outputPath}\" --v2_metrics " +
+        "--no_console_stats --stop_existing_session --terminate_on_proc_exit",
+    ];
+
+    /// <summary>
+    /// PresentMon 2.x invocation. No metrics flag: PresentMon's default already emits the full v2 column
+    /// set, and it is a superset of what <c>--v2_metrics</c> produces. <c>--stop_existing_session</c>
+    /// matters because a killed PresentMon leaves its ETW session behind and the next capture would
+    /// otherwise refuse to start.
+    /// </summary>
+    public const string DefaultArgumentsTemplate =
+        "--process_id {processId} --output_file \"{outputPath}\" " +
+        "--no_console_stats --stop_existing_session --terminate_on_proc_exit";
+
     public string? ExecutablePath { get; set; }
-    public string ArgumentsTemplate { get; set; } = "-process_id {processId} -output_file \"{outputPath}\"";
+    public string ArgumentsTemplate { get; set; } = DefaultArgumentsTemplate;
     public TimeSpan PollingInterval { get; set; } = TimeSpan.FromMilliseconds(250);
+}
+
+public sealed record GpuOptions
+{
+    public bool Enabled { get; set; } = true;
+    public TimeSpan PollingInterval { get; set; } = TimeSpan.FromMilliseconds(500);
 }
 
 public sealed record ObsOptions
@@ -63,7 +95,20 @@ public sealed record DeepCaptureOptions
 {
     public bool Enabled { get; set; } = true;
     public string WprExecutablePath { get; set; } = "wpr.exe";
-    public string Profile { get; set; } = "GeneralProfile";
+
+    /// <summary>
+    /// Legacy single-profile setting. Read so a customised value from an older install is migrated into
+    /// <see cref="Profiles"/> instead of being silently dropped; cleared once migrated.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Profile { get; set; }
+
+    /// <summary>
+    /// GeneralProfile alone does not carry enough GPU, disk or resident-set detail to explain a
+    /// multi-second whole-system stall, so the default stacks the profiles that do.
+    /// </summary>
+    public IList<string> Profiles { get; set; } = ["GeneralProfile", "CPU", "GPU", "DiskIO", "Minifilter", "ResidentSet"];
+
     public TimeSpan CaptureDuration { get; set; } = TimeSpan.FromSeconds(15);
 }
 
@@ -86,6 +131,7 @@ public sealed record DiagnosticsSettings
     public TimeSpan NetworkPollingInterval { get; set; } = TimeSpan.FromSeconds(2);
     public ServerProfile ServerProfile { get; set; } = new();
     public PresentMonOptions PresentMon { get; set; } = new();
+    public GpuOptions Gpu { get; set; } = new();
     public ObsOptions Obs { get; set; } = new();
     public DeepCaptureOptions DeepCapture { get; set; } = new();
     public PrivacyOptions Privacy { get; set; } = new();
@@ -152,6 +198,7 @@ public sealed record DiagnosticStatusEntry(DateTimeOffset Timestamp, StatusLevel
 
 [JsonPolymorphic(TypeDiscriminatorPropertyName = "$type")]
 [JsonDerivedType(typeof(FrameTelemetrySample), "frame")]
+[JsonDerivedType(typeof(GpuTelemetrySample), "gpu")]
 [JsonDerivedType(typeof(SystemTelemetrySample), "system")]
 [JsonDerivedType(typeof(ProcessTelemetrySample), "process")]
 [JsonDerivedType(typeof(ObsTelemetrySample), "obs")]
@@ -160,6 +207,11 @@ public sealed record DiagnosticStatusEntry(DateTimeOffset Timestamp, StatusLevel
 [JsonDerivedType(typeof(ArtifactEvidence), "artifact")]
 public abstract record TelemetryEvent(DateTimeOffset Timestamp, string Source);
 
+/// <summary>
+/// One presented frame. The CPU/GPU breakdown comes from PresentMon 2.x <c>--v2_metrics</c> and is what
+/// separates a CPU-bound spike (script/resource work) from a GPU-bound one (encode contention) from a
+/// present/composition stall. The fields stay nullable because PresentMon 1.x CSVs do not carry them.
+/// </summary>
 public sealed record FrameTelemetrySample(
     DateTimeOffset Timestamp,
     double FrameTimeMs,
@@ -168,7 +220,31 @@ public sealed record FrameTelemetrySample(
     double? MsBetweenPresents,
     bool Dropped,
     string ProcessName,
-    double? SwapChainLatencyMs = null) : TelemetryEvent(Timestamp, "Frame");
+    double? SwapChainLatencyMs = null,
+    double? CpuBusyMs = null,
+    double? CpuWaitMs = null,
+    double? GpuWaitMs = null,
+    double? GpuLatencyMs = null,
+    double? FlipDelayMs = null,
+    double? InputLatencyMs = null) : TelemetryEvent(Timestamp, "Frame");
+
+public sealed record GpuTelemetrySample(
+    DateTimeOffset Timestamp,
+    bool IsAvailable,
+    string? AdapterName,
+    double? UtilizationPercent,
+    double? MemoryBandwidthUtilizationPercent,
+    ulong? UsedVramBytes,
+    ulong? TotalVramBytes,
+    double? EncoderUtilizationPercent,
+    double? DecoderUtilizationPercent,
+    int? TemperatureCelsius,
+    IReadOnlyList<string> ThrottleReasons) : TelemetryEvent(Timestamp, "GPU")
+{
+    public double? VramUsagePercent => TotalVramBytes is > 0 && UsedVramBytes is not null
+        ? (double)UsedVramBytes.Value / TotalVramBytes.Value * 100
+        : null;
+}
 
 public sealed record SystemTelemetrySample(
     DateTimeOffset Timestamp,
