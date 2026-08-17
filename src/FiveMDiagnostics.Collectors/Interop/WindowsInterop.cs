@@ -170,7 +170,13 @@ internal readonly record struct ProcessMetricSnapshot(
 
 internal static class ProcessMetricsReader
 {
-    public static bool TryRead(Process process, DateTimeOffset timestamp, out ProcessMetricSnapshot snapshot)
+    /// <summary>
+    /// Reads a process snapshot. <paramref name="includeThreadCount"/> is opt-in because
+    /// <see cref="Process.Threads"/> materializes a <see cref="ProcessThread"/> object per thread; doing
+    /// that for every process on the machine on each sweep dominated the collector's allocation cost,
+    /// and only the target process actually reports a thread count.
+    /// </summary>
+    public static bool TryRead(Process process, DateTimeOffset timestamp, out ProcessMetricSnapshot snapshot, bool includeThreadCount = false)
     {
         snapshot = default;
 
@@ -187,7 +193,7 @@ internal static class ProcessMetricsReader
                 timestamp,
                 process.PrivateMemorySize64,
                 process.WorkingSet64,
-                process.Threads.Count);
+                includeThreadCount ? process.Threads.Count : 0);
             return true;
         }
         catch
