@@ -11,6 +11,7 @@ The collection and analysis pipeline is designed to be generic and work with any
 - Background collectors that only sample while a FiveM/GTA process is active
 - Ring buffer retention of at least 90 seconds in memory
 - Incident materialization with 30 seconds before and 60 seconds after a marker
+- Automatic incident marking when a frame crosses a relative stutter threshold, so an unattended session still produces evidence
 - PresentMon 2.x integration with per-frame CPU/GPU attribution, plus safe fallback and automatic discovery
 - GPU telemetry via NVML: utilization, VRAM occupancy, NVENC load and throttle reasons
 - OBS websocket polling with safe fallback when OBS is absent
@@ -44,6 +45,45 @@ than frame time alone:
 | `MsCPUBusy` dominates | FiveM script/resource work or CPU contention |
 | `MsGPUBusy` dominates | GPU contention, e.g. NVENC encoding against the game |
 | Neither is busy | Present/display path stalled — VRAM eviction, DPC/ISR latency or composition |
+
+### Automatic incident marking
+
+Relying on the user to notice a hitch and hit a hotkey samples the problem at a few percent, and biases
+that sample towards whatever they happened to be looking at. A six hour session in the field produced an
+estimated thousand hitches against a single manual marker.
+
+The detector therefore marks incidents on its own, using the same relative baseline as the analysis
+engine — the rolling median frame time over the last ~10 seconds, floored at the display refresh
+interval:
+
+| Rule | Default | Severity |
+| --- | --- | --- |
+| Frame time ≥ `SpikeMultiplier` × baseline | 2.0× (33 ms at 60 fps) | Normal |
+| Frame time ≥ `SevereMultiplier` × baseline | 4.0× (67 ms at 60 fps) | Severe |
+| `DroppedFrameRun` consecutive undisplayed frames | 3 | Normal |
+
+Guard rails, all configurable under `AutoDetect` in `settings.json`:
+
+- **Cooldown** (2 minutes) — incident windows span 90 seconds, so anything shorter produces incidents
+  that mostly re-describe each other's telemetry.
+- **MaxIncidentsPerSession** (40) — each incident retains its full event window in memory.
+- **MinimumSamples** (120) — nothing fires before the baseline settles, so a level load is not a stutter.
+
+Every value is clamped when settings are read and written. A hand-edited file with `SpikeMultiplier: 0`,
+`DroppedFrameRun: 0` or `Cooldown: 0` would otherwise trigger on nearly every frame, each trigger
+snapshotting a 90 second window; `BaselineWindowFrames` is capped because the detector allocates arrays
+of that size up front.
+
+`MaxIncidentsPerSession` bounds one session, so the top-level **MaxRetainedIncidents** (50) bounds the
+history across all of them. Beyond that the oldest incidents are dropped from memory and from the list —
+exported bundles are unaffected.
+
+Auto-marked incidents **never trigger deep capture**. WPR writes a multi-hundred-megabyte ETL and costs
+about fifteen seconds of tracing, which is affordable once on demand and ruinous every two minutes for
+six hours. Manual `Severe` markers still trigger it.
+
+Manual marking is unchanged and still worth using: it records that a human *perceived* something, which
+the telemetry alone cannot establish.
 
 ### Spike thresholds are relative, not fixed
 
@@ -138,6 +178,35 @@ Settings written by an older build are migrated to the template above automatica
 Timestamps in the CSV are relative to the start of the PresentMon trace. The collector anchors them to
 wall clock by tracking the tightest observed bound across batches, so frames land at their real position
 on the timeline instead of collapsing onto the moment they were read.
+
+
+#### Capture health
+
+A capture that dies while the game is still running used to restart in silence, and a six hour session
+was found to have produced a 0.77 second CSV. The collector now watches for both failure modes and
+reports them to the status log:
+
+- PresentMon's process exiting on its own while FiveM is still running.
+- PresentMon still running but producing no frames for 15 seconds — it can lose its ETW session, or have
+  it taken by another tool using the same session name, without its process exiting.
+
+Either case restarts the capture, but silence is ambiguous: an alt-tab, a minimised window or a loading
+screen presents nothing either. Restarting on a flat 15 second timer therefore meant a paused game got a
+kill-and-respawn every 15 seconds, which costs more ETW churn than the frames it recovers. So:
+
+- The tolerated silence **doubles after every restart** (15 s, 30 s, 60 s … capped at 4 minutes), and the
+  same ladder spaces the restarts themselves out — a PresentMon that exits instantly can no longer be
+  respawned once per polling interval.
+- A CSV that grows without yielding parsable samples counts as alive, so an unusable batch is not read as
+  a dead ETW session.
+- After **five** fruitless restarts, automatic restarts are suspended and reported as `Error`. They
+  resume when FiveM is restarted (a new process id) or a new session is started. A mute capture that is
+  left running recovers on its own as soon as frames return.
+- A capture that then runs healthily for two minutes clears the restart counter, so the ladder describes
+  the current problem rather than the whole session.
+
+From the third restart onwards the status entry escalates to `Error`, because at that point the session's
+frame data should be treated as incomplete.
 
 ### GPU telemetry notes
 
@@ -255,6 +324,10 @@ The tool has to stay cheap enough that it does not become the thing it is measur
   materializer returns early when nothing is pending — both run hundreds of times a second at PresentMon
   frame rates.
 - Collectors that depend on a running game idle until a FiveM/GTA process is present.
+- Correlation analysis runs on its own bounded worker queue rather than on the telemetry pump. Analysing
+  an incident sorts its frame data and makes several passes over a 90 second window, and doing that on
+  the pump stalled ingestion for every collector — a CPU and GC spike in the middle of the very stutter
+  being recorded. The queue is drained before a session is reported as stopped.
 
 ## Documentation
 

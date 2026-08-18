@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
     <IsPackable>false</IsPackable>
   </PropertyGroup>
 
@@ -15,6 +15,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\FiveMDiagnostics.Core\FiveMDiagnostics.Core.csproj" />
     <ProjectReference Include="..\..\src\FiveMDiagnostics.Analysis\FiveMDiagnostics.Analysis.csproj" />
+    <ProjectReference Include="..\..\src\FiveMDiagnostics.Collectors\FiveMDiagnostics.Collectors.csproj" />
     <ProjectReference Include="..\..\src\FiveMDiagnostics.Export\FiveMDiagnostics.Export.csproj" />
     <ProjectReference Include="..\..\src\FiveMDiagnostics.Fakes\FiveMDiagnostics.Fakes.csproj" />
     <ProjectReference Include="..\..\src\FiveMDiagnostics.Integrations.PresentMon\FiveMDiagnostics.Integrations.PresentMon.csproj" />

@@ -86,6 +86,7 @@
   <data name="WorkingDirectory" xml:space="preserve"><value>Working directory</value></data>
   <data name="ExportDirectory" xml:space="preserve"><value>Export directory</value></data>
   <data name="ArtifactDirectory" xml:space="preserve"><value>Artifact directory</value></data>
+  <data name="AutoDetectEnabled" xml:space="preserve"><value>Mark stutters automatically (no hotkey needed)</value></data>
   <data name="IncludeSensitiveFields" xml:space="preserve"><value>Include sensitive fields in export</value></data>
   <data name="IncludeAttachedArtifacts" xml:space="preserve"><value>Include attached artifacts in export</value></data>
   <data name="SaveSettings" xml:space="preserve"><value>Save Settings</value></data>
