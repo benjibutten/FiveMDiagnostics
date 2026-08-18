@@ -184,6 +184,7 @@
                                 </StackPanel>
                             </Expander>
 
+                            <CheckBox Content="{x:Static props:Strings.AutoDetectEnabled}" IsChecked="{Binding AutoDetectEnabled}" Margin="0,12,0,0" />
                             <CheckBox Content="{x:Static props:Strings.IncludeSensitiveFields}" IsChecked="{Binding IncludeSensitiveFields}" Margin="0,12,0,0" />
                             <CheckBox Content="{x:Static props:Strings.IncludeAttachedArtifacts}" IsChecked="{Binding IncludeAttachedArtifacts}" />
                             <Button Content="{x:Static props:Strings.SaveSettings}" Command="{Binding SaveSettingsCommand}" Width="180" Margin="0,10,0,0" />

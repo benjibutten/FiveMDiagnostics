@@ -36,6 +36,7 @@ public sealed class MainWindowViewModel : ObservableObject
     private string _artifactDirectory = string.Empty;
     private bool _includeSensitiveFields;
     private bool _includeAttachedArtifacts;
+    private bool _autoDetectEnabled;
     private bool _stateRefreshPending;
     private string _selectedLanguage = string.Empty;
     private string _presentMonStatusText = string.Empty;
@@ -68,6 +69,7 @@ public sealed class MainWindowViewModel : ObservableObject
         _artifactDirectory = settings.ArtifactDirectory;
         _includeSensitiveFields = settings.Privacy.IncludeSensitiveFieldsInExport;
         _includeAttachedArtifacts = settings.Privacy.IncludeAttachedArtifactsInExport;
+        _autoDetectEnabled = settings.AutoDetect.Enabled;
         _selectedLanguage = settings.Language;
 
         StartSessionCommand = new AsyncRelayCommand(StartSessionAsync, () => !IsSessionActive);
@@ -85,6 +87,7 @@ public sealed class MainWindowViewModel : ObservableObject
         _sessionManager.StatusReported += OnStatusReported;
         _sessionManager.IncidentCompleted += OnIncidentCompleted;
         _sessionManager.IncidentUpdated += OnIncidentUpdated;
+        _sessionManager.IncidentsEvicted += OnIncidentsEvicted;
         _sessionManager.SystemTelemetryUpdated += OnSystemTelemetryUpdated;
         _sessionManager.GpuTelemetryUpdated += OnGpuTelemetryUpdated;
 
@@ -282,6 +285,23 @@ public sealed class MainWindowViewModel : ObservableObject
         }
     }
 
+
+    /// <summary>
+    /// Bound live rather than only on save: if the detector misbehaves mid-session the user needs to
+    /// silence it without stopping the session or editing settings.json.
+    /// </summary>
+    public bool AutoDetectEnabled
+    {
+        get => _autoDetectEnabled;
+        set
+        {
+            if (SetProperty(ref _autoDetectEnabled, value))
+            {
+                Settings.AutoDetect.Enabled = value;
+            }
+        }
+    }
+
     public IReadOnlyList<LanguageOption> AvailableLanguages { get; } = [new("en", Strings.EnglishLanguageName), new("sv", Strings.SwedishLanguageName)];
 
     public string SelectedLanguage
@@ -427,6 +447,13 @@ public sealed class MainWindowViewModel : ObservableObject
     {
         _ = _dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
         {
+            // A synthetic scenario inserts itself before this queued callback runs, so the list would
+            // otherwise show it twice.
+            if (Incidents.Any(item => item.Id == incident.Id))
+            {
+                return;
+            }
+
             Incidents.Insert(0, incident);
             SelectedIncident ??= incident;
             _pendingIncidentIds.Remove(incident.Id);
@@ -467,6 +494,33 @@ public sealed class MainWindowViewModel : ObservableObject
             {
                 SelectedIncident = incident;
             }
+        }));
+    }
+
+    /// <summary>
+    /// Drops incidents the session manager has aged out. The list is the only other strong reference to
+    /// their telemetry, so keeping them here would defeat the retention cap entirely.
+    /// </summary>
+    private void OnIncidentsEvicted(object? sender, IReadOnlyList<IncidentRecord> evicted)
+    {
+        _ = _dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+        {
+            var evictedIds = evicted.Select(item => item.Id).ToHashSet();
+
+            for (var position = Incidents.Count - 1; position >= 0; position--)
+            {
+                if (evictedIds.Contains(Incidents[position].Id))
+                {
+                    Incidents.RemoveAt(position);
+                }
+            }
+
+            if (SelectedIncident is { } selected && evictedIds.Contains(selected.Id))
+            {
+                SelectedIncident = Incidents.FirstOrDefault();
+            }
+
+            _pendingIncidentIds.RemoveWhere(evictedIds.Contains);
         }));
     }
 

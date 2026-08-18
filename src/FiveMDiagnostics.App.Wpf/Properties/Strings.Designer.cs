@@ -66,6 +66,7 @@ public static class Strings
     public static string WorkingDirectory => ResourceManager.GetString("WorkingDirectory", Culture) ?? "Working directory";
     public static string ExportDirectory => ResourceManager.GetString("ExportDirectory", Culture) ?? "Export directory";
     public static string ArtifactDirectory => ResourceManager.GetString("ArtifactDirectory", Culture) ?? "Artifact directory";
+    public static string AutoDetectEnabled => ResourceManager.GetString("AutoDetectEnabled", Culture) ?? "Mark stutters automatically (no hotkey needed)";
     public static string IncludeSensitiveFields => ResourceManager.GetString("IncludeSensitiveFields", Culture) ?? "Include sensitive fields in export";
     public static string IncludeAttachedArtifacts => ResourceManager.GetString("IncludeAttachedArtifacts", Culture) ?? "Include attached artifacts in export";
     public static string SaveSettings => ResourceManager.GetString("SaveSettings", Culture) ?? "Save Settings";

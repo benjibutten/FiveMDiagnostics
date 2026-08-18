@@ -112,6 +112,96 @@ public sealed record DeepCaptureOptions
     public TimeSpan CaptureDuration { get; set; } = TimeSpan.FromSeconds(15);
 }
 
+/// <summary>
+/// Thresholds for marking incidents without user input. Multipliers are relative to the cadence the
+/// machine is actually achieving, for the same reason the correlation engine works that way: a fixed
+/// millisecond threshold is either deaf on a 120 Hz display or deafening on a 60 Hz one.
+/// </summary>
+public sealed record AutoDetectOptions
+{
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Frame time, as a multiple of baseline, that marks a normal incident. 2x at 60 fps is one lost frame.</summary>
+    public double SpikeMultiplier { get; set; } = 2.0;
+
+    /// <summary>Frame time, as a multiple of baseline, that marks a severe incident.</summary>
+    public double SevereMultiplier { get; set; } = 4.0;
+
+    /// <summary>Consecutive undisplayed frames that count as a visible freeze on their own.</summary>
+    public int DroppedFrameRun { get; set; } = 3;
+
+    /// <summary>
+    /// Minimum spacing between auto-marked incidents. Incident windows span 90 seconds, so a shorter
+    /// cooldown would produce incidents that mostly re-describe each other's telemetry.
+    /// </summary>
+    public TimeSpan Cooldown { get; set; } = TimeSpan.FromMinutes(2);
+
+    /// <summary>Ceiling on auto-marked incidents per session; each one retains its full event window in memory.</summary>
+    public int MaxIncidentsPerSession { get; set; } = 40;
+
+    /// <summary>Frames observed before any threshold is allowed to fire.</summary>
+    public int MinimumSamples { get; set; } = 120;
+
+    /// <summary>Frames the rolling median is computed over. 600 is roughly ten seconds at 60 fps.</summary>
+    public int BaselineWindowFrames { get; set; } = 600;
+
+    /// <summary>
+    /// Upper bound on the rolling window. The detector allocates two arrays of this size up front, so an
+    /// edited settings file must not be able to ask for hundreds of megabytes. 20 000 frames is about
+    /// five minutes at 60 fps, far beyond what a baseline meant to track slow drift needs.
+    /// </summary>
+    public const int MaxBaselineWindowFrames = 20_000;
+
+    /// <summary>
+    /// Clamps hand-edited values into the range the detector was designed for and reports whether
+    /// anything had to change.
+    /// </summary>
+    /// <remarks>
+    /// These options are read from a JSON file the user can edit, and the degenerate values are not
+    /// merely useless: a spike multiplier of 0, a dropped-frame run of 0 or a zero cooldown makes almost
+    /// every frame a trigger, and each trigger snapshots a 90 second window, writes a status entry and
+    /// refreshes the UI. Clamping at the point settings are read keeps that storm impossible instead of
+    /// relying on every consumer to be defensive.
+    /// </remarks>
+    public bool Normalize()
+    {
+        var original = this with { };
+
+        SpikeMultiplier = ClampMultiplier(SpikeMultiplier, fallback: 2.0);
+        SevereMultiplier = Math.Max(ClampMultiplier(SevereMultiplier, fallback: 4.0), SpikeMultiplier);
+
+        // One undisplayed frame is a dropped frame, not a freeze; a run is at least two.
+        DroppedFrameRun = Math.Clamp(DroppedFrameRun, 2, 600);
+        MaxIncidentsPerSession = Math.Clamp(MaxIncidentsPerSession, 1, 500);
+        BaselineWindowFrames = Math.Clamp(BaselineWindowFrames, 60, MaxBaselineWindowFrames);
+
+        // The observed sample count saturates at the window size, so a minimum above it would keep the
+        // detector permanently disarmed rather than merely conservative.
+        MinimumSamples = Math.Clamp(MinimumSamples, 30, BaselineWindowFrames);
+
+        // Incident windows span 90 seconds, so anything below a few seconds only produces incidents
+        // that re-describe each other's telemetry.
+        Cooldown = Cooldown < TimeSpan.FromSeconds(5)
+            ? TimeSpan.FromSeconds(5)
+            : Cooldown > TimeSpan.FromHours(1)
+                ? TimeSpan.FromHours(1)
+                : Cooldown;
+
+        return this != original;
+    }
+
+    private static double ClampMultiplier(double value, double fallback)
+    {
+        if (double.IsNaN(value) || double.IsInfinity(value))
+        {
+            return fallback;
+        }
+
+        // Below 1.2 the "spike" is inside normal frame-to-frame variance at any refresh rate.
+        return Math.Clamp(value, 1.2, 100);
+    }
+}
+
 public sealed record PrivacyOptions
 {
     public bool IncludeSensitiveFieldsInExport { get; set; }
@@ -126,6 +216,15 @@ public sealed record DiagnosticsSettings
     public TimeSpan RingBufferRetention { get; set; } = TimeSpan.FromMinutes(3);
     public TimeSpan PreIncidentWindow { get; set; } = TimeSpan.FromSeconds(30);
     public TimeSpan PostIncidentWindow { get; set; } = TimeSpan.FromSeconds(60);
+    /// <summary>
+    /// Incidents kept in memory across the whole application lifetime. Each one retains its full 90
+    /// second event window — thousands of frame samples — so an unbounded history grows for as long as
+    /// the app stays open, and the auto detector can add up to
+    /// <see cref="AutoDetectOptions.MaxIncidentsPerSession"/> per session on top of every manual marker.
+    /// The oldest are dropped once the cap is reached; exported bundles are unaffected.
+    /// </summary>
+    public int MaxRetainedIncidents { get; set; } = 50;
+
     public TimeSpan ProcessPollingInterval { get; set; } = TimeSpan.FromMilliseconds(500);
     public TimeSpan SystemPollingInterval { get; set; } = TimeSpan.FromMilliseconds(750);
     public TimeSpan NetworkPollingInterval { get; set; } = TimeSpan.FromSeconds(2);
@@ -134,6 +233,7 @@ public sealed record DiagnosticsSettings
     public GpuOptions Gpu { get; set; } = new();
     public ObsOptions Obs { get; set; } = new();
     public DeepCaptureOptions DeepCapture { get; set; } = new();
+    public AutoDetectOptions AutoDetect { get; set; } = new();
     public PrivacyOptions Privacy { get; set; } = new();
     public string Language { get; set; } = "en";
 

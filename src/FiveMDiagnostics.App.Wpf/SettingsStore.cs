@@ -82,11 +82,29 @@ public sealed class SettingsStore
             changed = true;
         }
 
+        // A hand-edited settings file is the only way these values become degenerate, and the failure is
+        // loud: a zero cooldown or a zero spike multiplier turns nearly every frame into an incident.
+        if (settings.AutoDetect.Normalize())
+        {
+            changed = true;
+        }
+
+        if (settings.MaxRetainedIncidents is < 1 or > 1000)
+        {
+            settings.MaxRetainedIncidents = Math.Clamp(settings.MaxRetainedIncidents, 1, 1000);
+            changed = true;
+        }
+
         return changed;
     }
 
     public async Task SaveAsync(DiagnosticsSettings settings, CancellationToken cancellationToken = default)
     {
+        // Saving is also the path an edit from the UI takes, so validation belongs here too rather than
+        // only on the way in.
+        settings.AutoDetect.Normalize();
+        settings.MaxRetainedIncidents = Math.Clamp(settings.MaxRetainedIncidents, 1, 1000);
+
         Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
         await using var stream = File.Create(SettingsPath);
         await JsonSerializer.SerializeAsync(stream, settings, JsonOptions, cancellationToken).ConfigureAwait(false);

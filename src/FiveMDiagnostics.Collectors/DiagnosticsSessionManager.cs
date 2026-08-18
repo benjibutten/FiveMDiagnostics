@@ -20,7 +20,17 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private readonly List<IncidentRecord> _incidents = [];
     private readonly List<ArtifactAttachment> _attachments = [];
 
+    /// <summary>
+    /// Completed incidents waiting to be analysed. The correlation engine sorts frame data and makes
+    /// several LINQ passes over a 90 second window, which is far too much work to run on the telemetry
+    /// pump: doing so stalls ingestion for every collector behind the bounded channel and produces a CPU
+    /// and GC spike in the middle of the very stutter being recorded.
+    /// </summary>
+    private const int AnalysisQueueCapacity = 64;
+
     private CancellationTokenSource? _sessionCts;
+    private Channel<IncidentRecord>? _analysisChannel;
+    private Task? _analysisTask;
     private Channel<TelemetryEvent>? _channel;
     private TimeWindowRingBuffer<TelemetryEvent>? _ringBuffer;
     private IncidentMaterializer? _incidentMaterializer;
@@ -28,6 +38,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private Task? _finalizeTask;
     private Task[] _collectorTasks = [];
     private volatile bool _isSessionActive;
+    private AutoIncidentDetector? _autoDetector;
     private volatile IReadOnlyList<ArtifactAttachment>? _attachmentsSnapshot;
 
     public DiagnosticsSessionManager(
@@ -55,6 +66,13 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     public event EventHandler<DiagnosticStatusEntry>? StatusReported;
 
     public event EventHandler<IncidentRecord>? IncidentCompleted;
+
+    /// <summary>
+    /// Raised with the incidents dropped to keep the history within
+    /// <see cref="DiagnosticsSettings.MaxRetainedIncidents"/>, so views holding their own copy can drop
+    /// them too instead of pinning the telemetry this cap exists to release.
+    /// </summary>
+    public event EventHandler<IReadOnlyList<IncidentRecord>>? IncidentsEvicted;
 
     /// <summary>Raised when an existing incident is re-analysed, e.g. after an artifact import.</summary>
     public event EventHandler<IncidentRecord>? IncidentUpdated;
@@ -108,7 +126,23 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         Environment = await _environmentMetadataProvider.CollectAsync(_settings, cancellationToken).ConfigureAwait(false);
         _ringBuffer = new TimeWindowRingBuffer<TelemetryEvent>(_settings.RingBufferRetention, item => item.Timestamp);
         _incidentMaterializer = new IncidentMaterializer(_ringBuffer, _settings.PreIncidentWindow, _settings.PostIncidentWindow);
+
+        // Settings can reach this point from anywhere, and degenerate thresholds make the detector fire
+        // on nearly every frame, so the invariant is re-established rather than assumed.
+        if (_settings.AutoDetect.Normalize())
+        {
+            Report(StatusLevel.Warning, nameof(DiagnosticsSessionManager), "Ogiltiga auto-detect-värden justerades till tillåtna gränser.");
+        }
+
+        _autoDetector = new AutoIncidentDetector(_settings.AutoDetect, Environment?.DisplayRefreshRateHz);
         _channel = Channel.CreateBounded<TelemetryEvent>(new BoundedChannelOptions(32768)
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.Wait,
+        });
+
+        _analysisChannel = Channel.CreateBounded<IncidentRecord>(new BoundedChannelOptions(AnalysisQueueCapacity)
         {
             SingleReader = true,
             SingleWriter = false,
@@ -118,6 +152,9 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         _sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var context = new CollectorContext(_channel.Writer, _settings, this, _processResolver, () => DateTimeOffset.UtcNow);
 
+        // Deliberately not tied to the session token: the queue has to drain on stop, or the last
+        // incidents of a session would be discarded exactly when the user goes looking for them.
+        _analysisTask = Task.Run(() => AnalysisLoopAsync(_analysisChannel.Reader));
         _pumpTask = Task.Run(() => PumpAsync(_channel.Reader, _sessionCts.Token));
         _finalizeTask = Task.Run(() => FinalizeLoopAsync(_sessionCts.Token));
         _collectorTasks = _collectors.Select(collector => Task.Run(() => RunCollectorSafeAsync(collector, context, _sessionCts.Token))).ToArray();
@@ -175,10 +212,20 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             Environment = Environment with { SessionEndedAt = DateTimeOffset.UtcNow };
         }
 
-        FlushPendingIncidents(DateTimeOffset.MaxValue);
+        await FlushPendingIncidentsAsync(DateTimeOffset.MaxValue).ConfigureAwait(false);
+
+        _analysisChannel?.Writer.TryComplete();
+        if (_analysisTask is not null)
+        {
+            await _analysisTask.ConfigureAwait(false);
+        }
+
         cancellationTokenSource?.Dispose();
         _sessionCts = null;
         _channel = null;
+        _analysisChannel = null;
+        _analysisTask = null;
+        _autoDetector = null;
         _collectorTasks = [];
         _isSessionActive = false;
 
@@ -194,10 +241,34 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             return null;
         }
 
-        var marker = _incidentMaterializer.MarkIncident(DateTimeOffset.UtcNow, severity);
+        return CreateMarker(DateTimeOffset.UtcNow, severity, label: null, allowDeepCapture: true);
+    }
+
+    /// <summary>
+    /// Marks an incident the detector found. Deep capture stays off: WPR is affordable once on demand
+    /// and not once every couple of minutes for a whole stream.
+    /// </summary>
+    private void MarkAutoIncident(DateTimeOffset timestamp, AutoIncidentTrigger trigger)
+    {
+        if (_incidentMaterializer is null)
+        {
+            return;
+        }
+
+        CreateMarker(timestamp, trigger.Severity, trigger.Label, allowDeepCapture: false);
+    }
+
+    private IncidentMarker? CreateMarker(DateTimeOffset timestamp, IncidentSeverity severity, string? label, bool allowDeepCapture)
+    {
+        if (_incidentMaterializer is null)
+        {
+            return null;
+        }
+
+        var marker = _incidentMaterializer.MarkIncident(timestamp, severity, label);
         Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), $"Incident markerad: {marker.Label} ({marker.Severity}).");
 
-        if (severity == IncidentSeverity.Severe && _settings.DeepCapture.Enabled && _sessionCts is not null)
+        if (allowDeepCapture && severity == IncidentSeverity.Severe && _settings.DeepCapture.Enabled && _sessionCts is not null)
         {
             _ = Task.Run(() => CaptureDeepTraceAsync(marker, _sessionCts.Token));
         }
@@ -269,13 +340,18 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
     public IncidentRecord AddSyntheticIncident(IncidentRecord incident)
     {
-        var analyzed = incident with { Analysis = incident.Analysis ?? _analysisEngine.Analyze(incident) };
-        lock (_sync)
-        {
-            _incidents.Add(analyzed);
-        }
+        // Demo scenarios are user-initiated and expected to appear immediately, so this one path keeps
+        // analysing inline instead of going through the worker queue.
+        var analyzed = incident.Analysis is null ? Analyze(incident) : incident;
+        var evicted = AddIncidentWithinCap(analyzed);
 
         IncidentCompleted?.Invoke(this, analyzed);
+
+        if (evicted.Count > 0)
+        {
+            IncidentsEvicted?.Invoke(this, evicted);
+        }
+
         OnStateChanged();
         return analyzed;
     }
@@ -338,12 +414,22 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 {
                     GpuTelemetryUpdated?.Invoke(this, gpuSample);
                 }
+                else if (telemetryEvent is FrameTelemetrySample frameSample && _autoDetector is not null)
+                {
+                    // The marker has to be raised before the materializer sees this event, so the frame
+                    // that triggered the incident lands inside its own window rather than one event
+                    // short of it.
+                    if (_autoDetector.Observe(frameSample) is { } trigger)
+                    {
+                        MarkAutoIncident(frameSample.Timestamp, trigger);
+                    }
+                }
 
                 if (_incidentMaterializer is not null && Environment is not null)
                 {
                     var attachments = GetAttachments();
                     var completed = _incidentMaterializer.OnTelemetry(telemetryEvent, Environment, attachments);
-                    AddCompletedIncidents(completed);
+                    await QueueForAnalysisAsync(completed).ConfigureAwait(false);
                 }
             }
         }
@@ -354,11 +440,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
         while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
         {
-            FlushPendingIncidents(DateTimeOffset.UtcNow);
+            await FlushPendingIncidentsAsync(DateTimeOffset.UtcNow).ConfigureAwait(false);
         }
     }
 
-    private void FlushPendingIncidents(DateTimeOffset now)
+    private async Task FlushPendingIncidentsAsync(DateTimeOffset now)
     {
         if (_incidentMaterializer is null || Environment is null)
         {
@@ -366,26 +452,96 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         }
 
         var completed = _incidentMaterializer.FinalizeDue(now, Environment, GetAttachments());
-        AddCompletedIncidents(completed);
+        await QueueForAnalysisAsync(completed).ConfigureAwait(false);
     }
 
-    private void AddCompletedIncidents(IReadOnlyList<IncidentRecord> completedIncidents)
+    /// <summary>
+    /// Hands completed incidents to the analysis worker. The queue is bounded, so a burst of incidents
+    /// slows the producer down instead of letting unanalysed windows pile up without limit.
+    /// </summary>
+    private async Task QueueForAnalysisAsync(IReadOnlyList<IncidentRecord> completedIncidents)
     {
-        foreach (var incident in completedIncidents)
+        if (completedIncidents.Count == 0)
         {
-            var analyzed = incident with { Analysis = _analysisEngine.Analyze(incident) };
-            lock (_sync)
-            {
-                _incidents.Add(analyzed);
-            }
-
-            IncidentCompleted?.Invoke(this, analyzed);
-            Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), $"Incident färdigställd: {analyzed.Marker.Label} {analyzed.Marker.MarkedAt:HH:mm:ss}.");
+            return;
         }
 
-        if (completedIncidents.Count > 0)
+        var writer = _analysisChannel?.Writer;
+        foreach (var incident in completedIncidents)
         {
-            OnStateChanged();
+            if (writer is null)
+            {
+                // No session running: analyse inline rather than lose the incident.
+                PublishIncident(Analyze(incident));
+                continue;
+            }
+
+            await writer.WriteAsync(incident, CancellationToken.None).ConfigureAwait(false);
+        }
+    }
+
+    private async Task AnalysisLoopAsync(ChannelReader<IncidentRecord> reader)
+    {
+        while (await reader.WaitToReadAsync(CancellationToken.None).ConfigureAwait(false))
+        {
+            while (reader.TryRead(out var incident))
+            {
+                PublishIncident(Analyze(incident));
+            }
+        }
+    }
+
+    private IncidentRecord Analyze(IncidentRecord incident)
+    {
+        try
+        {
+            return incident with { Analysis = _analysisEngine.Analyze(incident) };
+        }
+        catch (Exception ex)
+        {
+            // An incident without an analysis is still evidence worth keeping and exporting.
+            Report(StatusLevel.Warning, nameof(DiagnosticsSessionManager), $"Analysen av incidenten misslyckades: {ex.Message}");
+            return incident;
+        }
+    }
+
+    private void PublishIncident(IncidentRecord analyzed)
+    {
+        var evicted = AddIncidentWithinCap(analyzed);
+
+        IncidentCompleted?.Invoke(this, analyzed);
+        Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), $"Incident färdigställd: {analyzed.Marker.Label} {analyzed.Marker.MarkedAt:HH:mm:ss}.");
+
+        if (evicted.Count > 0)
+        {
+            IncidentsEvicted?.Invoke(this, evicted);
+        }
+
+        OnStateChanged();
+    }
+
+    /// <summary>
+    /// Appends an incident and drops the oldest ones beyond
+    /// <see cref="DiagnosticsSettings.MaxRetainedIncidents"/>. Each retained incident holds its whole 90
+    /// second window — thousands of frame samples — and the auto detector's per-session ceiling does
+    /// nothing across sessions, so without a global cap the history only ever grows.
+    /// </summary>
+    private IReadOnlyList<IncidentRecord> AddIncidentWithinCap(IncidentRecord incident)
+    {
+        var cap = Math.Clamp(_settings.MaxRetainedIncidents, 1, 1000);
+
+        lock (_sync)
+        {
+            _incidents.Add(incident);
+            if (_incidents.Count <= cap)
+            {
+                return [];
+            }
+
+            var removeCount = _incidents.Count - cap;
+            var evicted = _incidents.GetRange(0, removeCount);
+            _incidents.RemoveRange(0, removeCount);
+            return evicted;
         }
     }
 

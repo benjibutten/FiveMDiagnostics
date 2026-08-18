@@ -8,6 +8,7 @@ using FiveMDiagnostics.Core;
 public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposable
 {
     private readonly object _sync = new();
+    private readonly PresentMonCaptureHealth _health = new();
     private string? _resolvedExecutablePath;
     private bool _reportedAutoDetectedExecutable;
     private bool _reportedMissingExecutable;
@@ -17,11 +18,23 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
     private long _lastFilePosition;
     private Dictionary<string, int>? _headerIndex;
     private DateTimeOffset? _traceStartEstimateUtc;
+    private long _samplesThisCapture;
+    private long _positionAtLastHealthCheck;
+    private bool _reportedSuspension;
+    private string? _pendingRestartReason;
 
     public string Name => "PresentMon";
 
     public async Task RunAsync(CollectorContext context, CancellationToken cancellationToken)
     {
+        lock (_sync)
+        {
+            // Restarts counted during an earlier session say nothing about this one, so a new session
+            // always starts on a clean ladder.
+            _health.Reset();
+            _reportedSuspension = false;
+        }
+
         try
         {
             while (!cancellationToken.IsCancellationRequested)
@@ -62,10 +75,15 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
                 }
 
                 EnsureCaptureStarted(context, executablePath, target.ProcessId);
+
+                var produced = 0;
                 foreach (var sample in ReadNewSamples(target.ProcessName, context.UtcNow))
                 {
+                    produced++;
                     await context.Writer.WriteAsync(sample, cancellationToken).ConfigureAwait(false);
                 }
+
+                CheckCaptureHealth(context, produced);
 
                 await Task.Delay(context.Settings.PresentMon.PollingInterval, cancellationToken).ConfigureAwait(false);
             }
@@ -90,10 +108,41 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
                 return;
             }
 
+            if (_health.TargetProcessId != processId)
+            {
+                _health.OnTargetChanged(processId);
+                _reportedSuspension = false;
+            }
+
+            // A capture that ends while the game is still running is the failure that produced a
+            // 0.77 second CSV for a six hour session, and it used to restart in silence.
+            var exitReason = _currentProcessId == processId && _presentMonProcess is { HasExited: true } exited
+                ? $"PresentMon avslutades av sig självt (exit code {TryGetExitCode(exited)}) efter {_samplesThisCapture} frames."
+                : null;
+
             StopCaptureLocked(context);
+
+            // Every start after the first one for this target is a restart, whether the process died on
+            // its own or the health check killed a mute capture. Both go through the same ladder, so a
+            // PresentMon that exits immediately cannot be respawned once per polling interval forever.
+            if (_health.HasStartedCapture)
+            {
+                var now = context.UtcNow();
+                if (!_health.TryBeginRestart(now))
+                {
+                    ReportGaveUpLocked(context, exitReason);
+                    return;
+                }
+
+                ReportRestartLocked(context, exitReason ?? _pendingRestartReason ?? "PresentMon capture behövde startas om.");
+            }
+
+            _pendingRestartReason = null;
             _currentProcessId = processId;
             _currentOutputPath = Path.Combine(context.Settings.WorkingDirectory, $"presentmon_{processId}_{DateTimeOffset.UtcNow:yyyyMMdd_HHmmss}.csv");
             _traceStartEstimateUtc = null;
+            _samplesThisCapture = 0;
+            _positionAtLastHealthCheck = 0;
 
             var arguments = context.Settings.PresentMon.ArgumentsTemplate
                 .Replace("{processId}", processId.ToString(CultureInfo.InvariantCulture), StringComparison.OrdinalIgnoreCase)
@@ -110,6 +159,10 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
             _presentMonProcess = Process.Start(startInfo);
             _lastFilePosition = 0;
             _headerIndex = null;
+
+            // Counts as an attempt even when the start fails outright, so a start that keeps failing is
+            // spaced out by the same ladder rather than retried once per polling interval.
+            _health.OnCaptureStarted(context.UtcNow());
 
             if (_presentMonProcess is null)
             {
@@ -150,6 +203,111 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
         catch (InvalidOperationException)
         {
             // Process exited before redirection could start.
+        }
+    }
+
+    /// <summary>
+    /// Watches for a capture that is alive but mute. PresentMon can lose its ETW session, or be killed
+    /// by another tool that grabs the same session name, without its process exiting — from the outside
+    /// that looks identical to a healthy capture whose file simply stops growing.
+    /// </summary>
+    /// <remarks>
+    /// Silence alone is ambiguous: an alt-tab, a minimised window or a loading screen present nothing
+    /// either. The capture is therefore only killed when <see cref="PresentMonCaptureHealth"/> both
+    /// considers it silent — a window that doubles after every restart — and still allows a restart, so
+    /// a paused game costs at most a handful of increasingly spaced retries instead of one every
+    /// fifteen seconds for as long as the pause lasts.
+    /// </remarks>
+    private void CheckCaptureHealth(CollectorContext context, int samplesProduced)
+    {
+        lock (_sync)
+        {
+            if (_presentMonProcess is null)
+            {
+                return;
+            }
+
+            // A file that grew without yielding samples still proves the capture is alive, which keeps
+            // a header-only or unparsable batch from being read as a dead ETW session.
+            var fileAdvanced = _lastFilePosition != _positionAtLastHealthCheck;
+            _positionAtLastHealthCheck = _lastFilePosition;
+            var now = context.UtcNow();
+
+            if (samplesProduced > 0 || fileAdvanced)
+            {
+                _samplesThisCapture += samplesProduced;
+                if (_health.OnProgress(now))
+                {
+                    context.StatusSink.Report(
+                        StatusLevel.Info,
+                        Name,
+                        $"PresentMon har levererat frames stabilt i {PresentMonCaptureHealth.StableRunBeforeReset.TotalMinutes:F0} min — omstartsräknaren nollställd.");
+                }
+
+                return;
+            }
+
+            if (!_health.IsSilent(now))
+            {
+                return;
+            }
+
+            if (!_health.CanRestart(now))
+            {
+                ReportGaveUpLocked(context, reason: null);
+                return;
+            }
+
+            var silence = now - _health.LastProgressUtc;
+            _pendingRestartReason =
+                $"PresentMon har inte levererat några frames på {silence.TotalSeconds:F0} s trots att FiveM körs (totalt {_samplesThisCapture} frames denna capture).";
+
+            // Dropping the process forces the next EnsureCaptureStarted to spawn a fresh capture, which
+            // is also where the restart is counted against the ladder.
+            StopCaptureLocked(context);
+        }
+    }
+
+    private void ReportRestartLocked(CollectorContext context, string reason)
+    {
+        var restartCount = _health.RestartCount;
+        var level = restartCount >= PresentMonCaptureHealth.RestartsBeforeEscalation ? StatusLevel.Error : StatusLevel.Warning;
+        var suffix = restartCount >= PresentMonCaptureHealth.RestartsBeforeEscalation
+            ? $" Detta är omstart {restartCount} — frame-datat för sessionen är sannolikt ofullständigt."
+            : " Startar om capturen.";
+
+        context.StatusSink.Report(level, Name, reason + suffix);
+    }
+
+    /// <summary>
+    /// Says once — not once per polling interval — that automatic restarts have stopped. Restarting
+    /// costs an ETW session teardown and setup each time, so a target that has failed repeatedly is
+    /// better left alone until FiveM or the session restarts.
+    /// </summary>
+    private void ReportGaveUpLocked(CollectorContext context, string? reason)
+    {
+        if (_reportedSuspension || !_health.IsSuspended)
+        {
+            return;
+        }
+
+        _reportedSuspension = true;
+        var prefix = string.IsNullOrWhiteSpace(reason) ? string.Empty : reason + " ";
+        context.StatusSink.Report(
+            StatusLevel.Error,
+            Name,
+            $"{prefix}PresentMon startades om {_health.RestartCount} gånger utan att leverera frames. Automatiska omstarter pausas tills FiveM startas om eller en ny session startas — frame telemetry saknas till dess.");
+    }
+
+    private static string TryGetExitCode(Process process)
+    {
+        try
+        {
+            return process.ExitCode.ToString(CultureInfo.InvariantCulture);
+        }
+        catch (InvalidOperationException)
+        {
+            return "okänd";
         }
     }
 
