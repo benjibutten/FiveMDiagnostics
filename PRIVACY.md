@@ -5,6 +5,7 @@ FiveM Diagnostics is local-first by default.
 ## What stays local
 
 - sessions
+- session journals (`Sessions\session_*.jsonl`)
 - incident exports
 - imported artifacts
 - generated ETL traces
@@ -29,6 +30,13 @@ Default redaction behavior:
 - remote endpoint IP addresses are replaced with `[redacted]`
 - artifact file paths are reduced to file names
 - attached artifacts are excluded unless explicitly enabled
+
+## Session journals are not redacted
+
+The session journal is written to the working directory alongside the raw PresentMon CSVs and ETL
+traces, and like those it is stored unredacted: it is local evidence, not something meant to be handed
+over. It can contain the server address, process names and analysis text. Review it the same way you
+review an imported log before sharing it with anyone.
 
 ## When to include sensitive data
 

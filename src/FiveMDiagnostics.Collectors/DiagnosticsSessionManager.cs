@@ -21,6 +21,13 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private readonly List<ArtifactAttachment> _attachments = [];
 
     /// <summary>
+    /// Deep captures started by a marker. They run detached from the call that marked the incident, but
+    /// stopping the session still has to wait for them: they report their outcome through
+    /// <see cref="Report"/>, and a report arriving after the journal is closed is simply lost.
+    /// </summary>
+    private readonly List<Task> _deepCaptureTasks = [];
+
+    /// <summary>
     /// Completed incidents waiting to be analysed. The correlation engine sorts frame data and makes
     /// several LINQ passes over a 90 second window, which is far too much work to run on the telemetry
     /// pump: doing so stalls ingestion for every collector behind the bounded channel and produces a CPU
@@ -40,6 +47,13 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private volatile bool _isSessionActive;
     private AutoIncidentDetector? _autoDetector;
     private volatile IReadOnlyList<ArtifactAttachment>? _attachmentsSnapshot;
+
+    /// <summary>
+    /// Written to for as long as a session runs. Read without a lock from <see cref="Report"/>, which
+    /// collectors call from their own threads, so the field is volatile and the journal itself is
+    /// responsible for being thread safe.
+    /// </summary>
+    private volatile SessionJournal? _journal;
 
     public DiagnosticsSessionManager(
         DiagnosticsSettings settings,
@@ -124,6 +138,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         }
 
         Environment = await _environmentMetadataProvider.CollectAsync(_settings, cancellationToken).ConfigureAwait(false);
+
+        // Opened before anything else can report, so the warnings a session produces while starting up
+        // are in the file too. They are the ones that explain an empty history afterwards.
+        OpenJournal();
+
         _ringBuffer = new TimeWindowRingBuffer<TelemetryEvent>(_settings.RingBufferRetention, item => item.Timestamp);
         _incidentMaterializer = new IncidentMaterializer(_ringBuffer, _settings.PreIncidentWindow, _settings.PostIncidentWindow);
 
@@ -220,6 +239,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             await _analysisTask.ConfigureAwait(false);
         }
 
+        await WaitForDeepCapturesAsync().ConfigureAwait(false);
+
         cancellationTokenSource?.Dispose();
         _sessionCts = null;
         _channel = null;
@@ -230,7 +251,66 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         _isSessionActive = false;
 
         Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), "Session stopped.");
+        CloseJournal();
         OnStateChanged();
+    }
+
+    /// <summary>
+    /// Waits out the deep captures this session started, so their status entries reach the journal
+    /// before it is closed and land ahead of the session-end line rather than after it. The captures
+    /// observe the session token, which is already cancelled here, so this is a short wait — and it also
+    /// keeps the token source alive until nothing is using its token any more.
+    /// </summary>
+    private async Task WaitForDeepCapturesAsync()
+    {
+        Task[] pending;
+        lock (_sync)
+        {
+            pending = _deepCaptureTasks.ToArray();
+            _deepCaptureTasks.Clear();
+        }
+
+        if (pending.Length == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            await Task.WhenAll(pending).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // CaptureDeepTraceAsync reports its own failures; there is nothing to add here.
+        }
+    }
+
+    private void OpenJournal()
+    {
+        var startedAt = DateTimeOffset.UtcNow;
+        var journal = SessionJournal.TryOpen(_settings.WorkingDirectory, startedAt, out var error);
+        if (journal is null)
+        {
+            Report(StatusLevel.Warning, nameof(DiagnosticsSessionManager), $"Sessionsloggen kunde inte skapas: {error}");
+            return;
+        }
+
+        _journal = journal;
+        journal.WriteSessionStart(Environment, _settings, startedAt);
+        Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), $"Sessionslogg skrivs till {journal.Path}.");
+    }
+
+    private void CloseJournal()
+    {
+        var journal = _journal;
+        if (journal is null)
+        {
+            return;
+        }
+
+        journal.WriteSessionEnd(DateTimeOffset.UtcNow);
+        _journal = null;
+        journal.Dispose();
     }
 
     public IncidentMarker? MarkIncident(IncidentSeverity severity)
@@ -270,7 +350,16 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
         if (allowDeepCapture && severity == IncidentSeverity.Severe && _settings.DeepCapture.Enabled && _sessionCts is not null)
         {
-            _ = Task.Run(() => CaptureDeepTraceAsync(marker, _sessionCts.Token));
+            // The token is read here rather than inside the task: by the time the task runs, stopping
+            // the session may already have replaced the source with null.
+            var sessionToken = _sessionCts.Token;
+            var capture = Task.Run(() => CaptureDeepTraceAsync(marker, sessionToken));
+
+            lock (_sync)
+            {
+                _deepCaptureTasks.RemoveAll(task => task.IsCompleted);
+                _deepCaptureTasks.Add(capture);
+            }
         }
 
         OnStateChanged();
@@ -368,7 +457,20 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             }
         }
 
+        // The in-memory list keeps only the last 200 entries and dies with the process, so the journal
+        // is the only place a status entry from the start of a six hour session still exists.
+        var journal = _journal;
+        journal?.WriteStatus(entry);
+
         StatusReported?.Invoke(this, entry);
+
+        // A journal that failed to write is itself worth one status entry. Reporting it re-enters this
+        // method exactly once: taking the failure clears it, so the nested call finds nothing left to
+        // take and stops there.
+        if (journal is not null && journal.TryTakeFailure(out var failure))
+        {
+            Report(StatusLevel.Warning, nameof(SessionJournal), failure);
+        }
     }
 
     public async ValueTask DisposeAsync()
@@ -509,6 +611,10 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     {
         var evicted = AddIncidentWithinCap(analyzed);
 
+        // Written before the history is touched by anything else: an incident evicted by the retention
+        // cap, or dropped when the app closes, still leaves its summary on disk.
+        _journal?.WriteIncident(analyzed);
+
         IncidentCompleted?.Invoke(this, analyzed);
         Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), $"Incident färdigställd: {analyzed.Marker.Label} {analyzed.Marker.MarkedAt:HH:mm:ss}.");
 
@@ -601,6 +707,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             updated = latest with { Analysis = _analysisEngine.Analyze(latest) };
             _incidents[^1] = updated;
         }
+
+        // The journal line written when the incident completed describes the analysis as it stood before
+        // this import, so the conclusion the import produced — usually the one that actually explains
+        // the incident — would otherwise exist only in memory.
+        _journal?.WriteIncidentUpdate(updated);
 
         IncidentUpdated?.Invoke(this, updated);
         OnStateChanged();

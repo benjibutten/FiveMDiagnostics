@@ -250,6 +250,49 @@ All setup fields are optional. The app can start a session with the default path
 - right-click the tray icon to mark normal or severe stutter while a session is active
 - right-click the tray icon to export the latest incident or reopen the main window
 
+## Session journal
+
+Every session appends a JSON Lines file to the working directory as it runs:
+
+```text
+%LocalAppData%\FiveMDiagnostics\Sessions\session_<yyyyMMdd_HHmmss>.jsonl
+```
+
+Incidents otherwise exist only in memory and only reach disk through an explicit export of a selected
+incident, and the status list is capped at 200 entries and dies with the process. A six-hour stream can
+therefore auto-mark dozens of incidents and leave behind nothing but a PresentMon CSV and whatever ETL
+traces deep capture wrote — including, in the failure that motivated this, the status entries proving
+the frame telemetry had died in the first minute, which is the very thing that explains the empty
+history.
+
+One JSON object per line, each with `type`, `timestamp` and `payload`:
+
+| `type` | Payload |
+| --- | --- |
+| `session-start` | environment metadata and the settings that shape the evidence |
+| `status` | one status entry: level, source, message |
+| `incident` | marker, window, analysis summary, top hypotheses, suspected processes, timeline, per-source event counts, attachment names |
+| `incident-update` | the same payload, re-written after an imported artifact added evidence and the analysis was re-run |
+| `session-end` | incidents written |
+| `journal-truncated` | written instead of `session-end` when the size budget is reached |
+
+Notes:
+
+- **Summary level only.** An incident's own event window is 90 seconds of frame samples; that belongs in
+  an export bundle, not in a file appended to for six hours.
+- **Per-source event counts are the point.** An incident window holding no frame samples is not a quiet
+  incident, it is a broken PresentMon capture, and a summary reporting only what the correlation engine
+  concluded hides that distinction.
+- **Flushed per line**, because the failure it exists for is the app being closed or killed.
+- **Append only.** An incident that changes later gets an `incident-update` line rather than a rewrite,
+  so whatever reached disk survives a kill; a reader taking the last line per incident id ends up with
+  the current state.
+- **Bounded at 8 MB** for the file, including anything a session started in the same second already
+  wrote to it. On reaching the limit a `journal-truncated` line is written and the file is closed — a
+  journal that simply stops is indistinguishable from a crash.
+- **Written unredacted**, like the raw captures beside it. It is local evidence, not a bundle meant to
+  be handed to someone else; the redaction rules still apply to everything exported.
+
 ## Export bundle
 
 By default exports are written under:
