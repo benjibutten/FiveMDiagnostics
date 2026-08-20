@@ -153,7 +153,7 @@ locations, including versioned filenames such as `PresentMon-2.4.1-x64.exe`.
 Default argument template:
 
 ```text
---process_id {processId} --output_file "{outputPath}" --no_console_stats --stop_existing_session --terminate_on_proc_exit
+--process_id {processId} --output_stdout --no_console_stats --stop_existing_session --terminate_on_proc_exit
 ```
 
 Note the absence of a metrics flag. PresentMon 2.4.1 emits **three different column schemes**, verified
@@ -173,7 +173,12 @@ parser handles all three — a hand-edited template will not silently produce ze
 the next capture would otherwise refuse to start. `--terminate_on_proc_exit` is a no-op unless the app
 runs elevated; the collector stops the capture itself when the target process disappears.
 
-Settings written by an older build are migrated to the template above automatically on load.
+Settings written by an older build are migrated to the template above automatically on load. The app
+drains stdout continuously and writes its own raw CSV copy in the session directory. It never needs to
+open PresentMon's live output file, so a transient file-sharing lock cannot terminate frame collection.
+Each PresentMon process owns a separate bounded stdout buffer (8,192 rows); delayed callbacks from a
+retired process are rejected, and overflow is reported and recovered through the restart backoff instead
+of allowing memory to grow without limit.
 
 Timestamps in the CSV are relative to the start of the PresentMon trace. The collector anchors them to
 wall clock by tracking the tightest observed bound across batches, so frames land at their real position
@@ -204,6 +209,9 @@ kill-and-respawn every 15 seconds, which costs more ETW churn than the frames it
   left running recovers on its own as soon as frames return.
 - A capture that then runs healthily for two minutes clears the restart counter, so the ladder describes
   the current problem rather than the whole session.
+- A low-rate health snapshot records frame count, observed time range, largest gap, continuous pre-buffer
+  span and total restarts. Incident exports state whether both the 30-second pre-window and 60-second
+  post-window were covered.
 
 From the third restart onwards the status entry escalates to `Error`, because at that point the session's
 frame data should be treated as incomplete.
@@ -216,8 +224,9 @@ unavailable, leaving every other collector untouched.
 
 ## Capture depth
 
-There is no mode selector in the UI. Every session runs the standard capture; the deeper WPR capture is
-switched on automatically by `Mark Severe` and by nothing else.
+Every session runs the standard capture. The deeper WPR capture is switched on automatically by
+`Mark Severe`; a settings checkbox can also opt normal *manual* markers into deep capture. Automatic
+incidents never start WPR, preventing recurring trace overhead during a bad session.
 
 ### Standard capture
 
@@ -231,6 +240,7 @@ switched on automatically by `Mark Severe` and by nothing else.
 ### Deep capture
 
 - Triggered automatically on `Mark Severe`
+- Optionally triggered by a normal manual marker when explicitly enabled
 - **Requires the app to run as administrator.** `wpr.exe` cannot self-elevate, so the app checks up front
   and reports that clearly rather than failing part-way through and leaving a trace session running.
 - Starts a short WPR trace only when needed, stacking the profiles that matter for stutter:

@@ -95,6 +95,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
     public event EventHandler<GpuTelemetrySample>? GpuTelemetryUpdated;
 
+    public event EventHandler<CaptureHealthTelemetrySample>? CaptureHealthUpdated;
+
     public bool IsSessionActive => _isSessionActive;
 
     public DiagnosticsSettings Settings => _settings;
@@ -348,7 +350,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         var marker = _incidentMaterializer.MarkIncident(timestamp, severity, label);
         Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), $"Incident markerad: {marker.Label} ({marker.Severity}).");
 
-        if (allowDeepCapture && severity == IncidentSeverity.Severe && _settings.DeepCapture.Enabled && _sessionCts is not null)
+        var shouldDeepCapture = severity == IncidentSeverity.Severe || _settings.DeepCapture.CaptureNormalManualIncidents;
+        if (allowDeepCapture && shouldDeepCapture && _settings.DeepCapture.Enabled && _sessionCts is not null)
         {
             // The token is read here rather than inside the task: by the time the task runs, stopping
             // the session may already have replaced the source with null.
@@ -515,6 +518,10 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 else if (telemetryEvent is GpuTelemetrySample gpuSample)
                 {
                     GpuTelemetryUpdated?.Invoke(this, gpuSample);
+                }
+                else if (telemetryEvent is CaptureHealthTelemetrySample healthSample)
+                {
+                    CaptureHealthUpdated?.Invoke(this, healthSample);
                 }
                 else if (telemetryEvent is FrameTelemetrySample frameSample && _autoDetector is not null)
                 {

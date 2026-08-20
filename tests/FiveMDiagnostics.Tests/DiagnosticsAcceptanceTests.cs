@@ -77,6 +77,62 @@ public sealed class DiagnosticsAcceptanceTests
         Assert.True(analysis.Hypotheses[0].Confidence >= 0.6);
     }
 
+    [Fact]
+    public void CorrelationEngine_AlwaysReturnsInsufficientEvidenceWithoutFrames()
+    {
+        var baseTime = new DateTimeOffset(2026, 8, 20, 20, 0, 0, TimeSpan.Zero);
+        var discord = new[]
+        {
+            new ProcessActivity("Discord", 101, 0, 0),
+            new ProcessActivity("DiscordCanary", 102, 0, 0),
+        };
+        var events = new TelemetryEvent[]
+        {
+            new SystemTelemetrySample(baseTime, 15, new Dictionary<string, double> { ["0"] = 20 }, 40, 16_000, discord, []),
+        };
+
+        var analysis = _engine.Analyze(BuildIncident(baseTime, events, 60));
+
+        Assert.True(analysis.InsufficientEvidence);
+        Assert.Equal(RootCauseCategory.InsufficientEvidence, Assert.Single(analysis.Hypotheses).Category);
+        Assert.Empty(analysis.SuspectedProcesses);
+    }
+
+    [Fact]
+    public void CorrelationEngine_UsesStrongIoFallbackWhenDiskCountersAreUnavailable()
+    {
+        var baseTime = new DateTimeOffset(2026, 8, 20, 20, 0, 0, TimeSpan.Zero);
+        var events = new List<TelemetryEvent>();
+        for (var index = 0; index < 60; index++)
+        {
+            events.Add(new FrameTelemetrySample(
+                baseTime.AddMilliseconds(index * 16.6),
+                index == 40 ? 100 : 16.6,
+                8,
+                5,
+                index == 40 ? 100 : 16.6,
+                false,
+                "FiveM",
+                CpuBusyMs: 7));
+        }
+
+        events.Add(new ProcessTelemetrySample(baseTime, 42, "FiveM", 30, 1, 1, 20, 60 * 1024 * 1024, 0));
+        events.Add(new SystemTelemetrySample(
+            baseTime,
+            40,
+            new Dictionary<string, double> { ["0"] = 50 },
+            50,
+            8_000,
+            [],
+            [new ProcessActivity("Indexer", 84, 5, 30 * 1024 * 1024)]));
+
+        var analysis = _engine.Analyze(BuildIncident(baseTime, events, 60));
+        var disk = analysis.Hypotheses.FirstOrDefault(item => item.Category == RootCauseCategory.StreamingOrDiskStall);
+
+        Assert.NotNull(disk);
+        Assert.Contains(disk.Evidence, item => item.Contains("counters saknades", StringComparison.OrdinalIgnoreCase));
+    }
+
     /// <summary>
     /// The fixed 25 ms spike threshold could never fire on a high-refresh display: a game targeting
     /// 8.3 ms that hits 20 ms is visibly hitching but stayed invisible to the engine.
@@ -278,6 +334,60 @@ public sealed class DiagnosticsAcceptanceTests
         Assert.Contains(zip.Entries, entry => entry.FullName == "summary.json");
         Assert.Contains(zip.Entries, entry => entry.FullName == "metrics.csv");
         Assert.Contains(zip.Entries, entry => entry.FullName == "incident-report.txt");
+    }
+
+    [Fact]
+    public async Task Exporter_IncludesPerCoreDiskObsAndCaptureHealth()
+    {
+        var baseTime = new DateTimeOffset(2026, 8, 20, 20, 0, 0, TimeSpan.Zero);
+        var events = new List<TelemetryEvent>();
+        for (var second = -30; second <= 60; second++)
+        {
+            events.Add(new FrameTelemetrySample(baseTime.AddSeconds(second), 16.6, 8, 5, 16.6, false, "FiveM", CpuBusyMs: 7));
+        }
+
+        events.Add(new SystemTelemetrySample(baseTime, 50, new Dictionary<string, double> { ["0"] = 99 }, 55, 8_000, [], [], 24, 3, 120));
+        events.Add(new ObsTelemetrySample(baseTime, true, 60, 2, 0, 0, 2, 500, true, false, true));
+        events.Add(new CaptureHealthTelemetrySample(baseTime, 91, baseTime.AddSeconds(-30), baseTime.AddSeconds(60), 1, 90, 1, true));
+        var incident = BuildIncident(baseTime, events, 60);
+        var outputDirectory = Path.Combine(Path.GetTempPath(), "FiveMDiagnosticsTests", Guid.NewGuid().ToString("N"));
+        var zipPath = await new IncidentBundleExporter().ExportAsync(incident, new ExportBundleOptions(outputDirectory, false, false), CancellationToken.None);
+
+        using var zip = ZipFile.OpenRead(zipPath);
+        using var metricsReader = new StreamReader(zip.GetEntry("metrics.csv")!.Open());
+        var metrics = await metricsReader.ReadToEndAsync();
+        using var reportReader = new StreamReader(zip.GetEntry("incident-report.txt")!.Open());
+        var report = await reportReader.ReadToEndAsync();
+
+        Assert.Contains("cpuCore.0.usagePercent", metrics, StringComparison.Ordinal);
+        Assert.Contains("diskAverageLatencyMs", metrics, StringComparison.Ordinal);
+        Assert.Contains("isProcessRunning", metrics, StringComparison.Ordinal);
+        Assert.Contains("isWebSocketConnected", metrics, StringComparison.Ordinal);
+        Assert.Contains("Window coverage: pre-buffer complete, post-window complete, full window yes", report, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Exporter_DoesNotCallSparseBoundaryFramesFullCoverageOrUseSessionGapTotals()
+    {
+        var baseTime = new DateTimeOffset(2026, 8, 20, 20, 0, 0, TimeSpan.Zero);
+        var events = new TelemetryEvent[]
+        {
+            new FrameTelemetrySample(baseTime.AddSeconds(-30), 16.6, 8, 5, 16.6, false, "FiveM", CpuBusyMs: 7),
+            new FrameTelemetrySample(baseTime.AddSeconds(60), 16.6, 8, 5, 16.6, false, "FiveM", CpuBusyMs: 7),
+            new CaptureHealthTelemetrySample(baseTime, 5000, baseTime.AddHours(-1), baseTime, 600, 0, 4, true, 12),
+        };
+        var incident = BuildIncident(baseTime, events, 60);
+        var outputDirectory = Path.Combine(Path.GetTempPath(), "FiveMDiagnosticsTests", Guid.NewGuid().ToString("N"));
+        var zipPath = await new IncidentBundleExporter().ExportAsync(incident, new ExportBundleOptions(outputDirectory, false, false), CancellationToken.None);
+
+        using var zip = ZipFile.OpenRead(zipPath);
+        using var reader = new StreamReader(zip.GetEntry("incident-report.txt")!.Open());
+        var report = await reader.ReadToEndAsync();
+
+        Assert.Contains("full window no", report, StringComparison.Ordinal);
+        Assert.Contains("incident gaps 1, largest incident gap 90.00 s", report, StringComparison.Ordinal);
+        Assert.DoesNotContain("incident gaps 12", report, StringComparison.Ordinal);
+        Assert.DoesNotContain("largest incident gap 600", report, StringComparison.Ordinal);
     }
 
     private static EnvironmentMetadata CreateEnvironment(DateTimeOffset baseTime)

@@ -42,10 +42,11 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
 
     private async Task<ObsTelemetrySample> PollAsync(ObsOptions options, CancellationToken cancellationToken)
     {
-        if (Process.GetProcessesByName("obs64").Length == 0 && Process.GetProcessesByName("obs32").Length == 0)
+        var processRunning = IsObsProcessRunning();
+        if (!processRunning)
         {
             await ResetSocketAsync().ConfigureAwait(false);
-            return CreateDisconnectedSample();
+            return CreateDisconnectedSample(processRunning: false);
         }
 
         try
@@ -53,7 +54,7 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
             await EnsureConnectedAsync(options, cancellationToken).ConfigureAwait(false);
             if (_socket is null || _socket.State != WebSocketState.Open)
             {
-                return CreateDisconnectedSample();
+                return CreateDisconnectedSample(processRunning: true);
             }
 
             var stats = await SendRequestAsync("GetStats", null, cancellationToken).ConfigureAwait(false);
@@ -70,12 +71,13 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
                 CpuUsagePercent: TryGetDouble(stats, "cpuUsage"),
                 MemoryUsageMb: TryGetDouble(stats, "memoryUsage"),
                 IsStreaming: TryGetBool(stream, "outputActive") || TryGetBool(stream, "outputReconnecting"),
-                IsRecording: TryGetBool(record, "outputActive"));
+                IsRecording: TryGetBool(record, "outputActive"),
+                IsProcessRunning: true);
         }
         catch
         {
             await ResetSocketAsync().ConfigureAwait(false);
-            return CreateDisconnectedSample();
+            return CreateDisconnectedSample(processRunning: true);
         }
     }
 
@@ -248,9 +250,25 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
         }
     }
 
-    private static ObsTelemetrySample CreateDisconnectedSample()
+    private static ObsTelemetrySample CreateDisconnectedSample(bool processRunning)
     {
-        return new ObsTelemetrySample(DateTimeOffset.UtcNow, false, null, null, null, null, null, null, false, false);
+        return new ObsTelemetrySample(DateTimeOffset.UtcNow, false, null, null, null, null, null, null, false, false, processRunning);
+    }
+
+    private static bool IsObsProcessRunning()
+    {
+        var processes = Process.GetProcessesByName("obs64").Concat(Process.GetProcessesByName("obs32")).ToArray();
+        try
+        {
+            return processes.Length > 0;
+        }
+        finally
+        {
+            foreach (var process in processes)
+            {
+                process.Dispose();
+            }
+        }
     }
 
     private static double? TryGetDouble(JsonElement element, string propertyName)

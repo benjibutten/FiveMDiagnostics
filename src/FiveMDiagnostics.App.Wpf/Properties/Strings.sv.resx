@@ -51,7 +51,7 @@
   <data name="PresentMonStatusMissing" xml:space="preserve"><value>PresentMon hittades inte. Appen fungerar ändå utan det. Lägg till det senare under Avancerat om du vill ha djupare framedata.</value></data>
   <data name="CaptureFeedbackHeader" xml:space="preserve"><value>Insamlingsstatus</value></data>
   <data name="CaptureFeedbackHint" xml:space="preserve"><value>När du markerar stutter fortsätter appen samla data i ytterligare 60 sekunder innan den färdiga incidenten dyker upp i listan.</value></data>
-  <data name="CaptureFeedbackSessionStarted" xml:space="preserve"><value>Session startad. Appen är redo att ta emot en stutter-markering.</value></data>
+  <data name="CaptureFeedbackSessionStarted" xml:space="preserve"><value>Session startad. Väntar på PresentMon-frames och 30 sekunders pre-buffer.</value></data>
   <data name="CaptureFeedbackCollectingFormat" xml:space="preserve"><value>{0} sparad. Appen fattade klicket och samlar resten av fönstret till {1}. Väntande insamlingar: {2}.</value></data>
   <data name="CaptureFeedbackReadyFormat" xml:space="preserve"><value>{0} är nu klar. Välj den i incidentlistan för att se analysen.</value></data>
   <data name="CaptureFeedbackReadyWithPendingFormat" xml:space="preserve"><value>{0} är nu klar. Det finns fortfarande {1} insamling(ar) som pågår.</value></data>
@@ -130,6 +130,11 @@
 
   <!-- ViewModel strings -->
   <data name="SessionActive" xml:space="preserve"><value>Session aktiv. Datainsamlare mäter bara medan FiveM/GTA körs.</value></data>
+  <data name="SessionWarmingUp" xml:space="preserve"><value>Samlar PresentMon-pre-buffer.</value></data>
+  <data name="SessionReady" xml:space="preserve"><value>Redo för incident.</value></data>
+  <data name="CaptureFeedbackIncidentReady" xml:space="preserve"><value>PresentMon levererar frames och 30 sekunders pre-buffer är komplett. Redo för incident.</value></data>
+  <data name="CaptureFeedbackWarmingFormat" xml:space="preserve"><value>Väntar på kontinuerliga PresentMon-frames och pre-buffer: {0:F0}/{1:F0} sekunder.</value></data>
+  <data name="CaptureNormalManualIncidents" xml:space="preserve"><value>Deep capture för normala manuella markeringar</value></data>
   <data name="SessionIdle" xml:space="preserve"><value>Session inaktiv.</value></data>
   <data name="WaitingForProcess" xml:space="preserve"><value>Väntar på FiveM/GTA-process</value></data>
   <data name="SelectIncidentHint" xml:space="preserve"><value>Välj en incident för att se sammanfattning och stödjande bevis.</value></data>

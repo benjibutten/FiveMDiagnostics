@@ -10,6 +10,9 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
 {
     private readonly PerformanceCounter? _totalCpuCounter;
     private readonly IReadOnlyList<PerformanceCounter> _perCoreCounters;
+    private readonly PerformanceCounter? _diskLatencyCounter;
+    private readonly PerformanceCounter? _diskQueueCounter;
+    private readonly PerformanceCounter? _hardFaultPagesCounter;
     private readonly Dictionary<int, ProcessMetricSnapshot> _previousSnapshots = new();
     private readonly TimeSpan _processSampleInterval = TimeSpan.FromSeconds(2);
     private readonly int _currentSessionId = Process.GetCurrentProcess().SessionId;
@@ -36,6 +39,10 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
             {
                 _ = counter.NextValue();
             }
+
+            _diskLatencyCounter = TryCreateCounter("PhysicalDisk", "Avg. Disk sec/Transfer", "_Total");
+            _diskQueueCounter = TryCreateCounter("PhysicalDisk", "Current Disk Queue Length", "_Total");
+            _hardFaultPagesCounter = TryCreateCounter("Memory", "Pages Input/sec", null);
         }
         catch
         {
@@ -62,7 +69,10 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
                     memoryPressure,
                     availableMb,
                     topCpu,
-                    topDisk),
+                    topDisk,
+                    ReadCounter(_diskLatencyCounter, multiplier: 1000),
+                    ReadCounter(_diskQueueCounter),
+                    ReadCounter(_hardFaultPagesCounter)),
                 cancellationToken).ConfigureAwait(false);
 
             await Task.Delay(context.Settings.SystemPollingInterval, cancellationToken).ConfigureAwait(false);
@@ -75,6 +85,39 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
         foreach (var counter in _perCoreCounters)
         {
             counter.Dispose();
+        }
+
+
+        _diskLatencyCounter?.Dispose();
+        _diskQueueCounter?.Dispose();
+        _hardFaultPagesCounter?.Dispose();
+    }
+
+    private static PerformanceCounter? TryCreateCounter(string category, string name, string? instance)
+    {
+        try
+        {
+            var counter = instance is null
+                ? new PerformanceCounter(category, name, readOnly: true)
+                : new PerformanceCounter(category, name, instance, readOnly: true);
+            _ = counter.NextValue();
+            return counter;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static double? ReadCounter(PerformanceCounter? counter, double multiplier = 1)
+    {
+        try
+        {
+            return counter is null ? null : Math.Round(counter.NextValue() * multiplier, 2);
+        }
+        catch
+        {
+            return null;
         }
     }
 

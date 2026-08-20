@@ -51,7 +51,7 @@
   <data name="PresentMonStatusMissing" xml:space="preserve"><value>PresentMon was not found. The app still works without it; add it later under Advanced if you want deeper frame data.</value></data>
   <data name="CaptureFeedbackHeader" xml:space="preserve"><value>Capture status</value></data>
   <data name="CaptureFeedbackHint" xml:space="preserve"><value>When you mark stutter, the app keeps collecting for another 60 seconds before the finished incident appears in the list.</value></data>
-  <data name="CaptureFeedbackSessionStarted" xml:space="preserve"><value>Session started. The app is ready to capture a stutter marker.</value></data>
+  <data name="CaptureFeedbackSessionStarted" xml:space="preserve"><value>Session started. Waiting for PresentMon frames and the 30-second pre-buffer.</value></data>
   <data name="CaptureFeedbackCollectingFormat" xml:space="preserve"><value>{0} saved. The app understood the click and is collecting the rest of the capture window until {1}. Pending captures: {2}.</value></data>
   <data name="CaptureFeedbackReadyFormat" xml:space="preserve"><value>{0} is now ready. Select it in the incident list to inspect the analysis.</value></data>
   <data name="CaptureFeedbackReadyWithPendingFormat" xml:space="preserve"><value>{0} is now ready. There are still {1} capture(s) being collected.</value></data>
@@ -130,6 +130,11 @@
 
   <!-- ViewModel strings -->
   <data name="SessionActive" xml:space="preserve"><value>Session active. Collectors sample only while FiveM/GTA is running.</value></data>
+  <data name="SessionWarmingUp" xml:space="preserve"><value>Collecting PresentMon pre-buffer.</value></data>
+  <data name="SessionReady" xml:space="preserve"><value>Ready for incident.</value></data>
+  <data name="CaptureFeedbackIncidentReady" xml:space="preserve"><value>PresentMon is delivering frames and the 30-second pre-buffer is complete. Ready for incident.</value></data>
+  <data name="CaptureFeedbackWarmingFormat" xml:space="preserve"><value>Waiting for continuous PresentMon frames and pre-buffer: {0:F0}/{1:F0} seconds.</value></data>
+  <data name="CaptureNormalManualIncidents" xml:space="preserve"><value>Deep capture for normal manual markers</value></data>
   <data name="SessionIdle" xml:space="preserve"><value>Session idle.</value></data>
   <data name="WaitingForProcess" xml:space="preserve"><value>Waiting for FiveM/GTA process</value></data>
   <data name="SelectIncidentHint" xml:space="preserve"><value>Select an incident to inspect its summary and supporting evidence.</value></data>

@@ -58,6 +58,7 @@ public sealed class IncidentBundleExporter : IIncidentExporter
 
     private static object BuildSummaryModel(IncidentRecord incident)
     {
+        var captureHealth = BuildCaptureHealth(incident);
         return new
         {
             incident.Id,
@@ -68,6 +69,7 @@ public sealed class IncidentBundleExporter : IIncidentExporter
             Analysis = incident.Analysis,
             Attachments = incident.Attachments.Select(item => new { item.DisplayName, item.Kind, item.ImportedAt, item.Sensitive }),
             EventCounts = incident.Events.GroupBy(item => item.Source).ToDictionary(group => group.Key, group => group.Count()),
+            CaptureHealth = captureHealth,
         };
     }
 
@@ -95,6 +97,9 @@ public sealed class IncidentBundleExporter : IIncidentExporter
         builder.AppendLine($"Marked at: {incident.Marker.MarkedAt:O}");
         builder.AppendLine($"Window: {incident.WindowStart:O} -> {incident.WindowEnd:O}");
         builder.AppendLine($"Server profile: {incident.Environment.ServerProfileName}");
+        var health = BuildCaptureHealth(incident);
+        builder.AppendLine($"Capture health: {health.FrameCount} frames, range {health.FirstFrameAt:O} -> {health.LastFrameAt:O} ({health.FrameSpanSeconds:F1} s), incident gaps {health.GapCount}, largest incident gap {health.LargestGapSeconds:F2} s, session restarts at incident end {health.SessionRestartCountAtEnd}.");
+        builder.AppendLine($"Window coverage: pre-buffer {(health.PreWindowCovered ? "complete" : "incomplete")}, post-window {(health.PostWindowCovered ? "complete" : "incomplete")}, full window {(health.FullWindowCovered ? "yes" : "no")}.");
         builder.AppendLine();
         builder.AppendLine(incident.Analysis?.Summary ?? "Ingen analys kördes före export.");
         builder.AppendLine();
@@ -263,14 +268,7 @@ public sealed class IncidentBundleExporter : IIncidentExporter
                 ("temperatureCelsius", gpu.TemperatureCelsius?.ToString() ?? string.Empty),
                 ("throttleReasons", string.Join(';', gpu.ThrottleReasons)),
             ],
-            SystemTelemetrySample system =>
-            [
-                ("totalCpuUsagePercent", system.TotalCpuUsagePercent.ToString("F1")),
-                ("memoryCommitPercent", system.MemoryCommitPercent.ToString("F1")),
-                ("availableMemoryMb", system.AvailableMemoryMb.ToString()),
-                ("topCpuProcesses", string.Join(';', system.TopCpuProcesses.Select(item => $"{item.ProcessName}:{item.CpuPercent:F1}%"))),
-                ("topDiskProcesses", string.Join(';', system.TopDiskProcesses.Select(item => $"{item.ProcessName}:{item.IoBytesPerSecond}"))),
-            ],
+            SystemTelemetrySample system => FlattenSystem(system),
             ProcessTelemetrySample process =>
             [
                 ("processName", process.ProcessName),
@@ -288,8 +286,21 @@ public sealed class IncidentBundleExporter : IIncidentExporter
                 ("averageFrameRenderTimeMs", obs.AverageFrameRenderTimeMs?.ToString("F1") ?? string.Empty),
                 ("renderSkippedFrames", obs.RenderSkippedFrames?.ToString() ?? string.Empty),
                 ("outputSkippedFrames", obs.OutputSkippedFrames?.ToString() ?? string.Empty),
+                ("isProcessRunning", obs.IsProcessRunning.ToString()),
+                ("isWebSocketConnected", obs.IsConnected.ToString()),
                 ("isStreaming", obs.IsStreaming.ToString()),
                 ("isRecording", obs.IsRecording.ToString()),
+            ],
+            CaptureHealthTelemetrySample health =>
+            [
+                ("frameCount", health.FrameCount.ToString()),
+                ("firstFrameAt", health.FirstFrameAt?.ToString("O") ?? string.Empty),
+                ("lastFrameAt", health.LastFrameAt?.ToString("O") ?? string.Empty),
+                ("largestFrameGapSeconds", health.LargestFrameGapSeconds.ToString("F3")),
+                ("continuousFrameSpanSeconds", health.ContinuousFrameSpanSeconds.ToString("F1")),
+                ("restartCount", health.RestartCount.ToString()),
+                ("captureProcessRunning", health.CaptureProcessRunning.ToString()),
+                ("frameGapCount", health.FrameGapCount.ToString()),
             ],
             NetworkEndpointSample network =>
             [
@@ -312,6 +323,79 @@ public sealed class IncidentBundleExporter : IIncidentExporter
             _ => [("summary", telemetryEvent.Source)],
         };
     }
+
+    private static IEnumerable<(string Key, string Value)> FlattenSystem(SystemTelemetrySample system)
+    {
+        yield return ("totalCpuUsagePercent", system.TotalCpuUsagePercent.ToString("F1"));
+        yield return ("memoryCommitPercent", system.MemoryCommitPercent.ToString("F1"));
+        yield return ("availableMemoryMb", system.AvailableMemoryMb.ToString());
+        yield return ("diskAverageLatencyMs", system.DiskAverageLatencyMs?.ToString("F2") ?? string.Empty);
+        yield return ("diskQueueLength", system.DiskQueueLength?.ToString("F2") ?? string.Empty);
+        yield return ("hardFaultPagesPerSecond", system.HardFaultPagesPerSecond?.ToString("F2") ?? string.Empty);
+        yield return ("topCpuProcesses", string.Join(';', system.TopCpuProcesses.Select(item => $"{item.ProcessName}:{item.CpuPercent:F1}%")));
+        yield return ("topDiskProcesses", string.Join(';', system.TopDiskProcesses.Select(item => $"{item.ProcessName}:{item.IoBytesPerSecond}")));
+        foreach (var core in system.PerCoreUsagePercent.OrderBy(item => item.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            yield return ($"cpuCore.{core.Key}.usagePercent", core.Value.ToString("F1"));
+        }
+    }
+
+    private static CaptureHealthSummary BuildCaptureHealth(IncidentRecord incident)
+    {
+        var frames = incident.GetEvents<FrameTelemetrySample>();
+        var healthSamples = incident.GetEvents<CaptureHealthTelemetrySample>();
+        var first = frames.FirstOrDefault()?.Timestamp;
+        var last = frames.LastOrDefault()?.Timestamp;
+        var largestObservedGap = frames.Zip(frames.Skip(1), (left, right) => Math.Max(0, (right.Timestamp - left.Timestamp).TotalSeconds)).DefaultIfEmpty().Max();
+        var observedGapCount = frames.Zip(frames.Skip(1), (left, right) => (right.Timestamp - left.Timestamp).TotalSeconds > 2 ? 1 : 0).Sum();
+        var tolerance = TimeSpan.FromSeconds(2);
+        var preCovered = HasContinuousCoverage(frames, incident.WindowStart, incident.Marker.MarkedAt, tolerance);
+        var postCovered = HasContinuousCoverage(frames, incident.Marker.MarkedAt, incident.WindowEnd, tolerance);
+        var fullWindowCovered = preCovered && postCovered && largestObservedGap <= tolerance.TotalSeconds;
+
+        return new CaptureHealthSummary(
+            frames.Count,
+            first,
+            last,
+            first is { } start && last is { } end ? Math.Max(0, (end - start).TotalSeconds) : 0,
+            largestObservedGap,
+            observedGapCount,
+            healthSamples.Select(item => item.RestartCount).DefaultIfEmpty().Max(),
+            preCovered,
+            postCovered,
+            fullWindowCovered);
+    }
+
+    private static bool HasContinuousCoverage(
+        IReadOnlyList<FrameTelemetrySample> frames,
+        DateTimeOffset start,
+        DateTimeOffset end,
+        TimeSpan tolerance)
+    {
+        var segment = frames.Where(item => item.Timestamp >= start && item.Timestamp <= end).ToArray();
+        if (segment.Length == 0
+            || segment[0].Timestamp > start + tolerance
+            || segment[^1].Timestamp < end - tolerance)
+        {
+            return false;
+        }
+
+        return segment
+            .Zip(segment.Skip(1), (left, right) => right.Timestamp - left.Timestamp)
+            .All(gap => gap <= tolerance);
+    }
+
+    private sealed record CaptureHealthSummary(
+        int FrameCount,
+        DateTimeOffset? FirstFrameAt,
+        DateTimeOffset? LastFrameAt,
+        double FrameSpanSeconds,
+        double LargestGapSeconds,
+        int GapCount,
+        int SessionRestartCountAtEnd,
+        bool PreWindowCovered,
+        bool PostWindowCovered,
+        bool FullWindowCovered);
 
     private static string Escape(string value)
     {

@@ -15,6 +15,9 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
     private int? _currentProcessId;
     private string? _currentOutputPath;
     private Process? _presentMonProcess;
+    private PresentMonStdoutBuffer? _stdoutBuffer;
+    private StreamWriter? _rawOutputWriter;
+    private bool _readsFromStdout;
     private long _lastFilePosition;
     private Dictionary<string, int>? _headerIndex;
     private DateTimeOffset? _traceStartEstimateUtc;
@@ -22,6 +25,14 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
     private long _positionAtLastHealthCheck;
     private bool _reportedSuspension;
     private string? _pendingRestartReason;
+    private long _sessionFrameCount;
+    private int _sessionRestartCount;
+    private DateTimeOffset? _firstFrameUtc;
+    private DateTimeOffset? _lastFrameUtc;
+    private DateTimeOffset? _continuousRunStartedUtc;
+    private double _largestFrameGapSeconds;
+    private int _frameGapCount;
+    private DateTimeOffset _lastHealthSampleUtc = DateTimeOffset.MinValue;
 
     public string Name => "PresentMon";
 
@@ -33,6 +44,14 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
             // always starts on a clean ladder.
             _health.Reset();
             _reportedSuspension = false;
+            _sessionFrameCount = 0;
+            _sessionRestartCount = 0;
+            _firstFrameUtc = null;
+            _lastFrameUtc = null;
+            _continuousRunStartedUtc = null;
+            _largestFrameGapSeconds = 0;
+            _frameGapCount = 0;
+            _lastHealthSampleUtc = DateTimeOffset.MinValue;
         }
 
         try
@@ -80,10 +99,12 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
                 foreach (var sample in ReadNewSamples(target.ProcessName, context.UtcNow))
                 {
                     produced++;
+                    RecordFrame(sample.Timestamp);
                     await context.Writer.WriteAsync(sample, cancellationToken).ConfigureAwait(false);
                 }
 
                 CheckCaptureHealth(context, produced);
+                await WriteHealthSampleIfDueAsync(context, cancellationToken).ConfigureAwait(false);
 
                 await Task.Delay(context.Settings.PresentMon.PollingInterval, cancellationToken).ConfigureAwait(false);
             }
@@ -134,6 +155,8 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
                     return;
                 }
 
+                _sessionRestartCount++;
+
                 ReportRestartLocked(context, exitReason ?? _pendingRestartReason ?? "PresentMon capture behövde startas om.");
             }
 
@@ -147,6 +170,21 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
             var arguments = context.Settings.PresentMon.ArgumentsTemplate
                 .Replace("{processId}", processId.ToString(CultureInfo.InvariantCulture), StringComparison.OrdinalIgnoreCase)
                 .Replace("{outputPath}", _currentOutputPath, StringComparison.OrdinalIgnoreCase);
+            _readsFromStdout = arguments.Contains("--output_stdout", StringComparison.OrdinalIgnoreCase)
+                || arguments.Contains("-output_stdout", StringComparison.OrdinalIgnoreCase);
+
+            if (_readsFromStdout)
+            {
+                _stdoutBuffer = new PresentMonStdoutBuffer();
+                Directory.CreateDirectory(context.Settings.WorkingDirectory);
+                _rawOutputWriter = new StreamWriter(new FileStream(
+                    _currentOutputPath,
+                    FileMode.Create,
+                    FileAccess.Write,
+                    FileShare.Read | FileShare.Delete,
+                    bufferSize: 64 * 1024,
+                    useAsync: false));
+            }
 
             var startInfo = new ProcessStartInfo(executablePath, arguments)
             {
@@ -172,13 +210,13 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
 
             // PresentMon writes an elevation warning to stderr immediately. Nothing drained these pipes
             // before, so once the 4 KB buffer filled PresentMon blocked forever.
-            DrainDiagnosticStream(_presentMonProcess, context);
+            DrainDiagnosticStreams(_presentMonProcess, context, _stdoutBuffer);
 
             context.StatusSink.Report(StatusLevel.Info, Name, $"PresentMon capture startad för PID {processId}.");
         }
     }
 
-    private void DrainDiagnosticStream(Process process, CollectorContext context)
+    private void DrainDiagnosticStreams(Process process, CollectorContext context, PresentMonStdoutBuffer? stdoutBuffer)
     {
         process.ErrorDataReceived += (_, args) =>
         {
@@ -193,7 +231,13 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
             context.StatusSink.Report(level, Name, $"PresentMon: {args.Data.Trim()}");
         };
 
-        process.OutputDataReceived += (_, _) => { };
+        process.OutputDataReceived += (_, args) =>
+        {
+            if (stdoutBuffer is not null && args.Data is not null)
+            {
+                _ = stdoutBuffer.TryEnqueue(args.Data);
+            }
+        };
 
         try
         {
@@ -224,6 +268,18 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
         {
             if (_presentMonProcess is null)
             {
+                return;
+            }
+
+            if (_stdoutBuffer is { DroppedLineCount: > 0 } overflowed)
+            {
+                _pendingRestartReason =
+                    $"PresentMon stdout-bufferten nådde sin gräns på {PresentMonStdoutBuffer.DefaultCapacity} rader under backpressure; {overflowed.DroppedLineCount} CSV-rader tappades.";
+                context.StatusSink.Report(
+                    StatusLevel.Error,
+                    Name,
+                    _pendingRestartReason + " Capturen stoppades och återstartas enligt ordinarie backoff för att återfå en komplett CSV-ström.");
+                StopCaptureLocked(context);
                 return;
             }
 
@@ -313,6 +369,96 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
 
     private IEnumerable<FrameTelemetrySample> ReadNewSamples(string processName, Func<DateTimeOffset> utcNow)
     {
+        if (_readsFromStdout)
+        {
+            return ReadNewStdoutSamples(processName, utcNow);
+        }
+
+        return ReadNewFileSamples(processName, utcNow);
+    }
+
+    private IEnumerable<FrameTelemetrySample> ReadNewStdoutSamples(string processName, Func<DateTimeOffset> utcNow)
+    {
+        PresentMonStdoutBuffer? stdoutBuffer;
+        lock (_sync)
+        {
+            stdoutBuffer = _stdoutBuffer;
+        }
+
+        var lines = stdoutBuffer?.Drain() ?? [];
+
+        if (lines.Count == 0)
+        {
+            return [];
+        }
+
+        Dictionary<string, int>? headerIndex;
+        lock (_sync)
+        {
+            // Stop/restart may race with a final drain. A buffer belongs to exactly one process; if it
+            // is no longer current, none of its rows may update the replacement capture's parser.
+            if (!ReferenceEquals(_stdoutBuffer, stdoutBuffer))
+            {
+                return [];
+            }
+
+            headerIndex = _headerIndex;
+            foreach (var line in lines)
+            {
+                _rawOutputWriter?.WriteLine(line);
+            }
+            _rawOutputWriter?.Flush();
+            _lastFilePosition += lines.Sum(line => line.Length + Environment.NewLine.Length);
+        }
+
+        var readUtc = utcNow();
+        var rows = new List<(string[] Cells, double? RelativeMs)>();
+        foreach (var line in lines)
+        {
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                continue;
+            }
+
+            if (headerIndex is null)
+            {
+                headerIndex = PresentMonCsvParser.ParseHeader(line);
+                continue;
+            }
+
+            var cells = line.Split(',');
+            rows.Add((cells, PresentMonCsvParser.ReadRelativeMs(cells, headerIndex)));
+        }
+
+        DateTimeOffset traceStart;
+        lock (_sync)
+        {
+            if (!ReferenceEquals(_stdoutBuffer, stdoutBuffer))
+            {
+                return [];
+            }
+
+            _headerIndex = headerIndex;
+            AnchorTraceStartLocked(rows, readUtc);
+            traceStart = _traceStartEstimateUtc ?? readUtc;
+        }
+
+        if (headerIndex is null)
+        {
+            return [];
+        }
+
+        return rows.Select(row =>
+            {
+                var timestamp = row.RelativeMs is { } offset ? traceStart.AddMilliseconds(offset) : readUtc;
+                return PresentMonCsvParser.ParseRow(row.Cells, headerIndex, processName, timestamp);
+            })
+            .Where(sample => sample is not null)
+            .Select(sample => sample!);
+    }
+
+    private IEnumerable<FrameTelemetrySample> ReadNewFileSamples(string processName, Func<DateTimeOffset> utcNow)
+    {
         string? outputPath;
         long startPosition;
         Dictionary<string, int>? headerIndex;
@@ -389,6 +535,55 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
         }
     }
 
+    private void RecordFrame(DateTimeOffset timestamp)
+    {
+        lock (_sync)
+        {
+            if (_lastFrameUtc is { } previous)
+            {
+                var gap = Math.Max(0, (timestamp - previous).TotalSeconds);
+                _largestFrameGapSeconds = Math.Max(_largestFrameGapSeconds, gap);
+                if (gap > 2)
+                {
+                    _frameGapCount++;
+                    _continuousRunStartedUtc = timestamp;
+                }
+            }
+
+            _firstFrameUtc ??= timestamp;
+            _continuousRunStartedUtc ??= timestamp;
+            _lastFrameUtc = timestamp;
+            _sessionFrameCount++;
+        }
+    }
+
+    private async Task WriteHealthSampleIfDueAsync(CollectorContext context, CancellationToken cancellationToken)
+    {
+        CaptureHealthTelemetrySample? sample = null;
+        lock (_sync)
+        {
+            var now = context.UtcNow();
+            if (now - _lastHealthSampleUtc < TimeSpan.FromSeconds(1))
+            {
+                return;
+            }
+
+            _lastHealthSampleUtc = now;
+            sample = new CaptureHealthTelemetrySample(
+                now,
+                _sessionFrameCount,
+                _firstFrameUtc,
+                _lastFrameUtc,
+                _largestFrameGapSeconds,
+                _lastFrameUtc is { } last && _continuousRunStartedUtc is { } start ? Math.Max(0, (last - start).TotalSeconds) : 0,
+                _sessionRestartCount,
+                _presentMonProcess is { HasExited: false },
+                _frameGapCount);
+        }
+
+        await context.Writer.WriteAsync(sample, cancellationToken).ConfigureAwait(false);
+    }
+
     /// <summary>
     /// PresentMon reports frame times relative to the start of its trace, not as wall-clock. The read
     /// always happens after the frame, so <c>readUtc - relativeMs</c> is an upper bound on the trace
@@ -444,6 +639,11 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
         }
 
         _presentMonProcess = null;
+        _stdoutBuffer?.Deactivate();
+        _stdoutBuffer = null;
+        _rawOutputWriter?.Dispose();
+        _rawOutputWriter = null;
+        _readsFromStdout = false;
         _currentProcessId = null;
         _currentOutputPath = null;
         _lastFilePosition = 0;

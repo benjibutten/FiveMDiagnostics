@@ -33,7 +33,7 @@ public static class Strings
     public static string PresentMonStatusMissing => ResourceManager.GetString("PresentMonStatusMissing", Culture) ?? "PresentMon was not found. The app still works without it; add it later under Advanced if you want deeper frame data.";
     public static string CaptureFeedbackHeader => ResourceManager.GetString("CaptureFeedbackHeader", Culture) ?? "Capture status";
     public static string CaptureFeedbackHint => ResourceManager.GetString("CaptureFeedbackHint", Culture) ?? "When you mark stutter, the app keeps collecting for another 60 seconds before the finished incident appears in the list.";
-    public static string CaptureFeedbackSessionStarted => ResourceManager.GetString("CaptureFeedbackSessionStarted", Culture) ?? "Session started. The app is ready to capture a stutter marker.";
+    public static string CaptureFeedbackSessionStarted => ResourceManager.GetString("CaptureFeedbackSessionStarted", Culture) ?? "Session started. Waiting for PresentMon frames and the 30-second pre-buffer.";
     public static string CaptureFeedbackCollectingFormat => ResourceManager.GetString("CaptureFeedbackCollectingFormat", Culture) ?? "{0} saved. The app understood the click and is collecting the rest of the capture window until {1}. Pending captures: {2}.";
     public static string CaptureFeedbackReadyFormat => ResourceManager.GetString("CaptureFeedbackReadyFormat", Culture) ?? "{0} is now ready. Select it in the incident list to inspect the analysis.";
     public static string CaptureFeedbackReadyWithPendingFormat => ResourceManager.GetString("CaptureFeedbackReadyWithPendingFormat", Culture) ?? "{0} is now ready. There are still {1} capture(s) being collected.";
@@ -107,6 +107,11 @@ public static class Strings
     public static string TimelineHeader => ResourceManager.GetString("TimelineHeader", Culture) ?? "Timeline";
 
     public static string SessionActive => ResourceManager.GetString("SessionActive", Culture) ?? "";
+    public static string SessionWarmingUp => ResourceManager.GetString("SessionWarmingUp", Culture) ?? "Collecting PresentMon pre-buffer.";
+    public static string SessionReady => ResourceManager.GetString("SessionReady", Culture) ?? "Ready for incident.";
+    public static string CaptureFeedbackIncidentReady => ResourceManager.GetString("CaptureFeedbackIncidentReady", Culture) ?? "PresentMon is delivering frames and the 30-second pre-buffer is complete. Ready for incident.";
+    public static string CaptureFeedbackWarmingFormat => ResourceManager.GetString("CaptureFeedbackWarmingFormat", Culture) ?? "Waiting for continuous PresentMon frames and pre-buffer: {0:F0}/{1:F0} seconds.";
+    public static string CaptureNormalManualIncidents => ResourceManager.GetString("CaptureNormalManualIncidents", Culture) ?? "Deep capture for normal manual markers";
     public static string SessionIdle => ResourceManager.GetString("SessionIdle", Culture) ?? "";
     public static string WaitingForProcess => ResourceManager.GetString("WaitingForProcess", Culture) ?? "";
     public static string SelectIncidentHint => ResourceManager.GetString("SelectIncidentHint", Culture) ?? "";

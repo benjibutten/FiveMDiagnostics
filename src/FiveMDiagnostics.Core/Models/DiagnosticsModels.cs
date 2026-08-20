@@ -61,6 +61,11 @@ public sealed record PresentMonOptions
         // instead of MsBetweenPresents/MsCPUBusy) than PresentMon's own default.
         "--process_id {processId} --output_file \"{outputPath}\" --v2_metrics " +
         "--no_console_stats --stop_existing_session --terminate_on_proc_exit",
+
+        // The first 2.x default still tailed PresentMon's live file. A transient sharing violation
+        // could therefore terminate the collector for the remainder of a long session.
+        "--process_id {processId} --output_file \"{outputPath}\" " +
+        "--no_console_stats --stop_existing_session --terminate_on_proc_exit",
     ];
 
     /// <summary>
@@ -70,7 +75,7 @@ public sealed record PresentMonOptions
     /// otherwise refuse to start.
     /// </summary>
     public const string DefaultArgumentsTemplate =
-        "--process_id {processId} --output_file \"{outputPath}\" " +
+        "--process_id {processId} --output_stdout " +
         "--no_console_stats --stop_existing_session --terminate_on_proc_exit";
 
     public string? ExecutablePath { get; set; }
@@ -110,6 +115,13 @@ public sealed record DeepCaptureOptions
     public IList<string> Profiles { get; set; } = ["GeneralProfile", "CPU", "GPU", "DiskIO", "Minifilter", "ResidentSet"];
 
     public TimeSpan CaptureDuration { get; set; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Severe manual markers retain their historical automatic capture behaviour. Enabling this also
+    /// captures normal manual markers; it never applies to automatic incidents, which could otherwise
+    /// create recurring WPR load during a bad session.
+    /// </summary>
+    public bool CaptureNormalManualIncidents { get; set; }
 }
 
 /// <summary>
@@ -305,6 +317,7 @@ public sealed record DiagnosticStatusEntry(DateTimeOffset Timestamp, StatusLevel
 [JsonDerivedType(typeof(NetworkEndpointSample), "endpoint")]
 [JsonDerivedType(typeof(NetworkProbeSample), "probe")]
 [JsonDerivedType(typeof(ArtifactEvidence), "artifact")]
+[JsonDerivedType(typeof(CaptureHealthTelemetrySample), "capture-health")]
 public abstract record TelemetryEvent(DateTimeOffset Timestamp, string Source);
 
 /// <summary>
@@ -353,7 +366,10 @@ public sealed record SystemTelemetrySample(
     double MemoryCommitPercent,
     ulong AvailableMemoryMb,
     IReadOnlyList<ProcessActivity> TopCpuProcesses,
-    IReadOnlyList<ProcessActivity> TopDiskProcesses) : TelemetryEvent(Timestamp, "System");
+    IReadOnlyList<ProcessActivity> TopDiskProcesses,
+    double? DiskAverageLatencyMs = null,
+    double? DiskQueueLength = null,
+    double? HardFaultPagesPerSecond = null) : TelemetryEvent(Timestamp, "System");
 
 public sealed record ProcessTelemetrySample(
     DateTimeOffset Timestamp,
@@ -376,7 +392,23 @@ public sealed record ObsTelemetrySample(
     double? CpuUsagePercent,
     double? MemoryUsageMb,
     bool IsStreaming,
-    bool IsRecording) : TelemetryEvent(Timestamp, "OBS");
+    bool IsRecording,
+    bool IsProcessRunning = false) : TelemetryEvent(Timestamp, "OBS");
+
+/// <summary>
+/// Low-rate PresentMon health snapshot. Keeping this at roughly one sample per second exposes gaps and
+/// restarts without duplicating per-frame telemetry or adding another polling loop.
+/// </summary>
+public sealed record CaptureHealthTelemetrySample(
+    DateTimeOffset Timestamp,
+    long FrameCount,
+    DateTimeOffset? FirstFrameAt,
+    DateTimeOffset? LastFrameAt,
+    double LargestFrameGapSeconds,
+    double ContinuousFrameSpanSeconds,
+    int RestartCount,
+    bool CaptureProcessRunning,
+    int FrameGapCount = 0) : TelemetryEvent(Timestamp, "CaptureHealth");
 
 public sealed record NetworkEndpointSample(
     DateTimeOffset Timestamp,

@@ -37,6 +37,8 @@ public sealed class MainWindowViewModel : ObservableObject
     private bool _includeSensitiveFields;
     private bool _includeAttachedArtifacts;
     private bool _autoDetectEnabled;
+    private bool _captureNormalManualIncidents;
+    private bool _isReadyForIncident;
     private bool _stateRefreshPending;
     private string _selectedLanguage = string.Empty;
     private string _presentMonStatusText = string.Empty;
@@ -70,6 +72,7 @@ public sealed class MainWindowViewModel : ObservableObject
         _includeSensitiveFields = settings.Privacy.IncludeSensitiveFieldsInExport;
         _includeAttachedArtifacts = settings.Privacy.IncludeAttachedArtifactsInExport;
         _autoDetectEnabled = settings.AutoDetect.Enabled;
+        _captureNormalManualIncidents = settings.DeepCapture.CaptureNormalManualIncidents;
         _selectedLanguage = settings.Language;
 
         StartSessionCommand = new AsyncRelayCommand(StartSessionAsync, () => !IsSessionActive);
@@ -90,6 +93,7 @@ public sealed class MainWindowViewModel : ObservableObject
         _sessionManager.IncidentsEvicted += OnIncidentsEvicted;
         _sessionManager.SystemTelemetryUpdated += OnSystemTelemetryUpdated;
         _sessionManager.GpuTelemetryUpdated += OnGpuTelemetryUpdated;
+        _sessionManager.CaptureHealthUpdated += OnCaptureHealthUpdated;
 
         foreach (var incident in _sessionManager.GetRecentIncidents())
         {
@@ -138,7 +142,21 @@ public sealed class MainWindowViewModel : ObservableObject
         private set => SetProperty(ref _isSessionActive, value);
     }
 
-    public string SessionStateText => IsSessionActive ? Strings.SessionActive : Strings.SessionIdle;
+    public string SessionStateText => IsSessionActive
+        ? IsReadyForIncident ? Strings.SessionReady : Strings.SessionWarmingUp
+        : Strings.SessionIdle;
+
+    public bool IsReadyForIncident
+    {
+        get => _isReadyForIncident;
+        private set
+        {
+            if (SetProperty(ref _isReadyForIncident, value))
+            {
+                OnPropertyChanged(nameof(SessionStateText));
+            }
+        }
+    }
 
     public string ActiveProcessText
     {
@@ -302,6 +320,18 @@ public sealed class MainWindowViewModel : ObservableObject
         }
     }
 
+    public bool CaptureNormalManualIncidents
+    {
+        get => _captureNormalManualIncidents;
+        set
+        {
+            if (SetProperty(ref _captureNormalManualIncidents, value))
+            {
+                Settings.DeepCapture.CaptureNormalManualIncidents = value;
+            }
+        }
+    }
+
     public IReadOnlyList<LanguageOption> AvailableLanguages { get; } = [new("en", Strings.EnglishLanguageName), new("sv", Strings.SwedishLanguageName)];
 
     public string SelectedLanguage
@@ -350,6 +380,7 @@ public sealed class MainWindowViewModel : ObservableObject
         await _sessionManager.StopSessionAsync().ConfigureAwait(false);
         await _dispatcher.InvokeAsync(RefreshState, DispatcherPriority.Background);
         _pendingIncidentIds.Clear();
+        IsReadyForIncident = false;
         CaptureFeedbackText = Strings.CaptureFeedbackHint;
     }
 
@@ -436,6 +467,25 @@ public sealed class MainWindowViewModel : ObservableObject
             : Strings.LiveVramUnavailable;
 
         _ = _dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() => LiveVramText = text));
+    }
+
+    private void OnCaptureHealthUpdated(object? sender, CaptureHealthTelemetrySample sample)
+    {
+        var ready = sample.CaptureProcessRunning
+            && sample.LastFrameAt is { } lastFrame
+            && sample.Timestamp - lastFrame <= TimeSpan.FromSeconds(2)
+            && sample.ContinuousFrameSpanSeconds >= Settings.PreIncidentWindow.TotalSeconds;
+
+        _ = _dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+        {
+            IsReadyForIncident = ready;
+            if (_pendingIncidentIds.Count == 0)
+            {
+                CaptureFeedbackText = ready
+                    ? Strings.CaptureFeedbackIncidentReady
+                    : string.Format(Strings.CaptureFeedbackWarmingFormat, Math.Min(sample.ContinuousFrameSpanSeconds, Settings.PreIncidentWindow.TotalSeconds), Settings.PreIncidentWindow.TotalSeconds);
+            }
+        }));
     }
 
     private void OnStatusReported(object? sender, DiagnosticStatusEntry status)

@@ -27,6 +27,23 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         var networkEndpoints = incident.GetEvents<NetworkEndpointSample>();
         var artifacts = incident.GetEvents<ArtifactEvidence>();
 
+        // Process names, OBS presence, disk throughput and similar context cannot prove a frametime
+        // incident on their own. In particular, two idle Discord helper processes used to become a
+        // 57% external-process conclusion when PresentMon had produced no rows at all.
+        if (frameSamples.Count == 0)
+        {
+            var insufficient = new HypothesisScore(
+                RootCauseCategory.InsufficientEvidence,
+                1,
+                ["Ingen framedata samlades in i incidentfönstret; ingen process kan tillskrivas stuttern utan observerade frames."]);
+            return new IncidentAnalysis(
+                [insufficient],
+                true,
+                "Insufficient evidence. PresentMon levererade inga frames i incidentfönstret.",
+                [new TimelineHighlight(incident.Marker.MarkedAt, "Capture health", "0 frames i incidentfönstret; rotorsak klassificerades inte.")],
+                []);
+        }
+
         var metrics = BuildFrameMetrics(frameSamples, incident.Environment.DisplayRefreshRateHz);
         var gpu = BuildGpuMetrics(gpuSamples);
         var cores = BuildCoreMetrics(systemSamples);
@@ -545,6 +562,13 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         var maxRead = processSamples.Select(item => item.ReadBytesPerSecond).DefaultIfEmpty().Max();
         var competingIo = systemSamples.SelectMany(item => item.TopDiskProcesses).Where(item => !item.ProcessName.Contains("FiveM", StringComparison.OrdinalIgnoreCase)).ToArray();
         var maxCompetingIo = competingIo.Select(item => item.IoBytesPerSecond).DefaultIfEmpty().Max();
+        var maxLatency = systemSamples.Select(item => item.DiskAverageLatencyMs ?? 0).DefaultIfEmpty().Max();
+        var maxQueue = systemSamples.Select(item => item.DiskQueueLength ?? 0).DefaultIfEmpty().Max();
+        var maxHardFaultPages = systemSamples.Select(item => item.HardFaultPagesPerSecond ?? 0).DefaultIfEmpty().Max();
+        var hasDiskCounterData = systemSamples.Any(item =>
+            item.DiskAverageLatencyMs is not null
+            || item.DiskQueueLength is not null
+            || item.HardFaultPagesPerSecond is not null);
         var streamingHints = artifacts.Where(item => item.Summary.Contains("stream", StringComparison.OrdinalIgnoreCase)).ToArray();
 
         if (maxRead >= 50 * 1024 * 1024)
@@ -565,13 +589,43 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             evidence.AddRange(streamingHints.Select(item => item.Summary));
         }
 
+        if (maxLatency >= 20)
+        {
+            confidence += 0.3;
+            evidence.Add($"Disklatensen toppade på {maxLatency:F1} ms.");
+        }
+
+        if (maxQueue >= 2)
+        {
+            confidence += 0.2;
+            evidence.Add($"Diskkön toppade på {maxQueue:F1} samtidiga operationer.");
+        }
+
+        if (maxHardFaultPages >= 100)
+        {
+            confidence += 0.15;
+            evidence.Add($"Paging från disk toppade på {maxHardFaultPages:F0} sidor/s.");
+        }
+
         if (metrics.SevereSpikeCount > 0)
         {
             confidence += 0.1;
             evidence.Add("Frametime-spikes sammanföll med disk- eller streaming-signaler.");
         }
 
-        if (confidence > 0)
+        var hasStrongIoFallback = !hasDiskCounterData
+            && (maxRead >= 50 * 1024 * 1024 || maxCompetingIo >= 20 * 1024 * 1024);
+        if (hasStrongIoFallback)
+        {
+            evidence.Add("Diskens latency-/köcounters saknades; bedömningen bygger därför på uppmätt process-I/O och framedata.");
+        }
+
+        var hasStorageStallSignal = maxLatency >= 20
+            || maxQueue >= 2
+            || maxHardFaultPages >= 100
+            || streamingHints.Length > 0
+            || hasStrongIoFallback;
+        if (confidence > 0 && hasStorageStallSignal)
         {
             hypotheses.Add(new HypothesisScore(RootCauseCategory.StreamingOrDiskStall, Math.Min(confidence, 0.88), evidence));
         }
@@ -701,10 +755,17 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                 $"{gpu.AdapterName ?? "GPU"}: peak {gpu.PeakUtilizationPercent:F0}% util, VRAM {gpu.PeakVramUsedGb:F1}/{gpu.TotalVramGb:F1} GB ({gpu.PeakVramPercent:F0}%), NVENC {gpu.PeakEncoderPercent:F0}%."));
         }
 
-        var obs = obsSamples.LastOrDefault(item => item.IsConnected);
+        var obs = obsSamples.LastOrDefault();
         if (obs is not null)
         {
-            highlights.Add(new(obs.Timestamp, "OBS", $"OBS render time {obs.AverageFrameRenderTimeMs:F1} ms, render skipped {obs.RenderSkippedFrames}, output skipped {obs.OutputSkippedFrames}."));
+            var state = obs.IsStreaming
+                ? "process körs, WebSocket ansluten, streamar"
+                : obs.IsConnected
+                    ? "process körs, WebSocket ansluten, streamar inte"
+                    : obs.IsProcessRunning
+                        ? "process körs, WebSocket frånkopplad"
+                        : "process körs inte";
+            highlights.Add(new(obs.Timestamp, "OBS", $"OBS-status: {state}. Render time {obs.AverageFrameRenderTimeMs:F1} ms, render skipped {obs.RenderSkippedFrames}, output skipped {obs.OutputSkippedFrames}."));
         }
 
         var probe = probes.OrderByDescending(item => item.RoundTripTimeMs ?? 0).FirstOrDefault();
@@ -760,7 +821,13 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             return $"Insufficient evidence. Kör gärna en ny session i grundläge igen.{hint}";
         }
 
-        var obsActive = obsSamples.Any(item => item.IsConnected) ? "OBS var aktivt." : "OBS var inte aktivt.";
+        var obsActive = obsSamples.Any(item => item.IsStreaming)
+            ? "OBS-processen körde, WebSocket var ansluten och streamen var aktiv."
+            : obsSamples.Any(item => item.IsConnected)
+                ? "OBS-processen körde och WebSocket var ansluten, men streamen var inte aktiv."
+                : obsSamples.Any(item => item.IsProcessRunning)
+                    ? "OBS-processen körde men WebSocket var inte ansluten."
+                    : "OBS-processen körde inte.";
         var attribution = metrics.HasCpuGpuBreakdown && metrics.SpikeCount > 0
             ? $" Av {metrics.SpikeCount} spikes var {metrics.CpuBoundSpikes} CPU-bundna, {metrics.GpuBoundSpikes} GPU-bundna och {metrics.PresentBoundSpikes} present/display-bundna."
             : string.Empty;
@@ -799,7 +866,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                     Score = peakCpu + (peakIoMegabytes * 1.5) + (IsKnownOverlayOrHook(group.Key.ProcessName) ? 20 : 0),
                 };
             })
-            .Where(item => item.Impact.PeakCpuPercent >= 12 || item.Impact.PeakIoMegabytesPerSecond >= 12 || IsKnownOverlayOrHook(item.Impact.ProcessName))
+            .Where(item => item.Impact.PeakCpuPercent >= 12 || item.Impact.PeakIoMegabytesPerSecond >= 12)
             .OrderByDescending(item => item.Score)
             .ThenByDescending(item => item.Impact.ObservedSamples)
             .Select(item => item.Impact)
