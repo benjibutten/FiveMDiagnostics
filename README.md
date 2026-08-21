@@ -46,6 +46,28 @@ than frame time alone:
 | `MsGPUBusy` dominates | GPU contention, e.g. NVENC encoding against the game |
 | Neither is busy | Present/display path stalled — VRAM eviction, DPC/ISR latency or composition |
 
+PresentMon's `PresentMode` and `MsBetweenDisplayChange` are read alongside these and reported in the
+summary, the timeline and the exported metrics. The mode is the only column that says *how* a frame
+reached the screen — a window where every frame sat in `Composed: Copy with GPU GDI` is a machine
+compositing through DWM rather than getting an independent flip, which costs latency on every frame and
+is invisible in frame time. Display-change cadence separates "frames were slow" from "frames were on
+time and the screen did not update", and the two need different fixes.
+
+### A verdict never outranks the measurement behind it
+
+Disk counters (`\PhysicalDisk\Avg. Disk sec/Transfer`, `Current Disk Queue Length`, `\Memory\Pages
+Input/sec`) can fail to open, and used to fail in complete silence — the analysis then fell back to raw
+process throughput and still reached 88% confidence in a storage stall, for an incident whose ETL held
+five disk operations and three hard faults. Two rules now apply:
+
+- The system collector **reports at session start** which counters opened and, for each that did not, the
+  reason. It reports again if a counter opened but produced no value across the first twenty reads. Both
+  go to the session journal, so whether the counters worked is answerable from the log alone.
+- A hypothesis resting on a fallback rather than on the measurement it substitutes for is **capped below
+  the 35% bar** that promotes a hypothesis past "insufficient evidence". Throughput cannot distinguish a
+  busy disk from a slow one, so it produces a lead worth checking, not an answer that ends the
+  investigation.
+
 ### Automatic incident marking
 
 Relying on the user to notice a hitch and hit a hotkey samples the problem at a few percent, and biases
@@ -66,7 +88,11 @@ Guard rails, all configurable under `AutoDetect` in `settings.json`:
 
 - **Cooldown** (2 minutes) — incident windows span 90 seconds, so anything shorter produces incidents
   that mostly re-describe each other's telemetry.
-- **MaxIncidentsPerSession** (40) — each incident retains its full event window in memory.
+- **MaxIncidentsPerWindow** (20) over **IncidentBudgetWindow** (1 hour) — each incident retains its full
+  event window in memory. The budget is time-windowed rather than session-wide: a session-wide ceiling of
+  40 was exhausted after 1 h 42 min of a 3 h 57 min stream, leaving the detector disarmed for the whole
+  second half. A settings file that still carries the old `MaxIncidentsPerSession` has its value migrated
+  into `MaxIncidentsPerWindow` on load.
 - **MinimumSamples** (120) — nothing fires before the baseline settles, so a level load is not a stutter.
 
 Every value is clamped when settings are read and written. A hand-edited file with `SpikeMultiplier: 0`,
@@ -74,13 +100,13 @@ Every value is clamped when settings are read and written. A hand-edited file wi
 snapshotting a 90 second window; `BaselineWindowFrames` is capped because the detector allocates arrays
 of that size up front.
 
-`MaxIncidentsPerSession` bounds one session, so the top-level **MaxRetainedIncidents** (50) bounds the
-history across all of them. Beyond that the oldest incidents are dropped from memory and from the list —
+`MaxIncidentsPerWindow` bounds the rate, so the top-level **MaxRetainedIncidents** (50) bounds the
+history across all sessions. Beyond that the oldest incidents are dropped from memory and from the list —
 exported bundles are unaffected.
 
-Auto-marked incidents **never trigger deep capture**. WPR writes a multi-hundred-megabyte ETL and costs
-about fifteen seconds of tracing, which is affordable once on demand and ruinous every two minutes for
-six hours. Manual `Severe` markers still trigger it.
+Auto-marked incidents **never trigger deep capture**. Saving the ring buffer writes a multi-hundred-megabyte
+ETL and empties the buffer, discarding the history the next marker would have used — affordable once on
+demand and ruinous every two minutes for six hours. Manual `Severe` markers still trigger it.
 
 Manual marking is unchanged and still worth using: it records that a human *perceived* something, which
 the telemetry alone cannot establish.
@@ -239,16 +265,33 @@ incidents never start WPR, preventing recurring trace overhead during a bad sess
 
 ### Deep capture
 
-- Triggered automatically on `Mark Severe`
-- Optionally triggered by a normal manual marker when explicitly enabled
+- **Runs as a continuous ring buffer, not a recording that starts at the marker.** WPR records into an
+  in-memory ring from the moment the session starts; a marker stops it, which flushes the accumulated
+  history to an ETL, and starts a fresh one. Starting at the marker meant the trace began after the
+  interesting part was already over — by the time a human presses the key or the detector classifies a
+  hitch, the frames that caused it are seconds in the past.
+- **DeepCapture.RingBufferMegabytes** (256) decides how much run-up a marker can save — roughly seven
+  seconds at the event rates a stall produces. **DeepCapture.PostMarkerTail** (5 s) is how long the marker
+  waits before stopping, so the recovery is in the trace too.
+- Triggered automatically on `Mark Severe`; optionally by a normal manual marker when explicitly enabled
 - **Requires the app to run as administrator.** `wpr.exe` cannot self-elevate, so the app checks up front
   and reports that clearly rather than failing part-way through and leaving a trace session running.
-- Starts a short WPR trace only when needed, stacking the profiles that matter for stutter:
-  `GeneralProfile`, `CPU`, `GPU`, `DiskIO`, `Minifilter`, `ResidentSet` (configurable via
-  `DeepCapture.Profiles`)
-- Attempts to save an ETL file in the session working directory
+  Without elevation there is no ring buffer, and a marker falls back to recording forward from itself —
+  which the resulting status entry says explicitly.
+- **Records through a generated `.wprp`, not `GeneralProfile`.** The built-in profile enables syscall
+  enter/exit tracing: 88 of 132 million events and about 5 GB of a 6.9 GB trace, none of it attributable
+  to a thread. The generated profile asks for context switches, ready threads, sampled profiles, DPC/ISR,
+  disk and file I/O, hard faults and resident set — and stacks only for the events whose stacks get read.
+  It is rewritten to the working directory each session so the buffer size follows the setting; point
+  `DeepCapture.CustomProfilePath` at your own file to override it. If WPR rejects the generated profile
+  the built-in `DeepCapture.Profiles` stack takes over and the status entry says so.
 - ETL analysis reports DPC/ISR **durations**, not event counts: ten thousand short DPCs are normal, a
   single 8 ms one blocks the scheduler and stalls every thread at once
+- ETL analysis also reports **per-stream coverage**. Context switches and stacks have been observed
+  stopping at 23 of 54 seconds while `EventsLost` stayed at 0 — that counts events the consumer failed to
+  drain, not a provider that went silent because another ETW session took the keyword. A trace with full
+  duration and half the context switches looks healthy by every other statistic, so the parser measures
+  when each stream was actually producing and warns when one ends early.
 - Only one capture runs at a time. WPR records into a single machine-wide session, so a severe marker
   raised while a capture is in flight is recorded as an incident but does not start a second trace
 
@@ -302,6 +345,22 @@ Notes:
   journal that simply stops is indistinguishable from a crash.
 - **Written unredacted**, like the raw captures beside it. It is local evidence, not a bundle meant to
   be handed to someone else; the redaction rules still apply to everything exported.
+
+## Continuous GPU log
+
+Alongside the journal, every session writes each GPU sample to a flat CSV:
+
+```text
+%LocalAppData%\FiveMDiagnostics\Sessions\gpu_<yyyyMMdd_HHmmss>.csv
+```
+
+Columns are timestamp, availability, adapter, GPU and memory-bandwidth utilisation, used/total VRAM and
+the derived percentage, encoder and decoder load, temperature, and throttle reasons.
+
+GPU telemetry otherwise survives only inside incident windows, and whatever the analysis did not fold
+into a timeline string was gone: reconstructing how VRAM behaved across an evening meant taking 42
+separate timeline strings apart by hand. At the default 500 ms cadence a whole stream costs a few
+megabytes. Flushed per row for the same reason the journal is, bounded at 64 MB, and written unredacted.
 
 ## Export bundle
 

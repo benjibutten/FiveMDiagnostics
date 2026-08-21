@@ -92,10 +92,15 @@ public sealed class AutoIncidentDetectorTests
     }
 
     [Fact]
-    public void StopsAfterTheSessionCap()
+    public void StopsAfterTheWindowBudget()
     {
         var detector = new AutoIncidentDetector(
-            new AutoDetectOptions { Cooldown = TimeSpan.Zero, MaxIncidentsPerSession = 3 },
+            new AutoDetectOptions
+            {
+                Cooldown = TimeSpan.Zero,
+                MaxIncidentsPerWindow = 3,
+                IncidentBudgetWindow = TimeSpan.FromHours(1),
+            },
             60);
 
         var timestamp = Start;
@@ -105,6 +110,7 @@ public sealed class AutoIncidentDetectorTests
             timestamp = timestamp.AddMilliseconds(16.7);
         }
 
+        // 20 spikes half a minute apart, so all of them fall inside the same hour.
         for (var i = 0; i < 20; i++)
         {
             detector.Observe(Frame(timestamp, 200));
@@ -112,6 +118,58 @@ public sealed class AutoIncidentDetectorTests
         }
 
         Assert.Equal(3, detector.TriggerCount);
+    }
+
+    /// <summary>
+    /// The failure a session-wide cap produced: a bad first hour spent the whole budget and the detector
+    /// stayed disarmed for the rest of a four hour stream. The budget has to come back.
+    /// </summary>
+    [Fact]
+    public void BudgetRefillsOnceTheWindowHasPassed()
+    {
+        var detector = new AutoIncidentDetector(
+            new AutoDetectOptions
+            {
+                Cooldown = TimeSpan.Zero,
+                MaxIncidentsPerWindow = 3,
+                IncidentBudgetWindow = TimeSpan.FromHours(1),
+            },
+            60);
+
+        var timestamp = Start;
+        for (var i = 0; i < 200; i++)
+        {
+            detector.Observe(Frame(timestamp, 16.7));
+            timestamp = timestamp.AddMilliseconds(16.7);
+        }
+
+        for (var i = 0; i < 10; i++)
+        {
+            detector.Observe(Frame(timestamp, 200));
+            timestamp = timestamp.AddSeconds(30);
+        }
+
+        Assert.Equal(3, detector.TriggerCount);
+        Assert.Equal(3, detector.TriggersInCurrentWindow);
+
+        timestamp = timestamp.AddHours(2);
+        var afterTheWindow = detector.Observe(Frame(timestamp, 200));
+
+        Assert.NotNull(afterTheWindow);
+        Assert.Equal(4, detector.TriggerCount);
+        Assert.Equal(1, detector.TriggersInCurrentWindow);
+    }
+
+    /// <summary>A ceiling from a settings file written before the budget became time-windowed.</summary>
+    [Fact]
+    public void LegacySessionCeilingBecomesTheWindowBudget()
+    {
+        var options = new AutoDetectOptions { MaxIncidentsPerSession = 7 };
+
+        options.Normalize();
+
+        Assert.Equal(7, options.MaxIncidentsPerWindow);
+        Assert.Null(options.MaxIncidentsPerSession);
     }
 
     [Fact]

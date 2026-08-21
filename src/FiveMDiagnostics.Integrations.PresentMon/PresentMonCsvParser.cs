@@ -42,6 +42,29 @@ public static class PresentMonCsvParser
         ["AllInputToPhotonLatency", "MsAllInputToPhotonLatency", "ClickToPhotonLatency", "MsClickToPhotonLatency"];
 
     /// <summary>
+    /// How the frame reached the screen: <c>Hardware: Independent Flip</c>, <c>Composed: Flip</c>,
+    /// <c>Composed: Copy with GPU GDI</c> and so on.
+    /// </summary>
+    /// <remarks>
+    /// Read because it is the one column that describes the present path itself rather than its timing,
+    /// and no amount of frame time analysis substitutes for it: a capture where all 848 272 frames sat
+    /// in <c>Composed: Copy with GPU GDI</c> is a machine compositing every frame through DWM, which is
+    /// obvious in three seconds of looking at the raw CSV and was invisible to this app.
+    /// </remarks>
+    private static readonly string[] PresentModeColumns = ["PresentMode"];
+
+    /// <summary>
+    /// Time between frames actually changing on screen, as opposed to between presents.
+    /// </summary>
+    /// <remarks>
+    /// The two diverge exactly when the interesting failures happen. Presents arriving on a steady
+    /// cadence while display changes stutter means the frames are being produced on time and held
+    /// somewhere after the present call — a compositor or flip queue problem that
+    /// <c>MsBetweenPresents</c> alone reports as a perfectly healthy frame rate.
+    /// </remarks>
+    private static readonly string[] DisplayChangeColumns = ["MsBetweenDisplayChange"];
+
+    /// <summary>
     /// Time of the frame relative to the start of the PresentMon trace. Whichever of these columns is
     /// present, the unit is milliseconds — <c>CPUStartTime</c> included, confirmed against a four second
     /// capture whose final row read 3996.99.
@@ -99,7 +122,21 @@ public static class PresentMonCsvParser
             ReadDouble(cells, headerIndex, GpuWaitColumns),
             ReadDouble(cells, headerIndex, GpuLatencyColumns),
             ReadDouble(cells, headerIndex, FlipDelayColumns),
-            ReadDouble(cells, headerIndex, InputLatencyColumns));
+            ReadDouble(cells, headerIndex, InputLatencyColumns),
+            ReadPresentMode(cells, headerIndex),
+            ReadDouble(cells, headerIndex, DisplayChangeColumns));
+    }
+
+    /// <summary>
+    /// Reads the present mode, treating the blank and "NA" cells PresentMon writes for a frame it could
+    /// not classify as absent rather than as a mode named "NA".
+    /// </summary>
+    private static string? ReadPresentMode(string[] cells, IReadOnlyDictionary<string, int> headerIndex)
+    {
+        var value = ReadString(cells, headerIndex, PresentModeColumns)?.Trim();
+        return string.IsNullOrEmpty(value) || string.Equals(value, "NA", StringComparison.OrdinalIgnoreCase)
+            ? null
+            : value;
     }
 
     private static bool IsUndisplayed(string[] cells, IReadOnlyDictionary<string, int> headerIndex)

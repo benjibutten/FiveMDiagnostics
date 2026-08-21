@@ -14,9 +14,10 @@ public sealed record AutoIncidentTrigger(IncidentSeverity Severity, string Label
 /// manual marker still records that a human perceived something, which is evidence the telemetry alone
 /// cannot supply.
 /// <para>
-/// Auto-marked incidents deliberately never trigger deep capture. WPR writes a multi hundred megabyte
-/// ETL and costs about fifteen seconds of tracing, which is acceptable once when the user asks for it
-/// and ruinous if it fires every couple of minutes for six hours.
+/// Auto-marked incidents deliberately never trigger deep capture. Saving the ring buffer writes a
+/// multi hundred megabyte ETL and restarts the background session, discarding the history it had
+/// accumulated — acceptable once when the user asks for it, ruinous every couple of minutes for six
+/// hours.
 /// </para>
 /// </remarks>
 public sealed class AutoIncidentDetector
@@ -31,6 +32,12 @@ public sealed class AutoIncidentDetector
     private readonly double _refreshIntervalMs;
     private readonly double[] _frameTimes;
     private readonly double[] _sortBuffer;
+
+    /// <summary>
+    /// When each incident inside the current budget window was raised, oldest first. Only the budget's
+    /// worth of timestamps is ever held, so this stays a handful of entries however long a session runs.
+    /// </summary>
+    private readonly Queue<DateTimeOffset> _triggersInWindow = new();
 
     private int _sampleCount;
     private int _writeIndex;
@@ -56,8 +63,15 @@ public sealed class AutoIncidentDetector
     /// <summary>Current cadence the machine is achieving, in milliseconds. Exposed for the UI and tests.</summary>
     public double BaselineMs => _baselineMs;
 
-    /// <summary>How many incidents this detector has raised, against <see cref="AutoDetectOptions.MaxIncidentsPerSession"/>.</summary>
+    /// <summary>How many incidents this detector has raised over the whole session.</summary>
     public int TriggerCount => _triggerCount;
+
+    /// <summary>
+    /// Incidents raised inside the current budget window, against
+    /// <see cref="AutoDetectOptions.MaxIncidentsPerWindow"/>. Exposed so the UI can say how much of the
+    /// budget is left rather than leaving the user to guess why marking went quiet.
+    /// </summary>
+    public int TriggersInCurrentWindow => _triggersInWindow.Count;
 
     /// <summary>
     /// Feeds one presented frame in and returns a trigger when this frame crosses a threshold. Returns
@@ -76,7 +90,12 @@ public sealed class AutoIncidentDetector
             _droppedRun = 0;
         }
 
-        if (!_options.Enabled || _triggerCount >= _options.MaxIncidentsPerSession)
+        if (!_options.Enabled)
+        {
+            return null;
+        }
+
+        if (!HasBudget(sample.Timestamp))
         {
             return null;
         }
@@ -100,9 +119,29 @@ public sealed class AutoIncidentDetector
         }
 
         _lastTriggerAt = sample.Timestamp;
+        _triggersInWindow.Enqueue(sample.Timestamp);
         _triggerCount++;
         _droppedRun = 0;
         return trigger;
+    }
+
+    /// <summary>
+    /// Drops triggers that have aged out of the budget window and reports whether another one fits.
+    /// </summary>
+    /// <remarks>
+    /// Frame timestamps are derived from PresentMon's trace anchor and can therefore step backwards
+    /// slightly when the anchor converges, so entries are compared against this frame's own timestamp
+    /// rather than wall clock — otherwise a re-anchored batch could expire the window early.
+    /// </remarks>
+    private bool HasBudget(DateTimeOffset timestamp)
+    {
+        var windowStart = timestamp - _options.IncidentBudgetWindow;
+        while (_triggersInWindow.TryPeek(out var oldest) && oldest < windowStart)
+        {
+            _triggersInWindow.Dequeue();
+        }
+
+        return _triggersInWindow.Count < _options.MaxIncidentsPerWindow;
     }
 
     private AutoIncidentTrigger? Classify(FrameTelemetrySample sample)

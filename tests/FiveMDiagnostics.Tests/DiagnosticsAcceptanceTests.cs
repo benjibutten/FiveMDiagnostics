@@ -131,6 +131,159 @@ public sealed class DiagnosticsAcceptanceTests
 
         Assert.NotNull(disk);
         Assert.Contains(disk.Evidence, item => item.Contains("counters saknades", StringComparison.OrdinalIgnoreCase));
+
+        // The 88% disk verdict that started this: the counters that could have refuted it were the ones
+        // missing, so throughput alone must not be able to outrank a measured hypothesis.
+        Assert.True(disk.Confidence <= 0.34, $"Fallback-hypotesen fick {disk.Confidence:P0}, vilket är över taket.");
+    }
+
+    /// <summary>
+    /// The same window with working counters that measure a genuinely slow disk. The cap has to be about
+    /// missing measurements, not about disk hypotheses in general.
+    /// </summary>
+    [Fact]
+    public void CorrelationEngine_KeepsFullConfidenceWhenDiskCountersMeasuredTheStall()
+    {
+        var baseTime = new DateTimeOffset(2026, 8, 20, 20, 0, 0, TimeSpan.Zero);
+        var events = new List<TelemetryEvent>();
+        for (var index = 0; index < 60; index++)
+        {
+            events.Add(new FrameTelemetrySample(
+                baseTime.AddMilliseconds(index * 16.6),
+                index == 40 ? 100 : 16.6,
+                8,
+                5,
+                index == 40 ? 100 : 16.6,
+                false,
+                "FiveM",
+                CpuBusyMs: 7));
+        }
+
+        events.Add(new ProcessTelemetrySample(baseTime, 42, "FiveM", 30, 1, 1, 20, 60 * 1024 * 1024, 0));
+        events.Add(new SystemTelemetrySample(
+            baseTime,
+            40,
+            new Dictionary<string, double> { ["0"] = 50 },
+            50,
+            8_000,
+            [],
+            [new ProcessActivity("Indexer", 84, 5, 30 * 1024 * 1024)],
+            DiskAverageLatencyMs: 45,
+            DiskQueueLength: 6,
+            HardFaultPagesPerSecond: 800));
+
+        var analysis = _engine.Analyze(BuildIncident(baseTime, events, 60));
+        var disk = analysis.Hypotheses.FirstOrDefault(item => item.Category == RootCauseCategory.StreamingOrDiskStall);
+
+        Assert.NotNull(disk);
+        Assert.True(disk.Confidence > 0.34, $"Mätt disk-hypotes fick bara {disk.Confidence:P0}.");
+        Assert.DoesNotContain(disk.Evidence, item => item.Contains("counters saknades", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Partial counter coverage is not measured disk data. A hard fault counter that opened while the
+    /// latency and queue counters did not says nothing about whether the disk kept up, so the window is
+    /// still a throughput-only one and has to be capped like one.
+    /// </summary>
+    [Fact]
+    public void CorrelationEngine_UsesStrongIoFallbackWhenOnlyHardFaultCounterIsAvailable()
+    {
+        var baseTime = new DateTimeOffset(2026, 8, 20, 20, 0, 0, TimeSpan.Zero);
+        var events = new List<TelemetryEvent>();
+        for (var index = 0; index < 60; index++)
+        {
+            events.Add(new FrameTelemetrySample(
+                baseTime.AddMilliseconds(index * 16.6),
+                index == 40 ? 100 : 16.6,
+                8,
+                5,
+                index == 40 ? 100 : 16.6,
+                false,
+                "FiveM",
+                CpuBusyMs: 7));
+        }
+
+        events.Add(new ProcessTelemetrySample(baseTime, 42, "FiveM", 30, 1, 1, 20, 60 * 1024 * 1024, 0));
+        events.Add(new SystemTelemetrySample(
+            baseTime,
+            40,
+            new Dictionary<string, double> { ["0"] = 50 },
+            50,
+            8_000,
+            [],
+            [new ProcessActivity("Indexer", 84, 5, 30 * 1024 * 1024)],
+            HardFaultPagesPerSecond: 0));
+
+        var analysis = _engine.Analyze(BuildIncident(baseTime, events, 60));
+        var disk = analysis.Hypotheses.FirstOrDefault(item => item.Category == RootCauseCategory.StreamingOrDiskStall);
+
+        Assert.NotNull(disk);
+        Assert.Contains(disk.Evidence, item => item.Contains("counters saknades", StringComparison.OrdinalIgnoreCase));
+        Assert.True(disk.Confidence <= 0.34, $"Fallback-hypotesen fick {disk.Confidence:P0}, vilket är över taket.");
+    }
+
+    /// <summary>
+    /// PresentMode and MsBetweenDisplayChange have to reach the analysis, not merely the CSV: a window
+    /// where every frame was composed says the machine never got an independent flip, and nothing in the
+    /// frame times shows it.
+    /// </summary>
+    [Fact]
+    public void CorrelationEngine_ReportsComposedPresentMode()
+    {
+        var baseTime = new DateTimeOffset(2026, 8, 20, 20, 0, 0, TimeSpan.Zero);
+        var events = new List<TelemetryEvent>();
+        for (var index = 0; index < 120; index++)
+        {
+            events.Add(new FrameTelemetrySample(
+                baseTime.AddMilliseconds(index * 16.6),
+                index == 80 ? 90 : 16.6,
+                8,
+                5,
+                index == 80 ? 90 : 16.6,
+                false,
+                "FiveM",
+                CpuBusyMs: 7,
+                PresentMode: "Composed: Copy with GPU GDI",
+                MsBetweenDisplayChange: index == 80 ? 90 : 16.6));
+        }
+
+        var analysis = _engine.Analyze(BuildIncident(baseTime, events, 60));
+
+        Assert.Contains("Composed: Copy with GPU GDI", analysis.Summary, StringComparison.Ordinal);
+        Assert.Contains(analysis.TimelineHighlights, item => item.Category == "Present mode");
+    }
+
+    /// <summary>
+    /// "Nätprober fanns tillgängliga" was written for a window in which every probe failed, which reads
+    /// as reassurance about the exact thing that went wrong.
+    /// </summary>
+    [Fact]
+    public void CorrelationEngine_SaysWhenEveryNetworkProbeFailed()
+    {
+        var baseTime = new DateTimeOffset(2026, 8, 20, 20, 0, 0, TimeSpan.Zero);
+        var events = new List<TelemetryEvent>();
+        for (var index = 0; index < 120; index++)
+        {
+            events.Add(new FrameTelemetrySample(
+                baseTime.AddMilliseconds(index * 16.6),
+                index == 80 ? 90 : 16.6,
+                8,
+                5,
+                index == 80 ? 90 : 16.6,
+                false,
+                "FiveM",
+                CpuBusyMs: 7));
+        }
+
+        for (var index = 0; index < 5; index++)
+        {
+            events.Add(new NetworkProbeSample(baseTime.AddSeconds(index), "server.example", null, false, "TimedOut"));
+        }
+
+        var analysis = _engine.Analyze(BuildIncident(baseTime, events, 60));
+
+        Assert.Contains("misslyckades", analysis.Summary, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Nätprober fanns tillgängliga", analysis.Summary, StringComparison.Ordinal);
     }
 
     /// <summary>

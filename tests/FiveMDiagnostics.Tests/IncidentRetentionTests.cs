@@ -86,6 +86,11 @@ public sealed class IncidentRetentionTests
 
     private sealed class StubDeepCaptureService : IDeepCaptureService
     {
+        public Task<DeepCaptureResult> StartRingBufferAsync(DiagnosticsSettings settings, CancellationToken cancellationToken)
+            => Task.FromResult(new DeepCaptureResult(false, false, "stub"));
+
+        public Task StopRingBufferAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
         public Task<DeepCaptureResult> CaptureAsync(IncidentMarker marker, DiagnosticsSettings settings, CancellationToken cancellationToken)
             => Task.FromResult(new DeepCaptureResult(false, false, "stub"));
     }

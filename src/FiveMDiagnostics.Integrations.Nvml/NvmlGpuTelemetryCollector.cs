@@ -22,6 +22,8 @@ public sealed class NvmlGpuTelemetryCollector : ITelemetryCollector, IDisposable
     private bool _reportedUnavailable;
     private IntPtr _device;
     private string? _adapterName;
+    private GpuTelemetryCsvLog? _csvLog;
+    private bool _reportedLogFailure;
 
     public string Name => "GpuTelemetry";
 
@@ -32,13 +34,23 @@ public sealed class NvmlGpuTelemetryCollector : ITelemetryCollector, IDisposable
             return;
         }
 
+        OpenCsvLog(context);
+
         try
         {
             while (!cancellationToken.IsCancellationRequested)
             {
                 if (context.ProcessResolver.TryGetTargetProcess() is not null)
                 {
-                    await context.Writer.WriteAsync(Sample(context), cancellationToken).ConfigureAwait(false);
+                    var sample = Sample(context);
+
+                    // Written before the channel: a bounded channel under backpressure can hold this
+                    // call for a while, and the file is the copy that has to survive the app being
+                    // closed rather than the one feeding the UI.
+                    _csvLog?.Append(sample);
+                    ReportLogFailureIfAny(context);
+
+                    await context.Writer.WriteAsync(sample, cancellationToken).ConfigureAwait(false);
                 }
 
                 await Task.Delay(context.Settings.Gpu.PollingInterval, cancellationToken).ConfigureAwait(false);
@@ -46,13 +58,46 @@ public sealed class NvmlGpuTelemetryCollector : ITelemetryCollector, IDisposable
         }
         finally
         {
+            CloseCsvLog();
             ShutdownNvml();
         }
     }
 
     public void Dispose()
     {
+        CloseCsvLog();
         ShutdownNvml();
+    }
+
+    private void OpenCsvLog(CollectorContext context)
+    {
+        _reportedLogFailure = false;
+        _csvLog = GpuTelemetryCsvLog.TryOpen(context.Settings.WorkingDirectory, context.UtcNow(), out var error);
+
+        context.StatusSink.Report(
+            _csvLog is null ? StatusLevel.Warning : StatusLevel.Info,
+            Name,
+            _csvLog is null
+                ? $"GPU-loggen kunde inte skapas: {error}. GPU-telemetri finns då bara i incidentfönstren."
+                : $"GPU-telemetri loggas kontinuerligt till {_csvLog.Path}.");
+    }
+
+    /// <summary>Hands over the log's first failure once, so a full disk produces one warning rather than one per sample.</summary>
+    private void ReportLogFailureIfAny(CollectorContext context)
+    {
+        if (_reportedLogFailure || _csvLog?.Failure is not { } failure)
+        {
+            return;
+        }
+
+        _reportedLogFailure = true;
+        context.StatusSink.Report(StatusLevel.Warning, Name, failure);
+    }
+
+    private void CloseCsvLog()
+    {
+        _csvLog?.Dispose();
+        _csvLog = null;
     }
 
     private GpuTelemetrySample Sample(CollectorContext context)

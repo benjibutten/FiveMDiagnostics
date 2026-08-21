@@ -28,7 +28,13 @@ public sealed class FiveMTargetProcessResolver : ITargetProcessResolver
         {
             var now = DateTimeOffset.UtcNow;
             var cacheDuration = _cached is null ? _idleCacheDuration : _activeCacheDuration;
-            if (now - _lastRefreshUtc <= cacheDuration)
+
+            // A cached entry is only worth returning while it still names the same process. Serving a PID
+            // that has exited makes every consumer act on a process that is gone — PresentMon in
+            // particular starts a capture against nothing and then looks merely silent — and serving one
+            // Windows has since handed to somebody else is worse, because that capture succeeds against
+            // the wrong process.
+            if (now - _lastRefreshUtc <= cacheDuration && (_cached is null || ProcessIdentity.StillMatches(_cached)))
             {
                 return _cached;
             }
@@ -81,7 +87,11 @@ public sealed class FiveMTargetProcessResolver : ITargetProcessResolver
             }
             while (Process32Next(snapshotHandle, ref entry));
 
-            return bestMatch;
+            // Stamped on the winner only: the start time is what later tells this process apart from a
+            // different one that inherited its id, and reading it costs an OpenProcess per candidate.
+            return bestMatch is null
+                ? null
+                : bestMatch with { StartedAt = ProcessIdentity.TryGetStartTime(bestMatch.ProcessId) };
         }
         finally
         {

@@ -33,6 +33,7 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
     private double _largestFrameGapSeconds;
     private int _frameGapCount;
     private DateTimeOffset _lastHealthSampleUtc = DateTimeOffset.MinValue;
+    private int? _reportedStaleTargetPid;
 
     public string Name => "PresentMon";
 
@@ -52,6 +53,7 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
             _largestFrameGapSeconds = 0;
             _frameGapCount = 0;
             _lastHealthSampleUtc = DateTimeOffset.MinValue;
+            _reportedStaleTargetPid = null;
         }
 
         try
@@ -93,6 +95,21 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
                     continue;
                 }
 
+                // The resolver caches its scan, so a PID that exited moments ago is still handed out.
+                // PresentMon started against a dead PID does not fail loudly: it starts, attaches to
+                // nothing, and produces a capture that is silent for reasons the restart ladder then
+                // attributes to a lost ETW session. A PID Windows has already reused is worse still,
+                // since that capture works and reports another process's frames as FiveM's — so the
+                // check is on identity, not on liveness.
+                if (!ProcessIdentity.StillMatches(target))
+                {
+                    ReportStaleTarget(context, target);
+                    StopCapture(context);
+                    await Task.Delay(context.Settings.PresentMon.PollingInterval, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+
+                _reportedStaleTargetPid = null;
                 EnsureCaptureStarted(context, executablePath, target.ProcessId);
 
                 var produced = 0;
@@ -353,6 +370,24 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
             StatusLevel.Error,
             Name,
             $"{prefix}PresentMon startades om {_health.RestartCount} gånger utan att leverera frames. Automatiska omstarter pausas tills FiveM startas om eller en ny session startas — frame telemetry saknas till dess.");
+    }
+
+
+    /// <summary>Says once per stale PID that the target went away, rather than once per polling interval.</summary>
+    private void ReportStaleTarget(CollectorContext context, TargetProcessInfo target)
+    {
+        if (_reportedStaleTargetPid == target.ProcessId)
+        {
+            return;
+        }
+
+        _reportedStaleTargetPid = target.ProcessId;
+        context.StatusSink.Report(
+            StatusLevel.Warning,
+            Name,
+            $"{target.ProcessName} (PID {target.ProcessId}) var inte längre samma process när capturen skulle startas — "
+            + "den hade avslutats, eller så hade PID:n återanvänts. Ingen PresentMon startades mot den; väntar på att "
+            + "processen hittas igen.");
     }
 
     private static string TryGetExitCode(Process process)

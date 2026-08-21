@@ -9,14 +9,147 @@ namespace FiveMDiagnostics.Integrations.Etw;
 
 using FiveMDiagnostics.Core;
 
+/// <summary>
+/// Records deep traces through WPR, as a continuously running in-memory ring buffer that a marker
+/// saves rather than a recording that starts when the marker arrives.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Starting at the marker was the flaw the ring buffer exists to fix: by the time a human notices a
+/// hitch and presses the key, or the detector classifies one, the frames that caused it are seconds in
+/// the past and the trace begins after the interesting part is over. Everything the capture then holds
+/// is the recovery.
+/// </para>
+/// <para>
+/// So the session runs from the moment diagnostics start, writing into a memory ring that keeps only
+/// the most recent <see cref="DeepCaptureOptions.RingBufferMegabytes"/>. A marker stops it, which
+/// flushes that history to an ETL, and starts a fresh one. The cost is that the buffer is empty again
+/// straight after a capture, which is why automatic incidents do not save traces.
+/// </para>
+/// </remarks>
 public sealed class WprDeepCaptureService : IDeepCaptureService, IDisposable
 {
     /// <summary>
-    /// WPR records into a single machine-wide session, so captures cannot overlap. Without this gate a
+    /// WPR records into a single machine-wide session, so nothing here may overlap. Without this gate a
     /// second severe marker would run <c>-cancel</c> — which discards the recording rather than saving
     /// it — and destroy the trace the first marker was still collecting.
     /// </summary>
     private readonly SemaphoreSlim _captureGate = new(1, 1);
+
+    /// <summary>
+    /// The <c>-start</c> arguments the running ring buffer session was started with, or null when no
+    /// session of ours is running. Kept so a capture restarts the buffer exactly as it was, including
+    /// the fallback profile stack when the generated profile did not take.
+    /// </summary>
+    private string? _ringBufferArguments;
+
+    /// <summary>
+    /// Remembered so <see cref="StopRingBufferAsync"/> can tear the session down without being handed
+    /// settings; a running trace has to stop even when the caller no longer has them.
+    /// </summary>
+    private string? _wprPathForShutdown;
+
+    /// <summary>
+    /// Appended when <c>-start</c> fails. "Already recording" is by far the most common reason, and a
+    /// recording this service did not start is now left alone rather than cancelled, so clearing it is a
+    /// decision for whoever knows what it belongs to.
+    /// </summary>
+    private const string AlreadyRecordingHint =
+        " Om WPR redan spelar in — ett annat verktyg, eller en tidigare körning som inte städades — avbryts den "
+        + "inspelningen inte automatiskt. Kör \"wpr -cancel\" manuellt om den inte behövs.";
+
+    public async Task<DeepCaptureResult> StartRingBufferAsync(DiagnosticsSettings settings, CancellationToken cancellationToken)
+    {
+        if (!settings.DeepCapture.Enabled)
+        {
+            return new DeepCaptureResult(false, false, "Deep capture är avstängd; ingen bakgrundstrace startades.");
+        }
+
+        if (!IsElevated())
+        {
+            return new DeepCaptureResult(
+                Started: false,
+                RequiresElevation: true,
+                "Deep capture kräver att appen körs som administratör. Utan förhöjda rättigheter finns ingen ringbuffert, "
+                + "och en markering kan därför bara spela in framåt från markeringen.");
+        }
+
+        await _captureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_ringBufferArguments is not null)
+            {
+                return new DeepCaptureResult(true, false, "Ringbufferten körde redan.");
+            }
+
+            var wprPath = settings.DeepCapture.WprExecutablePath;
+
+            // Clears a session orphaned by an earlier crash so "already recording" does not block the
+            // whole session. Safe only because the gate guarantees no capture of ours is in flight, and
+            // only for a session that is recognisably ours — see CancelOwnOrphanedSessionAsync.
+            await CancelOwnOrphanedSessionAsync(wprPath, CancellationToken.None).ConfigureAwait(false);
+
+            var (arguments, isGenerated, profileNote) = BuildRingBufferArguments(settings);
+            var start = await RunWprAsync(wprPath, arguments, cancellationToken).ConfigureAwait(false);
+
+            // The generated profile is the only one whose keywords and buffer size we control, but it is
+            // also the only one WPR has never validated before this moment. A rejected profile must not
+            // cost the session its deep captures, so the built-in stack takes over and says so.
+            if (!start.Success && isGenerated)
+            {
+                var fallbackArguments = BuildFallbackArguments(settings.DeepCapture);
+                var fallback = await RunWprAsync(wprPath, fallbackArguments, cancellationToken).ConfigureAwait(false);
+                if (fallback.Success)
+                {
+                    _ringBufferArguments = fallbackArguments;
+                    return new DeepCaptureResult(
+                        true,
+                        false,
+                        $"WPR avvisade den genererade profilen ({start.Message.Trim()}). Ringbufferten körs i stället med "
+                        + $"inbyggda profiler ({string.Join(", ", ResolveFallbackProfiles(settings.DeepCapture))}), vilket ger en "
+                        + "betydligt större ETL med syscall-events.");
+                }
+
+                return new DeepCaptureResult(false, fallback.RequiresElevation, $"Ringbufferten kunde inte startas: {fallback.Message}{AlreadyRecordingHint}");
+            }
+
+            if (!start.Success)
+            {
+                return new DeepCaptureResult(false, start.RequiresElevation, $"Ringbufferten kunde inte startas: {start.Message}{AlreadyRecordingHint}");
+            }
+
+            _ringBufferArguments = arguments;
+            return new DeepCaptureResult(
+                true,
+                false,
+                $"WPR-ringbuffert igång ({settings.DeepCapture.RingBufferMegabytes} MB{profileNote}). En markering sparar sekunderna före hitchen.");
+        }
+        finally
+        {
+            _captureGate.Release();
+        }
+    }
+
+    public async Task StopRingBufferAsync(CancellationToken cancellationToken)
+    {
+        await _captureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_ringBufferArguments is null)
+            {
+                return;
+            }
+
+            // -cancel rather than -stop: the buffer holds only whatever happened since the last capture,
+            // and an ETL nobody asked for is not worth the disk. Tracing must stop either way.
+            await CancelQuietlyAsync(_wprPathForShutdown ?? "wpr.exe").ConfigureAwait(false);
+            _ringBufferArguments = null;
+        }
+        finally
+        {
+            _captureGate.Release();
+        }
+    }
 
     public async Task<DeepCaptureResult> CaptureAsync(IncidentMarker marker, DiagnosticsSettings settings, CancellationToken cancellationToken)
     {
@@ -43,7 +176,7 @@ public sealed class WprDeepCaptureService : IDeepCaptureService, IDisposable
         _captureGate.Dispose();
     }
 
-    private static async Task<DeepCaptureResult> CaptureCoreAsync(IncidentMarker marker, DiagnosticsSettings settings, CancellationToken cancellationToken)
+    private async Task<DeepCaptureResult> CaptureCoreAsync(IncidentMarker marker, DiagnosticsSettings settings, CancellationToken cancellationToken)
     {
         // wpr.exe cannot self-elevate, and failing halfway through leaves a running trace session
         // behind. Checking up front turns a confusing mid-capture failure into a clear message.
@@ -58,20 +191,93 @@ public sealed class WprDeepCaptureService : IDeepCaptureService, IDisposable
         var wprPath = settings.DeepCapture.WprExecutablePath;
         var capturePath = Path.Combine(settings.WorkingDirectory, $"deep_{marker.MarkedAt:yyyyMMdd_HHmmss}_{marker.Id:N}.etl");
 
-        // Clears a session orphaned by an earlier crash so "already recording" does not block every
-        // subsequent severe marker. Safe only because the capture gate guarantees no capture of ours is
-        // in flight — otherwise this would discard a trace still being collected.
-        await RunWprAsync(wprPath, "-cancel", CancellationToken.None).ConfigureAwait(false);
+        return _ringBufferArguments is { } ringBufferArguments
+            ? await SaveRingBufferAsync(wprPath, ringBufferArguments, capturePath, settings, cancellationToken).ConfigureAwait(false)
+            : await CaptureForwardAsync(wprPath, capturePath, settings, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Stops the ring buffer, which writes out the history it holds, then starts a fresh one.
+    /// </summary>
+    private async Task<DeepCaptureResult> SaveRingBufferAsync(
+        string wprPath,
+        string ringBufferArguments,
+        string capturePath,
+        DiagnosticsSettings settings,
+        CancellationToken cancellationToken)
+    {
+        var tail = settings.DeepCapture.PostMarkerTail;
+
+        try
+        {
+            // The run-up is already in the buffer; this waits only for the recovery, which is why a
+            // marker costs seconds rather than the old fifteen.
+            if (tail > TimeSpan.Zero)
+            {
+                await Task.Delay(tail, cancellationToken).ConfigureAwait(false);
+            }
+
+            var stop = await RunWprAsync(wprPath, $"-stop \"{capturePath}\"", cancellationToken).ConfigureAwait(false);
+            _ringBufferArguments = null;
+
+            // A failed -stop can leave the session recording, and -start would then fail with "already
+            // recording" and be reported as a restart problem rather than the stop problem it is.
+            // Cancelling first makes the state the same either way.
+            if (!stop.Success)
+            {
+                await CancelQuietlyAsync(wprPath).ConfigureAwait(false);
+            }
+
+            var restarted = await RestartRingBufferAsync(wprPath, ringBufferArguments).ConfigureAwait(false);
+            var restartNote = restarted
+                ? " Ringbufferten är igång igen och är tom tills den hunnit fyllas på."
+                : " Ringbufferten kunde inte startas om; nästa markering spelar bara in framåt.";
+
+            if (!stop.Success)
+            {
+                // Same reasoning as in CaptureForwardAsync: a -stop that failed has usually written
+                // nothing, and an ETL that was never written must not be reported as a capture.
+                var failure = BuildStopFailure(stop, capturePath);
+                return failure with { Message = failure.Message + restartNote };
+            }
+
+            return new DeepCaptureResult(
+                true,
+                false,
+                $"Deep capture sparad till {capturePath}. Tracen innehåller ringbuffertens historik före markeringen "
+                + $"plus {tail.TotalSeconds:F0} s efter." + restartNote,
+                capturePath);
+        }
+        catch (OperationCanceledException)
+        {
+            await CancelQuietlyAsync(wprPath).ConfigureAwait(false);
+            _ringBufferArguments = null;
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Records forward from the marker. Only reached when no ring buffer is running — deep capture was
+    /// started mid-session, WPR rejected every profile, or the app was not elevated when the session
+    /// began. The resulting trace cannot show what led up to the hitch, and says so.
+    /// </summary>
+    private static async Task<DeepCaptureResult> CaptureForwardAsync(
+        string wprPath,
+        string capturePath,
+        DiagnosticsSettings settings,
+        CancellationToken cancellationToken)
+    {
+        await CancelOwnOrphanedSessionAsync(wprPath, CancellationToken.None).ConfigureAwait(false);
 
         // Cancellation can land in any of the three phases below, and a trace left recording keeps
         // costing the machine performance indefinitely. One handler around the whole sequence guarantees
         // the session is torn down no matter where the token fired.
         try
         {
-            var start = await RunWprAsync(wprPath, BuildStartArguments(settings.DeepCapture), cancellationToken).ConfigureAwait(false);
+            var start = await RunWprAsync(wprPath, BuildFileModeArguments(settings), cancellationToken).ConfigureAwait(false);
             if (!start.Success)
             {
-                return new DeepCaptureResult(false, start.RequiresElevation, start.Message);
+                return new DeepCaptureResult(false, start.RequiresElevation, start.Message + AlreadyRecordingHint);
             }
 
             await Task.Delay(settings.DeepCapture.CaptureDuration, cancellationToken).ConfigureAwait(false);
@@ -79,16 +285,60 @@ public sealed class WprDeepCaptureService : IDeepCaptureService, IDisposable
             var stop = await RunWprAsync(wprPath, $"-stop \"{capturePath}\"", cancellationToken).ConfigureAwait(false);
             if (!stop.Success)
             {
-                return new DeepCaptureResult(true, stop.RequiresElevation, stop.Message, capturePath);
+                // A failed -stop usually means nothing was written, and it can leave the session still
+                // recording. Reporting it as a capture would attach an ETL that may not exist and leave
+                // WPR running for the rest of the session, so the trace is torn down and the path is only
+                // handed back if a file really did land.
+                await CancelQuietlyAsync(wprPath).ConfigureAwait(false);
+                return BuildStopFailure(stop, capturePath);
             }
 
-            return new DeepCaptureResult(true, false, $"Deep capture sparad till {capturePath}.", capturePath);
+            return new DeepCaptureResult(
+                true,
+                false,
+                $"Deep capture sparad till {capturePath}. Ingen ringbuffert körde, så tracen börjar vid markeringen och "
+                + "innehåller inget från före hitchen.",
+                capturePath);
         }
         catch (OperationCanceledException)
         {
             await CancelQuietlyAsync(wprPath).ConfigureAwait(false);
             throw;
         }
+    }
+
+    private async Task<bool> RestartRingBufferAsync(string wprPath, string arguments)
+    {
+        var restart = await RunWprAsync(wprPath, arguments, CancellationToken.None).ConfigureAwait(false);
+        if (!restart.Success)
+        {
+            return false;
+        }
+
+        _ringBufferArguments = arguments;
+        return true;
+    }
+
+    /// <summary>
+    /// Turns a failed <c>-stop</c> into a result the session manager can act on: a capture only counts
+    /// as one when the ETL is on disk.
+    /// </summary>
+    private static DeepCaptureResult BuildStopFailure(CommandResult stop, string capturePath)
+    {
+        if (File.Exists(capturePath))
+        {
+            return new DeepCaptureResult(
+                true,
+                stop.RequiresElevation,
+                $"WPR rapporterade fel när tracen stoppades ({stop.Message}), men {capturePath} skrevs och bifogas. "
+                + "Innehållet kan vara ofullständigt.",
+                capturePath);
+        }
+
+        return new DeepCaptureResult(
+            false,
+            stop.RequiresElevation,
+            $"Deep capture misslyckades: WPR kunde inte stoppa tracen ({stop.Message}). Ingen ETL skrevs.");
     }
 
     private static async Task CancelQuietlyAsync(string wprPath)
@@ -104,13 +354,80 @@ public sealed class WprDeepCaptureService : IDeepCaptureService, IDisposable
     }
 
     /// <summary>
-    /// GeneralProfile is first-level triage only. Explaining a multi-second stall needs GPU work, disk
-    /// and filter-driver activity, and resident-set behaviour on the same timeline.
+    /// Cancels a running WPR session only when it is one of ours that nobody stopped.
     /// </summary>
-    private static string BuildStartArguments(DeepCaptureOptions options)
+    /// <remarks>
+    /// <para>
+    /// WPR records into a single machine-wide session, so <c>-cancel</c> discards whatever is recording
+    /// — including a WPA session, a vendor's support trace or a colleague's capture that has nothing to
+    /// do with this app. Running it unconditionally at startup meant destroying someone else's recording
+    /// to make room for ours, which is not a trade this app gets to make.
+    /// </para>
+    /// <para>
+    /// Ownership is decided on the generated profile's name appearing in <c>-status profiles</c>, which
+    /// is unique to us. Deliberately not on the built-in fallback profiles: <c>GeneralProfile</c> is what
+    /// every other WPR user starts too, so an orphan of ours running the fallback is left alone and
+    /// reported through <see cref="AlreadyRecordingHint"/> instead. Nothing is parsed beyond that one
+    /// name, since the rest of WPR's output is localised.
+    /// </para>
+    /// </remarks>
+    private static async Task CancelOwnOrphanedSessionAsync(string wprPath, CancellationToken cancellationToken)
     {
-        var profiles = options.Profiles.Count > 0 ? options.Profiles : ["GeneralProfile"];
-        return string.Join(' ', profiles.Select(profile => $"-start {profile}")) + " -filemode";
+        var status = await RunWprAsync(wprPath, "-status profiles", cancellationToken).ConfigureAwait(false);
+        if (!status.Message.Contains(WprProfileWriter.ProfileName, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        await CancelQuietlyAsync(wprPath).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Builds the <c>-start</c> line for the background ring buffer: no <c>-filemode</c>, so WPR keeps
+    /// the trace in the memory ring the profile sizes instead of streaming it to disk.
+    /// </summary>
+    private (string Arguments, bool IsGenerated, string ProfileNote) BuildRingBufferArguments(DiagnosticsSettings settings)
+    {
+        _wprPathForShutdown = settings.DeepCapture.WprExecutablePath;
+
+        if (!settings.DeepCapture.UseGeneratedProfile)
+        {
+            return (BuildFallbackArguments(settings.DeepCapture), false, ", inbyggda profiler");
+        }
+
+        var profilePath = WprProfileWriter.TryWrite(settings, out var error);
+        if (profilePath is null)
+        {
+            return (BuildFallbackArguments(settings.DeepCapture), false, $", inbyggda profiler — egen profil kunde inte skrivas: {error}");
+        }
+
+        return ($"-start \"{profilePath}!{WprProfileWriter.ProfileName}\"", true, string.Empty);
+    }
+
+    private static string BuildFileModeArguments(DiagnosticsSettings settings)
+    {
+        if (settings.DeepCapture.UseGeneratedProfile
+            && WprProfileWriter.TryWrite(settings, out _) is { } profilePath)
+        {
+            return $"-start \"{profilePath}!{WprProfileWriter.ProfileName}\" -filemode";
+        }
+
+        return BuildFallbackArguments(settings.DeepCapture) + " -filemode";
+    }
+
+    /// <summary>
+    /// WPR's built-in profiles, used only when the generated one cannot be written or WPR rejects it.
+    /// GeneralProfile brings syscall tracing with it, which is most of the volume in a trace this stack
+    /// produces — accepted here because an oversized trace still beats no trace.
+    /// </summary>
+    private static string BuildFallbackArguments(DeepCaptureOptions options)
+    {
+        return string.Join(' ', ResolveFallbackProfiles(options).Select(profile => $"-start {profile}"));
+    }
+
+    private static IReadOnlyList<string> ResolveFallbackProfiles(DeepCaptureOptions options)
+    {
+        return options.Profiles.Count > 0 ? options.Profiles.ToArray() : ["GeneralProfile"];
     }
 
     private static bool IsElevated()
@@ -218,6 +535,13 @@ public sealed class EtlArtifactParser : IArtifactParser
     /// </summary>
     private const double LongDpcThresholdMs = 1.0;
 
+    /// <summary>
+    /// Fraction of the trace a stream has to span before its coverage is taken as complete. A little
+    /// slack absorbs the ordinary case where a provider's first or last event lands just inside the
+    /// trace boundary; anything below this is a stream that died partway through.
+    /// </summary>
+    private const double CoverageWarningRatio = 0.9;
+
     public bool CanParse(string path)
     {
         return Path.GetExtension(path).Equals(".etl", StringComparison.OrdinalIgnoreCase);
@@ -229,6 +553,8 @@ public sealed class EtlArtifactParser : IArtifactParser
         {
             var dpc = new LatencyAccumulator();
             var isr = new LatencyAccumulator();
+            var contextSwitches = new CoverageTracker();
+            var stacks = new CoverageTracker();
             long eventCount = 0;
             DateTime? firstTimestamp = null;
             DateTime? lastTimestamp = null;
@@ -241,6 +567,14 @@ public sealed class EtlArtifactParser : IArtifactParser
             kernel.PerfInfoDPC += data => dpc.Add(data.ElapsedTimeMSec);
             kernel.PerfInfoThreadedDPC += data => dpc.Add(data.ElapsedTimeMSec);
             kernel.PerfInfoISR += data => isr.Add(data.ElapsedTimeMSec);
+
+            // Context switches and stacks are the two streams the analysis leans on hardest, and both
+            // have been observed stopping partway through a trace while EventsLost stayed at zero. That
+            // is invisible unless someone histograms the events per second by hand, so the parser does
+            // it: an ETL whose cswitches end at 23 of 54 seconds explains far more about a failed
+            // investigation than any DPC figure it also contains.
+            kernel.ThreadCSwitch += data => contextSwitches.Add(data.TimeStamp);
+            kernel.StackWalkStack += data => stacks.Add(data.TimeStamp);
 
             source.AllEvents += traceEvent =>
             {
@@ -256,10 +590,14 @@ public sealed class EtlArtifactParser : IArtifactParser
                 ? (lastTimestamp.Value - firstTimestamp.Value).TotalSeconds
                 : 0;
 
+            var cswitchCoverage = contextSwitches.CoverageSeconds(firstTimestamp);
+            var stackCoverage = stacks.CoverageSeconds(firstTimestamp);
+
             var metrics = new Dictionary<string, double>
             {
                 ["eventCount"] = eventCount,
                 ["durationSeconds"] = durationSeconds,
+                ["eventsLost"] = source.EventsLost,
                 ["dpcCount"] = dpc.Count,
                 ["dpcMaxMs"] = dpc.MaxMs,
                 ["dpcTotalMs"] = dpc.TotalMs,
@@ -268,13 +606,27 @@ public sealed class EtlArtifactParser : IArtifactParser
                 ["isrMaxMs"] = isr.MaxMs,
                 ["isrTotalMs"] = isr.TotalMs,
                 ["isrOverThresholdCount"] = isr.OverThreshold(LongDpcThresholdMs),
+                ["cswitchCount"] = contextSwitches.Count,
+                ["cswitchCoverageSeconds"] = cswitchCoverage,
+                ["cswitchCoverageRatio"] = Ratio(cswitchCoverage, durationSeconds),
+                ["stackCount"] = stacks.Count,
+                ["stackCoverageSeconds"] = stackCoverage,
+                ["stackCoverageRatio"] = Ratio(stackCoverage, durationSeconds),
             };
+
+            var summary = BuildSummary(dpc, isr, durationSeconds, eventCount)
+                + BuildCoverageSummary(contextSwitches, stacks, firstTimestamp, durationSeconds, source.EventsLost);
 
             return new ArtifactParseResult(
                 new ArtifactAttachment(path, ArtifactKind.EtlTrace, Path.GetFileName(path), DateTimeOffset.UtcNow, Sensitive: true),
-                [new ArtifactEvidence(DateTimeOffset.UtcNow, ArtifactKind.EtlTrace, BuildSummary(dpc, isr, durationSeconds, eventCount), metrics, path)],
+                [new ArtifactEvidence(DateTimeOffset.UtcNow, ArtifactKind.EtlTrace, summary, metrics, path)],
                 []);
         }, cancellationToken);
+    }
+
+    private static double Ratio(double covered, double total)
+    {
+        return total > 0 ? Math.Clamp(covered / total, 0, 1) : 0;
     }
 
     private static string BuildSummary(LatencyAccumulator dpc, LatencyAccumulator isr, double durationSeconds, long eventCount)
@@ -293,6 +645,105 @@ public sealed class EtlArtifactParser : IArtifactParser
         return $"ETL-trace: längsta DPC {dpc.MaxMs:F2} ms ({longDpcs} över {LongDpcThresholdMs:F0} ms av {dpc.Count}), "
             + $"längsta ISR {isr.MaxMs:F2} ms ({longIsrs} över {LongDpcThresholdMs:F0} ms av {isr.Count}) "
             + $"över {durationSeconds:F1} sekunder.{verdict}";
+    }
+
+    /// <summary>
+    /// Describes how much of the trace each key stream actually covers, and says so loudly when a
+    /// stream stops early.
+    /// </summary>
+    /// <remarks>
+    /// <c>EventsLost = 0</c> is not evidence that nothing was lost: it counts events the consumer failed
+    /// to drain, not a provider that stopped emitting because another session took the keyword. A trace
+    /// with full duration and half the context switches looks healthy by every summary statistic there
+    /// is, and every conclusion drawn from its second half is worthless.
+    /// </remarks>
+    private static string BuildCoverageSummary(
+        CoverageTracker contextSwitches,
+        CoverageTracker stacks,
+        DateTime? traceStart,
+        double durationSeconds,
+        int eventsLost)
+    {
+        if (durationSeconds <= 0)
+        {
+            return string.Empty;
+        }
+
+        var parts = new List<string>();
+
+        foreach (var (label, tracker) in new[] { ("Context switches", contextSwitches), ("Stackar", stacks) })
+        {
+            if (tracker.Count == 0)
+            {
+                parts.Add($"{label} saknas helt i spåret.");
+                continue;
+            }
+
+            var coverage = tracker.CoverageSeconds(traceStart);
+            if (coverage < durationSeconds * CoverageWarningRatio)
+            {
+                parts.Add($"{label} slutade vid {coverage:F0} av {durationSeconds:F0} sekunder "
+                    + $"({tracker.Count} events, {tracker.SecondsWithEvents} sekunder med data).");
+            }
+        }
+
+        if (parts.Count == 0)
+        {
+            return $" Context switches och stackar täcker hela spåret (EventsLost {eventsLost}).";
+        }
+
+        var lostNote = eventsLost > 0
+            ? $"EventsLost var {eventsLost}."
+            : "EventsLost var 0, så det är inte buffertöverskrivning — mer sannolikt tog en annan ETW-session över keywordet.";
+
+        return $" VARNING, ofullständig täckning: {string.Join(" ", parts)} {lostNote} "
+            + "Slutsatser om den senare delen av fönstret vilar på data som inte finns.";
+    }
+
+    /// <summary>
+    /// Tracks when one event stream was actually producing events, rather than only how many it
+    /// produced. The count alone cannot distinguish a stream that ran the whole trace from one that
+    /// delivered the same number of events in the first third and then went silent.
+    /// </summary>
+    private sealed class CoverageTracker
+    {
+        /// <summary>
+        /// Distinct whole seconds that carried at least one event. Held as a set rather than a count so
+        /// a stream that is merely sparse — a mostly idle machine — is distinguishable from one that
+        /// stopped, which needs the last timestamp instead.
+        /// </summary>
+        private readonly HashSet<long> _secondsWithEvents = [];
+
+        public long Count { get; private set; }
+
+        public DateTime? FirstTimestamp { get; private set; }
+
+        public DateTime? LastTimestamp { get; private set; }
+
+        public int SecondsWithEvents => _secondsWithEvents.Count;
+
+        public void Add(DateTime timestamp)
+        {
+            Count++;
+            FirstTimestamp ??= timestamp;
+            LastTimestamp = timestamp;
+            _secondsWithEvents.Add(timestamp.Ticks / TimeSpan.TicksPerSecond);
+        }
+
+        /// <summary>
+        /// Seconds from the start of the trace to this stream's last event. Measured from the trace
+        /// start rather than the stream's own first event, so a stream that starts late is not credited
+        /// with the time before it appeared.
+        /// </summary>
+        public double CoverageSeconds(DateTime? traceStart)
+        {
+            if (LastTimestamp is not { } last || traceStart is not { } start)
+            {
+                return 0;
+            }
+
+            return Math.Max(0, (last - start).TotalSeconds);
+        }
     }
 
     private sealed class LatencyAccumulator

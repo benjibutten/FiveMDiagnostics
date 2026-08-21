@@ -145,43 +145,112 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         // are in the file too. They are the ones that explain an empty history afterwards.
         OpenJournal();
 
-        _ringBuffer = new TimeWindowRingBuffer<TelemetryEvent>(_settings.RingBufferRetention, item => item.Timestamp);
-        _incidentMaterializer = new IncidentMaterializer(_ringBuffer, _settings.PreIncidentWindow, _settings.PostIncidentWindow);
-
-        // Settings can reach this point from anywhere, and degenerate thresholds make the detector fire
-        // on nearly every frame, so the invariant is re-established rather than assumed.
-        if (_settings.AutoDetect.Normalize())
+        // Everything below builds session state that only StopSessionAsync tears down, and
+        // StopSessionAsync returns immediately while _isSessionActive is false. A start that throws —
+        // the token firing during the WPR ring buffer start is the realistic case, since that step waits
+        // on an external process — would therefore leave the journal open, the channels alive and
+        // possibly a WPR session recording, with nothing left that would ever clean them up. So the
+        // start undoes its own work before it lets the exception out.
+        try
         {
-            Report(StatusLevel.Warning, nameof(DiagnosticsSessionManager), "Ogiltiga auto-detect-värden justerades till tillåtna gränser.");
+            _ringBuffer = new TimeWindowRingBuffer<TelemetryEvent>(_settings.RingBufferRetention, item => item.Timestamp);
+            _incidentMaterializer = new IncidentMaterializer(_ringBuffer, _settings.PreIncidentWindow, _settings.PostIncidentWindow);
+
+            // Settings can reach this point from anywhere, and degenerate thresholds make the detector fire
+            // on nearly every frame, so the invariant is re-established rather than assumed.
+            if (_settings.AutoDetect.Normalize())
+            {
+                Report(StatusLevel.Warning, nameof(DiagnosticsSessionManager), "Ogiltiga auto-detect-värden justerades till tillåtna gränser.");
+            }
+
+            // Same reasoning for the ring buffer: its size is non-paged memory the machine gives up for the
+            // whole session, and a hand-edited value is not allowed to ask for an arbitrary amount of it.
+            _settings.DeepCapture.Normalize();
+
+            _autoDetector = new AutoIncidentDetector(_settings.AutoDetect, Environment?.DisplayRefreshRateHz);
+            _channel = Channel.CreateBounded<TelemetryEvent>(new BoundedChannelOptions(32768)
+            {
+                SingleReader = true,
+                SingleWriter = false,
+                FullMode = BoundedChannelFullMode.Wait,
+            });
+
+            _analysisChannel = Channel.CreateBounded<IncidentRecord>(new BoundedChannelOptions(AnalysisQueueCapacity)
+            {
+                SingleReader = true,
+                SingleWriter = false,
+                FullMode = BoundedChannelFullMode.Wait,
+            });
+
+            _sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var context = new CollectorContext(_channel.Writer, _settings, this, _processResolver, () => DateTimeOffset.UtcNow);
+
+            // Deliberately not tied to the session token: the queue has to drain on stop, or the last
+            // incidents of a session would be discarded exactly when the user goes looking for them.
+            // Started before the collectors so the buffer is already accumulating by the time the first
+            // frames arrive. The whole point is that a marker has history behind it, and history the session
+            // spent starting up is history a marker cannot use.
+            await StartDeepCaptureRingBufferAsync(_sessionCts.Token).ConfigureAwait(false);
+
+            _analysisTask = Task.Run(() => AnalysisLoopAsync(_analysisChannel.Reader));
+            _pumpTask = Task.Run(() => PumpAsync(_channel.Reader, _sessionCts.Token));
+            _finalizeTask = Task.Run(() => FinalizeLoopAsync(_sessionCts.Token));
+            _collectorTasks = _collectors.Select(collector => Task.Run(() => RunCollectorSafeAsync(collector, context, _sessionCts.Token))).ToArray();
+            _isSessionActive = true;
+        }
+        catch (Exception ex)
+        {
+            await AbortStartAsync(ex).ConfigureAwait(false);
+            throw;
         }
 
-        _autoDetector = new AutoIncidentDetector(_settings.AutoDetect, Environment?.DisplayRefreshRateHz);
-        _channel = Channel.CreateBounded<TelemetryEvent>(new BoundedChannelOptions(32768)
-        {
-            SingleReader = true,
-            SingleWriter = false,
-            FullMode = BoundedChannelFullMode.Wait,
-        });
-
-        _analysisChannel = Channel.CreateBounded<IncidentRecord>(new BoundedChannelOptions(AnalysisQueueCapacity)
-        {
-            SingleReader = true,
-            SingleWriter = false,
-            FullMode = BoundedChannelFullMode.Wait,
-        });
-
-        _sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var context = new CollectorContext(_channel.Writer, _settings, this, _processResolver, () => DateTimeOffset.UtcNow);
-
-        // Deliberately not tied to the session token: the queue has to drain on stop, or the last
-        // incidents of a session would be discarded exactly when the user goes looking for them.
-        _analysisTask = Task.Run(() => AnalysisLoopAsync(_analysisChannel.Reader));
-        _pumpTask = Task.Run(() => PumpAsync(_channel.Reader, _sessionCts.Token));
-        _finalizeTask = Task.Run(() => FinalizeLoopAsync(_sessionCts.Token));
-        _collectorTasks = _collectors.Select(collector => Task.Run(() => RunCollectorSafeAsync(collector, context, _sessionCts.Token))).ToArray();
-        _isSessionActive = true;
-
         Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), $"Session started for profile '{_settings.ServerProfile.Name}'.");
+        OnStateChanged();
+    }
+
+    /// <summary>
+    /// Rolls a half-built session back after <see cref="StartSessionAsync"/> failed, so the next start
+    /// begins from the state a clean stop would have left behind.
+    /// </summary>
+    private async Task AbortStartAsync(Exception failure)
+    {
+        Report(
+            StatusLevel.Warning,
+            nameof(DiagnosticsSessionManager),
+            $"Sessionen kunde inte startas: {failure.Message}. Det som hann startas städas bort.");
+
+        _sessionCts?.Cancel();
+        _channel?.Writer.TryComplete();
+        _analysisChannel?.Writer.TryComplete();
+
+        // The loops may never have been created; the ones that were observe the token just cancelled.
+        Task?[] pending = [.. _collectorTasks, _pumpTask, _finalizeTask, _analysisTask];
+        try
+        {
+            await Task.WhenAll(pending.Where(task => task is not null)!).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // Each loop reports its own failures, and this path is already unwinding.
+        }
+
+        // Before the journal closes, so a WPR teardown problem is still written down.
+        await StopDeepCaptureRingBufferAsync().ConfigureAwait(false);
+
+        _sessionCts?.Dispose();
+        _sessionCts = null;
+        _channel = null;
+        _analysisChannel = null;
+        _analysisTask = null;
+        _pumpTask = null;
+        _finalizeTask = null;
+        _autoDetector = null;
+        _ringBuffer = null;
+        _incidentMaterializer = null;
+        _collectorTasks = [];
+        _isSessionActive = false;
+
+        CloseJournal();
         OnStateChanged();
     }
 
@@ -243,6 +312,10 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
         await WaitForDeepCapturesAsync().ConfigureAwait(false);
 
+        // After the in-flight captures, not before: stopping the ring buffer takes the WPR gate, and a
+        // capture still writing its ETL needs to finish holding it first.
+        await StopDeepCaptureRingBufferAsync().ConfigureAwait(false);
+
         cancellationTokenSource?.Dispose();
         _sessionCts = null;
         _channel = null;
@@ -284,6 +357,51 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         catch (Exception)
         {
             // CaptureDeepTraceAsync reports its own failures; there is nothing to add here.
+        }
+    }
+
+    /// <summary>
+    /// Brings up the background WPR ring buffer, reporting whatever came of it.
+    /// </summary>
+    /// <remarks>
+    /// Never throws into session startup. Deep capture is an optional extra — a missing wpr.exe, an
+    /// unelevated app or a profile WPR rejects must all leave the rest of the telemetry running, since
+    /// frame data without a trace is far better than neither.
+    /// </remarks>
+    private async Task StartDeepCaptureRingBufferAsync(CancellationToken cancellationToken)
+    {
+        if (!_settings.DeepCapture.Enabled)
+        {
+            return;
+        }
+
+        try
+        {
+            var result = await _deepCaptureService.StartRingBufferAsync(_settings, cancellationToken).ConfigureAwait(false);
+            Report(
+                result.Started ? StatusLevel.Info : result.RequiresElevation ? StatusLevel.Warning : StatusLevel.Error,
+                nameof(IDeepCaptureService),
+                result.Message);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Report(StatusLevel.Error, nameof(IDeepCaptureService), $"Ringbufferten kunde inte startas: {ex.Message}");
+        }
+    }
+
+    private async Task StopDeepCaptureRingBufferAsync()
+    {
+        try
+        {
+            await _deepCaptureService.StopRingBufferAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Report(StatusLevel.Warning, nameof(IDeepCaptureService), $"Ringbufferten kunde inte stoppas rent: {ex.Message}");
         }
     }
 
@@ -731,7 +849,10 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             var result = await _deepCaptureService.CaptureAsync(marker, _settings, cancellationToken).ConfigureAwait(false);
             Report(result.RequiresElevation ? StatusLevel.Warning : StatusLevel.Info, nameof(DiagnosticsSessionManager), result.Message);
 
-            if (!string.IsNullOrWhiteSpace(result.CapturePath))
+            // File.Exists as well as a non-empty path: a capture that failed late can name the ETL it
+            // was going to write, and an attachment pointing at nothing follows the incident all the way
+            // into the export bundle.
+            if (!string.IsNullOrWhiteSpace(result.CapturePath) && File.Exists(result.CapturePath))
             {
                 lock (_sync)
                 {

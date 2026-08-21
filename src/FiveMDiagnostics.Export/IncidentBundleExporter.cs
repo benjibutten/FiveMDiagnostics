@@ -253,6 +253,8 @@ public sealed class IncidentBundleExporter : IIncidentExporter
                 ("displayLatencyMs", frame.DisplayLatencyMs?.ToString("F2") ?? string.Empty),
                 ("flipDelayMs", frame.FlipDelayMs?.ToString("F2") ?? string.Empty),
                 ("inputLatencyMs", frame.InputLatencyMs?.ToString("F2") ?? string.Empty),
+                ("msBetweenDisplayChange", frame.MsBetweenDisplayChange?.ToString("F2") ?? string.Empty),
+                ("presentMode", frame.PresentMode ?? string.Empty),
                 ("dropped", frame.Dropped.ToString()),
             ],
             GpuTelemetrySample gpu =>

@@ -84,10 +84,14 @@ public sealed class SettingsStore
 
         // A hand-edited settings file is the only way these values become degenerate, and the failure is
         // loud: a zero cooldown or a zero spike multiplier turns nearly every frame into an incident.
+        // Normalize also migrates the pre-window MaxIncidentsPerSession ceiling, which is why it runs
+        // before the file is compared for changes rather than only before the detector uses it.
         if (settings.AutoDetect.Normalize())
         {
             changed = true;
         }
+
+        settings.DeepCapture.Normalize();
 
         if (settings.MaxRetainedIncidents is < 1 or > 1000)
         {
@@ -103,6 +107,7 @@ public sealed class SettingsStore
         // Saving is also the path an edit from the UI takes, so validation belongs here too rather than
         // only on the way in.
         settings.AutoDetect.Normalize();
+        settings.DeepCapture.Normalize();
         settings.MaxRetainedIncidents = Math.Clamp(settings.MaxRetainedIncidents, 1, 1000);
 
         Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);

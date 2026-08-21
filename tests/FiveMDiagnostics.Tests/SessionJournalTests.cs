@@ -318,6 +318,34 @@ public sealed class SessionJournalTests : IDisposable
         Assert.Equal("session-end", lines[^1].GetProperty("type").GetString());
     }
 
+    /// <summary>
+    /// A start that fails while the WPR ring buffer is coming up — the token firing there is the
+    /// realistic case, since the step waits on wpr.exe — used to leave the session half built. The flag
+    /// that makes a session stoppable is set last, so StopSessionAsync returned immediately and the
+    /// journal, the channels and any running trace were left with nothing that would clean them up.
+    /// </summary>
+    [Fact]
+    public async Task StartFailingDuringRingBufferStart_UndoesTheHalfStartedSession()
+    {
+        var settings = CreateSettings();
+        settings.DeepCapture.Enabled = true;
+
+        var deepCapture = new FailingRingBufferService();
+        await using var manager = CreateManager(settings, deepCapture);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => manager.StartSessionAsync());
+
+        Assert.False(manager.IsSessionActive);
+        Assert.True(deepCapture.RingBufferStopped);
+        Assert.Equal("session-end", ReadJournalLines()[^1].GetProperty("type").GetString());
+
+        // The state the failed start built has to be gone rather than merely unused, so the next start
+        // has to come up on the same manager.
+        await manager.StartSessionAsync();
+        Assert.True(manager.IsSessionActive);
+        await manager.StopSessionAsync();
+    }
+
     /// <summary>Fills a journal file with one padded line of exactly <paramref name="totalBytes"/> bytes.</summary>
     private void WriteFiller(string path, long totalBytes)
     {
@@ -388,6 +416,11 @@ public sealed class SessionJournalTests : IDisposable
 
     private sealed class StubDeepCaptureService : IDeepCaptureService
     {
+        public Task<DeepCaptureResult> StartRingBufferAsync(DiagnosticsSettings settings, CancellationToken cancellationToken)
+            => Task.FromResult(new DeepCaptureResult(false, false, "stub"));
+
+        public Task StopRingBufferAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
         public Task<DeepCaptureResult> CaptureAsync(IncidentMarker marker, DiagnosticsSettings settings, CancellationToken cancellationToken)
             => Task.FromResult(new DeepCaptureResult(false, false, "stub"));
     }
@@ -402,6 +435,11 @@ public sealed class SessionJournalTests : IDisposable
 
         public void Release() => _release.TrySetResult();
 
+        public Task<DeepCaptureResult> StartRingBufferAsync(DiagnosticsSettings settings, CancellationToken cancellationToken)
+            => Task.FromResult(new DeepCaptureResult(true, false, "ringbuffert igång"));
+
+        public Task StopRingBufferAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
         public async Task<DeepCaptureResult> CaptureAsync(IncidentMarker marker, DiagnosticsSettings settings, CancellationToken cancellationToken)
         {
             _started.TrySetResult();
@@ -411,6 +449,30 @@ public sealed class SessionJournalTests : IDisposable
             await _release.Task.ConfigureAwait(false);
             return new DeepCaptureResult(true, false, message);
         }
+    }
+
+    /// <summary>Fails the first ring buffer start the way a cancelled one does, then behaves.</summary>
+    private sealed class FailingRingBufferService : IDeepCaptureService
+    {
+        private int _starts;
+
+        public bool RingBufferStopped { get; private set; }
+
+        public Task<DeepCaptureResult> StartRingBufferAsync(DiagnosticsSettings settings, CancellationToken cancellationToken)
+        {
+            return Interlocked.Increment(ref _starts) == 1
+                ? throw new OperationCanceledException(cancellationToken)
+                : Task.FromResult(new DeepCaptureResult(true, false, "ringbuffert igång"));
+        }
+
+        public Task StopRingBufferAsync(CancellationToken cancellationToken)
+        {
+            RingBufferStopped = true;
+            return Task.CompletedTask;
+        }
+
+        public Task<DeepCaptureResult> CaptureAsync(IncidentMarker marker, DiagnosticsSettings settings, CancellationToken cancellationToken)
+            => Task.FromResult(new DeepCaptureResult(false, false, "stub"));
     }
 
     private sealed class StubProcessResolver : ITargetProcessResolver

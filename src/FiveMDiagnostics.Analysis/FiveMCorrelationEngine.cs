@@ -16,6 +16,25 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
     private const double VramPressurePercent = 90;
     private const double VramCriticalPercent = 95;
 
+    /// <summary>Ceiling for a storage verdict backed by the disk counters that were supposed to measure it.</summary>
+    private const double MeasuredConfidenceCeiling = 0.88;
+
+    /// <summary>
+    /// Ceiling for a verdict resting on a fallback rather than on the measurement it substitutes for.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately below the 0.35 bar that promotes a hypothesis past "insufficient evidence": a
+    /// conclusion drawn without the instrument that could refute it should be a lead worth checking, not
+    /// a top-ranked answer that ends the investigation.
+    /// </remarks>
+    private const double FallbackConfidenceCeiling = 0.34;
+
+    /// <summary>
+    /// Share of frames in one present mode before it counts as how the machine presents, rather than as
+    /// a mode a few frames happened to use during a transition.
+    /// </summary>
+    private const double DominantPresentModeShare = 0.9;
+
     public IncidentAnalysis Analyze(IncidentRecord incident)
     {
         var frameSamples = incident.GetEvents<FrameTelemetrySample>();
@@ -148,7 +167,72 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             frameSamples.Select(item => item.GpuBusyMs ?? 0).DefaultIfEmpty().Max(),
             frameSamples.Select(item => item.GpuWaitMs ?? 0).DefaultIfEmpty().Max(),
             frameSamples.Select(item => item.FlipDelayMs ?? 0).DefaultIfEmpty().Max(),
-            frameSamples.Count(item => item.Dropped));
+            frameSamples.Count(item => item.Dropped),
+            BuildPresentModeMetrics(frameSamples),
+            BuildDisplayChangeMetrics(frameSamples, baseline));
+    }
+
+    /// <summary>
+    /// Summarises how the frames in this window reached the screen.
+    /// </summary>
+    /// <remarks>
+    /// The mode is a property of the machine's configuration far more than of the moment, so what
+    /// matters is the mode nearly every frame used, not a distribution. A window that is entirely
+    /// <c>Composed: Copy with GPU GDI</c> says the frames never got an independent flip at all — which
+    /// costs latency on every single frame and is invisible in frame time, since a compositor that adds
+    /// a consistent hop still produces a perfectly even cadence.
+    /// </remarks>
+    private static PresentModeMetrics BuildPresentModeMetrics(IReadOnlyList<FrameTelemetrySample> frameSamples)
+    {
+        var classified = frameSamples.Where(item => item.PresentMode is not null).ToArray();
+        if (classified.Length == 0)
+        {
+            return PresentModeMetrics.Empty;
+        }
+
+        var dominant = classified
+            .GroupBy(item => item.PresentMode!, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(group => group.Count())
+            .First();
+
+        return new PresentModeMetrics(
+            HasData: true,
+            dominant.Key,
+            (double)dominant.Count() / classified.Length,
+            (double)classified.Count(item => item.IsComposedPresent) / classified.Length,
+            classified.Length);
+    }
+
+    /// <summary>
+    /// Compares the cadence of presents against the cadence of the screen actually changing.
+    /// </summary>
+    /// <remarks>
+    /// A window where presents are even and display changes are not is the signature of frames being
+    /// produced on time and then held after the present call. Reporting only frame time hides that case
+    /// completely: the game looks like it is running perfectly and the player sees stutter.
+    /// </remarks>
+    private static DisplayChangeMetrics BuildDisplayChangeMetrics(IReadOnlyList<FrameTelemetrySample> frameSamples, double baseline)
+    {
+        var values = frameSamples
+            .Select(item => item.MsBetweenDisplayChange)
+            .Where(item => item is > 0)
+            .Select(item => item!.Value)
+            .OrderBy(value => value)
+            .ToArray();
+
+        if (values.Length == 0)
+        {
+            return DisplayChangeMetrics.Empty;
+        }
+
+        var threshold = Math.Max(baseline * SpikeMultiplier, 10);
+        return new DisplayChangeMetrics(
+            HasData: true,
+            values.Length,
+            Percentile(values, 0.50),
+            Percentile(values, 0.99),
+            values[^1],
+            values.Count(value => value >= threshold));
     }
 
     /// <summary>
@@ -565,10 +649,16 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         var maxLatency = systemSamples.Select(item => item.DiskAverageLatencyMs ?? 0).DefaultIfEmpty().Max();
         var maxQueue = systemSamples.Select(item => item.DiskQueueLength ?? 0).DefaultIfEmpty().Max();
         var maxHardFaultPages = systemSamples.Select(item => item.HardFaultPagesPerSecond ?? 0).DefaultIfEmpty().Max();
-        var hasDiskCounterData = systemSamples.Any(item =>
-            item.DiskAverageLatencyMs is not null
-            || item.DiskQueueLength is not null
-            || item.HardFaultPagesPerSecond is not null);
+
+        // Availability is per counter, and only latency and queue length count towards it. Those two are
+        // what separate a disk that is working hard from a disk that is slow; hard faults measure paging
+        // and say nothing about whether the disk kept up. Treating "any one of the three was present" as
+        // measured disk data meant a lone hard fault counter — or a queue counter that only ever read
+        // zero — lifted the ceiling on evidence that was still just throughput.
+        var hasLatencyData = systemSamples.Any(item => item.DiskAverageLatencyMs is not null);
+        var hasQueueData = systemSamples.Any(item => item.DiskQueueLength is not null);
+        var hasHardFaultData = systemSamples.Any(item => item.HardFaultPagesPerSecond is not null);
+        var hasDiskCounterData = hasLatencyData || hasQueueData;
         var streamingHints = artifacts.Where(item => item.Summary.Contains("stream", StringComparison.OrdinalIgnoreCase)).ToArray();
 
         if (maxRead >= 50 * 1024 * 1024)
@@ -617,7 +707,32 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             && (maxRead >= 50 * 1024 * 1024 || maxCompetingIo >= 20 * 1024 * 1024);
         if (hasStrongIoFallback)
         {
-            evidence.Add("Diskens latency-/köcounters saknades; bedömningen bygger därför på uppmätt process-I/O och framedata.");
+            var missingCounters = new List<string>(3);
+            if (!hasLatencyData)
+            {
+                missingCounters.Add("disklatens");
+            }
+
+            if (!hasQueueData)
+            {
+                missingCounters.Add("diskkö");
+            }
+
+            if (!hasHardFaultData)
+            {
+                missingCounters.Add("hard fault");
+            }
+
+            // Named rather than blanket: the warning used to claim all three were missing, which stopped
+            // being true once each counter was tracked separately.
+            var missingNames = missingCounters.Count == 1
+                ? missingCounters[0]
+                : string.Join(", ", missingCounters.SkipLast(1)) + " och " + missingCounters[^1];
+
+            evidence.Add(
+                $"VARNING: {missingNames}-counters saknades i fönstret. Bedömningen bygger bara på "
+                + "genomströmning, och genomströmning kan inte skilja en disk som jobbar mycket från en disk som är långsam. "
+                + $"Konfidensen är därför takad till {FallbackConfidenceCeiling:P0}.");
         }
 
         var hasStorageStallSignal = maxLatency >= 20
@@ -627,7 +742,12 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             || hasStrongIoFallback;
         if (confidence > 0 && hasStorageStallSignal)
         {
-            hypotheses.Add(new HypothesisScore(RootCauseCategory.StreamingOrDiskStall, Math.Min(confidence, 0.88), evidence));
+            // Without counters the evidence is throughput plus the fact that frames were slow, and that
+            // combination reached 88% for an incident whose ETL contained five disk operations and three
+            // hard faults. The measurements that would have ruled a disk stall out were the missing ones,
+            // so the ceiling has to reflect their absence rather than the tally of what remained.
+            var ceiling = hasDiskCounterData ? MeasuredConfidenceCeiling : FallbackConfidenceCeiling;
+            hypotheses.Add(new HypothesisScore(RootCauseCategory.StreamingOrDiskStall, Math.Min(confidence, ceiling), evidence));
         }
     }
 
@@ -747,6 +867,30 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                 $"Spikes fördelade som CPU-bundna {metrics.CpuBoundSpikes}, GPU-bundna {metrics.GpuBoundSpikes}, present/display {metrics.PresentBoundSpikes}."));
         }
 
+        if (metrics.PresentMode.HasData)
+        {
+            var mode = metrics.PresentMode;
+            var note = mode.IsComposed
+                ? " Frames går genom DWM i stället för en egen flip, vilket lägger på en kompositorstuds på varje frame."
+                : string.Empty;
+            highlights.Add(new(
+                incident.Marker.MarkedAt,
+                "Present mode",
+                $"{mode.DominantShare:P0} av {mode.ClassifiedFrames} frames presenterades som \"{mode.DominantMode}\".{note}"));
+        }
+
+        // Only worth a line when the two cadences disagree: presents on time with display changes
+        // stuttering is a different fault from frames simply taking too long to produce.
+        if (metrics.DisplayChange.HasData && metrics.DisplayChange.SpikeCount > metrics.SpikeCount)
+        {
+            highlights.Add(new(
+                incident.Marker.MarkedAt,
+                "Display change",
+                $"{metrics.DisplayChange.SpikeCount} hopp i MsBetweenDisplayChange mot {metrics.SpikeCount} i frametime "
+                + $"(median {metrics.DisplayChange.MedianMs:F1} ms, P99 {metrics.DisplayChange.P99Ms:F1} ms, max {metrics.DisplayChange.MaxMs:F1} ms). "
+                + "Frames presenterades jämnare än de nådde skärmen."));
+        }
+
         if (gpu.HasData)
         {
             highlights.Add(new(
@@ -796,6 +940,20 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         IReadOnlyList<NetworkProbeSample> probes,
         IReadOnlyList<SuspectedProcessImpact> suspectedProcesses)
     {
+        // Both are observations rather than conclusions, so they belong in the summary whether or not
+        // the engine managed to classify anything. An unclassified window is precisely where "every
+        // frame was composed" or "every probe failed" is the most useful thing anyone can be told.
+        var presentModeHint = metrics.PresentMode switch
+        {
+            { IsComposed: true } composed =>
+                $" Present mode var \"{composed.DominantMode}\" för {composed.DominantShare:P0} av frames — inga oberoende flips, "
+                + "allt gick via kompositorn.",
+            { IsUniform: true } uniform => $" Present mode var \"{uniform.DominantMode}\" genom hela fönstret.",
+            { HasData: true } mixed => $" Present mode växlade; vanligast var \"{mixed.DominantMode}\" ({mixed.DominantShare:P0}).",
+            _ => string.Empty,
+        };
+        var probeHint = BuildProbeHint(probes);
+
         if (top.Category == RootCauseCategory.InsufficientEvidence)
         {
             var missing = new List<string>();
@@ -818,7 +976,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                 ? $" Starkast förbättring just nu: {string.Join(", ", missing)}."
                 : string.Empty;
 
-            return $"Insufficient evidence. Kör gärna en ny session i grundläge igen.{hint}";
+            return $"Insufficient evidence. Kör gärna en ny session i grundläge igen.{hint}{presentModeHint}{probeHint}";
         }
 
         var obsActive = obsSamples.Any(item => item.IsStreaming)
@@ -835,12 +993,47 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             ? $" VRAM toppade på {gpu.PeakVramPercent:F0}% ({gpu.PeakVramUsedGb:F1}/{gpu.TotalVramGb:F1} GB)."
             : string.Empty;
         var artifactHint = artifacts.Count > 0 ? $" {artifacts.Count} importerade artifacts bidrog till bedömningen." : string.Empty;
-        var probeHint = probes.Any() ? " Nätprober fanns tillgängliga i incidentfönstret." : string.Empty;
         var suspectHint = suspectedProcesses.FirstOrDefault() is { } suspect
             ? $" Mest avvikande bakgrundsprocess: {suspect.ProcessName} ({suspect.Reason.ToLowerInvariant()})."
             : string.Empty;
 
-        return $"Trolig rotorsak: {ToLabel(top.Category)} ({top.Confidence:P0}). Frametime-fönstret hade baseline {metrics.BaselineFrameTime:F1} ms, P95 {metrics.P95FrameTime:F1} ms och P99 {metrics.P99FrameTime:F1} ms.{attribution}{vramHint} {obsActive}{artifactHint}{probeHint}{suspectHint}";
+        return $"Trolig rotorsak: {ToLabel(top.Category)} ({top.Confidence:P0}). Frametime-fönstret hade baseline {metrics.BaselineFrameTime:F1} ms, P95 {metrics.P95FrameTime:F1} ms och P99 {metrics.P99FrameTime:F1} ms.{attribution}{presentModeHint}{vramHint} {obsActive}{artifactHint}{probeHint}{suspectHint}";
+    }
+
+    /// <summary>
+    /// Says what the network probes actually did, rather than that they existed.
+    /// </summary>
+    /// <remarks>
+    /// "Nätprober fanns tillgängliga" was true of a window in which every single probe failed, which is
+    /// close to the opposite of what a reader takes from it — probes that all fail are either a blocked
+    /// ICMP path or a network that was down, and both are findings rather than background.
+    /// </remarks>
+    private static string BuildProbeHint(IReadOnlyList<NetworkProbeSample> probes)
+    {
+        if (probes.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var failed = probes.Count(item => !item.Success);
+        if (failed == 0)
+        {
+            var worstRtt = probes.Select(item => item.RoundTripTimeMs ?? 0).DefaultIfEmpty().Max();
+            return $" Alla {probes.Count} nätprober svarade, högsta RTT {worstRtt:F0} ms.";
+        }
+
+        if (failed == probes.Count)
+        {
+            var reason = probes
+                .Select(item => item.FailureReason)
+                .FirstOrDefault(item => !string.IsNullOrWhiteSpace(item)) ?? "okänt fel";
+
+            return $" Samtliga {probes.Count} nätprober misslyckades ({reason}), så det finns ingen RTT-mätning "
+                + "för fönstret — varken som stöd för eller emot en nätverksorsak.";
+        }
+
+        var succeededRtt = probes.Where(item => item.Success).Select(item => item.RoundTripTimeMs ?? 0).DefaultIfEmpty().Max();
+        return $" {failed} av {probes.Count} nätprober misslyckades; de som svarade toppade på {succeededRtt:F0} ms.";
     }
 
     private static IReadOnlyList<SuspectedProcessImpact> AnalyzeSuspiciousProcesses(IReadOnlyList<SystemTelemetrySample> systemSamples)
@@ -1001,9 +1194,39 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         double MaxGpuBusyMs,
         double MaxGpuWaitMs,
         double MaxFlipDelayMs,
-        int DroppedCount)
+        int DroppedCount,
+        PresentModeMetrics PresentMode,
+        DisplayChangeMetrics DisplayChange)
     {
-        public static FrameMetrics Empty { get; } = new(0, 0, 16.67, 25, 40, 0, 0, 0, 0, 0, 0, false, 0, 0, 0, 0, 0, 0, 0, 0);
+        public static FrameMetrics Empty { get; } =
+            new(0, 0, 16.67, 25, 40, 0, 0, 0, 0, 0, 0, false, 0, 0, 0, 0, 0, 0, 0, 0, PresentModeMetrics.Empty, DisplayChangeMetrics.Empty);
+    }
+
+    private sealed record PresentModeMetrics(
+        bool HasData,
+        string? DominantMode,
+        double DominantShare,
+        double ComposedShare,
+        int ClassifiedFrames)
+    {
+        public static PresentModeMetrics Empty { get; } = new(false, null, 0, 0, 0);
+
+        /// <summary>True when effectively every frame took the same path to the screen.</summary>
+        public bool IsUniform => HasData && DominantShare >= DominantPresentModeShare;
+
+        /// <summary>True when that path went through the compositor rather than an independent flip.</summary>
+        public bool IsComposed => ComposedShare >= DominantPresentModeShare;
+    }
+
+    private sealed record DisplayChangeMetrics(
+        bool HasData,
+        int SampleCount,
+        double MedianMs,
+        double P99Ms,
+        double MaxMs,
+        int SpikeCount)
+    {
+        public static DisplayChangeMetrics Empty { get; } = new(false, 0, 0, 0, 0, 0);
     }
 
     private sealed record GpuMetrics(

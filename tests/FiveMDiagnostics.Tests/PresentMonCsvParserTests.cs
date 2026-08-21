@@ -133,6 +133,63 @@ public sealed class PresentMonCsvParserTests
         Assert.Null(sample.DisplayLatencyMs);
     }
 
+    /// <summary>
+    /// The present mode sat in every one of these rows all along and was simply never read. It is the
+    /// only column that says how a frame reached the screen, and no frame time analysis substitutes for
+    /// it.
+    /// </summary>
+    [Theory]
+    [InlineData(nameof(DefaultHeader))]
+    [InlineData(nameof(V2MetricsHeader))]
+    [InlineData(nameof(V1MetricsHeader))]
+    public void ParseRow_ReadsPresentModeFromEveryScheme(string schemeName)
+    {
+        var (header, row) = schemeName switch
+        {
+            nameof(DefaultHeader) => (DefaultHeader, DefaultRow),
+            nameof(V2MetricsHeader) => (V2MetricsHeader, V2MetricsRow),
+            _ => (V1MetricsHeader, "app.exe,1,0x0,DXGI,1,0,0,4.2701141,0.3,18.4,0,Composed: Copy with GPU GDI,7.0,13.6,18.5,0.2,1.0,6.3,25.0"),
+        };
+
+        var sample = PresentMonCsvParser.ParseRow(row.Split(','), PresentMonCsvParser.ParseHeader(header), "fallback", DateTimeOffset.UnixEpoch);
+
+        Assert.NotNull(sample);
+        Assert.Equal("Composed: Copy with GPU GDI", sample.PresentMode);
+        Assert.True(sample.IsComposedPresent);
+    }
+
+    /// <summary>
+    /// Display change cadence is the one measurement that separates "frames were slow" from "frames were
+    /// on time and the screen did not update", and the two need entirely different fixes.
+    /// </summary>
+    [Fact]
+    public void ParseRow_ReadsMsBetweenDisplayChangeSeparatelyFromFrameTime()
+    {
+        var sample = PresentMonCsvParser.ParseRow(
+            DefaultRow.Split(','),
+            PresentMonCsvParser.ParseHeader(DefaultHeader),
+            "fallback",
+            DateTimeOffset.UnixEpoch);
+
+        Assert.NotNull(sample);
+        Assert.Equal(18.4, sample.FrameTimeMs, 3);
+        Assert.Equal(18.5, sample.MsBetweenDisplayChange!.Value, 3);
+    }
+
+    /// <summary>PresentMon writes "NA" for a frame it could not classify; that is not a mode called NA.</summary>
+    [Fact]
+    public void ParseRow_TreatsUnknownPresentModeAsMissing()
+    {
+        var cells = DefaultRow.Split(',');
+        cells[7] = "NA";
+
+        var sample = PresentMonCsvParser.ParseRow(cells, PresentMonCsvParser.ParseHeader(DefaultHeader), "fallback", DateTimeOffset.UnixEpoch);
+
+        Assert.NotNull(sample);
+        Assert.Null(sample.PresentMode);
+        Assert.False(sample.IsComposedPresent);
+    }
+
     [Fact]
     public void ParseRow_ReturnsNull_WhenNoFrameTimeColumnExists()
     {
