@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Analysis;
+﻿namespace FiveMDiagnostics.Analysis;
 
 using FiveMDiagnostics.Core;
 
@@ -34,6 +34,19 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
     /// a mode a few frames happened to use during a transition.
     /// </summary>
     private const double DominantPresentModeShare = 0.9;
+
+    /// <summary>
+    /// Share of a window's spikes that has to be CPU-bound before the frame attribution is treated as
+    /// having answered the question, whatever else the window contains.
+    /// </summary>
+    private const double DecisiveAttributionShare = 0.8;
+
+    /// <summary>
+    /// Ceiling for a hypothesis the per-frame attribution contradicts. Below the 0.35 bar that promotes
+    /// a hypothesis past "insufficient evidence", so such a verdict can be listed as a lead but cannot
+    /// be the answer.
+    /// </summary>
+    private const double ContradictedConfidenceCeiling = 0.3;
 
     public IncidentAnalysis Analyze(IncidentRecord incident)
     {
@@ -596,6 +609,14 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         var maxRtt = successfulProbes.Select(item => item.RoundTripTimeMs ?? 0).DefaultIfEmpty().Max();
         var avgRtt = successfulProbes.Select(item => item.RoundTripTimeMs ?? 0).DefaultIfEmpty().Average();
 
+        // A host that answered nothing, ever, is not a host that started dropping packets during this
+        // incident. Game servers routinely refuse ICMP outright, and the probe host is inferred from
+        // the connection rather than configured, so the common case for a total failure is that the
+        // probe was aimed at something that was never going to reply. Treating that as evidence of
+        // packet loss produced a network hypothesis in 26 incidents of a session whose every spike was
+        // CPU bound, so the probes are allowed to say nothing rather than to say the wrong thing.
+        var probesNeverAnswered = probes.Count > 0 && successfulProbes.Length == 0;
+
         if (maxRtt >= 120)
         {
             confidence += 0.3;
@@ -608,10 +629,10 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             evidence.Add($"RTT-jitter på minst {maxRtt - avgRtt:F0} ms observerades.");
         }
 
-        if (failedProbes > 0)
+        if (failedProbes > 0 && !probesNeverAnswered)
         {
             confidence += 0.2;
-            evidence.Add($"{failedProbes} probe-förfrågningar misslyckades under incidenten.");
+            evidence.Add($"{failedProbes} probe-förfrågningar misslyckades under incidenten, medan andra svarade.");
         }
 
         if (endpoints.Any(item => item.RemoteEndpoints.Count > 0))
@@ -621,7 +642,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         }
 
         // A network incident should look like a healthy local machine that is nonetheless hitching.
-        if (metrics.SpikeCount == 0 && systemSamples.Any(item => item.TotalCpuUsagePercent < 75) && obsSamples.All(item => !item.IsConnected))
+        if (confidence > 0 && metrics.SpikeCount == 0 && systemSamples.Any(item => item.TotalCpuUsagePercent < 75) && obsSamples.All(item => !item.IsConnected))
         {
             confidence += 0.2;
             evidence.Add("Lokal maskin såg stabil ut trots försämrat nätbeteende.");
@@ -735,9 +756,11 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                 + $"Konfidensen är därför takad till {FallbackConfidenceCeiling:P0}.");
         }
 
-        var hasStorageStallSignal = maxLatency >= 20
-            || maxQueue >= 2
-            || maxHardFaultPages >= 100
+        // The counters that measure a slow disk, as opposed to a busy one. Only these can outweigh the
+        // per-frame attribution below, because only these observe latency rather than volume.
+        var hasMeasuredStallSignal = maxLatency >= 20 || maxQueue >= 2 || maxHardFaultPages >= 100;
+
+        var hasStorageStallSignal = hasMeasuredStallSignal
             || streamingHints.Length > 0
             || hasStrongIoFallback;
         if (confidence > 0 && hasStorageStallSignal)
@@ -747,6 +770,26 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             // hard faults. The measurements that would have ruled a disk stall out were the missing ones,
             // so the ceiling has to reflect their absence rather than the tally of what remained.
             var ceiling = hasDiskCounterData ? MeasuredConfidenceCeiling : FallbackConfidenceCeiling;
+
+            // Per-frame attribution outranks every circumstantial storage signal there is. A stalled
+            // disk stalls a frame by making the CPU wait, so a window whose spikes are overwhelmingly
+            // CPU-busy has already ruled storage out — the disk cannot be the cause of a frame the CPU
+            // spent computing. Throughput and a busy neighbour still produced 57 top-ranked disk
+            // verdicts in a session where 98% of the spikes were CPU-bound, and this is what stops that
+            // happening rather than another adjustment to the individual thresholds.
+            if (metrics.HasCpuGpuBreakdown && metrics.SpikeCount > 0 && !hasMeasuredStallSignal)
+            {
+                var cpuBoundShare = (double)metrics.CpuBoundSpikes / metrics.SpikeCount;
+                if (cpuBoundShare >= DecisiveAttributionShare)
+                {
+                    ceiling = Math.Min(ceiling, ContradictedConfidenceCeiling);
+                    evidence.Add(
+                        $"NEDVIKTAD: {metrics.CpuBoundSpikes} av {metrics.SpikeCount} spikes ({cpuBoundShare:P0}) var CPU-bundna, "
+                        + "och ingen disklatens, diskkö eller paging översteg tröskeln. Frametiden gick åt till att räkna, "
+                        + $"inte till att vänta på lagring, så konfidensen är takad till {ContradictedConfidenceCeiling:P0}.");
+                }
+            }
+
             hypotheses.Add(new HypothesisScore(RootCauseCategory.StreamingOrDiskStall, Math.Min(confidence, ceiling), evidence));
         }
     }
@@ -1029,7 +1072,9 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                 .FirstOrDefault(item => !string.IsNullOrWhiteSpace(item)) ?? "okänt fel";
 
             return $" Samtliga {probes.Count} nätprober misslyckades ({reason}), så det finns ingen RTT-mätning "
-                + "för fönstret — varken som stöd för eller emot en nätverksorsak.";
+                + "för fönstret — varken som stöd för eller emot en nätverksorsak. Prob-hosten härleds från "
+                + "anslutningen och många spelservrar svarar inte på ICMP alls; sätt ServerProfile.ProbeHost "
+                + "till en adress som svarar, eller stäng av proberna.";
         }
 
         var succeededRtt = probes.Where(item => item.Success).Select(item => item.RoundTripTimeMs ?? 0).DefaultIfEmpty().Max();

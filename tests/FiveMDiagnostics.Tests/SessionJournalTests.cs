@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 
 namespace FiveMDiagnostics.Tests;
 
@@ -346,6 +346,86 @@ public sealed class SessionJournalTests : IDisposable
         await manager.StopSessionAsync();
     }
 
+    /// <summary>
+    /// Frame pacing has to survive the teardown, which is where it was first lost.
+    /// </summary>
+    /// <remarks>
+    /// The flush originally lived inside the journal close, by which point both teardown paths had
+    /// already nulled the monitor — so the closing window was silently dropped and the end-of-session
+    /// total was always empty. Nothing failed and nothing was logged; the journal simply ended one
+    /// window short of the truth. Asserting on the file is the only way that shows up.
+    /// </remarks>
+    [Fact]
+    public async Task Journal_RecordsPacingWindowsAndTheSessionTotal()
+    {
+        var settings = CreateSettings();
+        settings.FramePacing.WindowLength = TimeSpan.FromSeconds(10);
+        settings.FramePacing.MinimumFrames = 60;
+
+        var collector = new FrameReplayCollector(frames: 1200, frameTimeMs: 16.67, cpuWaitMs: 7.7);
+        await using var manager = CreateManager(settings, collectors: [collector]);
+
+        await manager.StartSessionAsync();
+        await collector.Completed;
+        await manager.StopSessionAsync();
+
+        var lines = ReadJournalLines();
+        var pacing = lines.Where(line => line.GetProperty("type").GetString() == "pacing").ToArray();
+
+        // 1200 frames at 16.67 ms is just under 20 seconds, so exactly one window closes while frames
+        // are arriving and the second exists only because the flush at teardown ran. Counting the
+        // frames is the sharper assertion: with the flush dead, half the session is missing from the
+        // journal and every share computed from it is wrong.
+        Assert.Equal(2, pacing.Length);
+        Assert.Equal(1200, pacing.Sum(line => line.GetProperty("payload").GetProperty("frameCount").GetInt32()));
+        Assert.All(pacing, line => Assert.Equal("Healthy", line.GetProperty("payload").GetProperty("state").GetString()));
+
+        var summaries = lines
+            .Where(line => line.GetProperty("type").GetString() == "status")
+            .Select(line => line.GetProperty("payload").GetProperty("message").GetString() ?? string.Empty)
+            .Where(message => message.StartsWith("Frame pacing:", StringComparison.Ordinal))
+            .ToArray();
+
+        Assert.Single(summaries);
+        Assert.Contains("friska", summaries[0]);
+    }
+
+    /// <summary>Writes a fixed run of frames as fast as the channel accepts them, then idles.</summary>
+    private sealed class FrameReplayCollector(int frames, double frameTimeMs, double? cpuWaitMs) : ITelemetryCollector
+    {
+        private readonly TaskCompletionSource _completed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public string Name => "FrameReplay";
+
+        public Task Completed => _completed.Task;
+
+        public async Task RunAsync(CollectorContext context, CancellationToken cancellationToken)
+        {
+            var timestamp = new DateTimeOffset(2026, 8, 21, 21, 42, 0, TimeSpan.Zero);
+
+            for (var index = 0; index < frames; index++)
+            {
+                await context.Writer.WriteAsync(
+                    new FrameTelemetrySample(
+                        timestamp,
+                        frameTimeMs,
+                        GpuBusyMs: 7.5,
+                        DisplayLatencyMs: null,
+                        MsBetweenPresents: frameTimeMs,
+                        Dropped: false,
+                        ProcessName: "FiveM_b3407_GTAProcess.exe",
+                        CpuBusyMs: cpuWaitMs is { } wait ? Math.Max(frameTimeMs - wait, 0) : null,
+                        CpuWaitMs: cpuWaitMs),
+                    cancellationToken).ConfigureAwait(false);
+
+                timestamp = timestamp.AddMilliseconds(frameTimeMs);
+            }
+
+            _completed.TrySetResult();
+            await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
     /// <summary>Fills a journal file with one padded line of exactly <paramref name="totalBytes"/> bytes.</summary>
     private void WriteFiller(string path, long totalBytes)
     {
@@ -374,7 +454,10 @@ public sealed class SessionJournalTests : IDisposable
         return settings;
     }
 
-    private DiagnosticsSessionManager CreateManager(DiagnosticsSettings settings, IDeepCaptureService? deepCaptureService = null)
+    private DiagnosticsSessionManager CreateManager(
+        DiagnosticsSettings settings,
+        IDeepCaptureService? deepCaptureService = null,
+        IEnumerable<ITelemetryCollector>? collectors = null)
     {
         return new DiagnosticsSessionManager(
             settings,
@@ -382,7 +465,7 @@ public sealed class SessionJournalTests : IDisposable
             new FiveMCorrelationEngine(),
             new StubIncidentExporter(),
             deepCaptureService ?? new StubDeepCaptureService(),
-            collectors: [],
+            collectors ?? [],
             artifactParsers: [],
             new StubProcessResolver());
     }

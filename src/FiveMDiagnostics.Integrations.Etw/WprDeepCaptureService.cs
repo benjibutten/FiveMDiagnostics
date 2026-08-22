@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.ComponentModel;
 using System.Security.Principal;
 using Microsoft.Diagnostics.Tracing;
@@ -555,6 +555,8 @@ public sealed class EtlArtifactParser : IArtifactParser
             var isr = new LatencyAccumulator();
             var contextSwitches = new CoverageTracker();
             var stacks = new CoverageTracker();
+            var cpu = new CpuSampleAttribution();
+            var samples = new CoverageTracker();
             long eventCount = 0;
             DateTime? firstTimestamp = null;
             DateTime? lastTimestamp = null;
@@ -573,8 +575,32 @@ public sealed class EtlArtifactParser : IArtifactParser
             // is invisible unless someone histograms the events per second by hand, so the parser does
             // it: an ETL whose cswitches end at 23 of 54 seconds explains far more about a failed
             // investigation than any DPC figure it also contains.
-            kernel.ThreadCSwitch += data => contextSwitches.Add(data.TimeStamp);
+            kernel.ThreadCSwitch += data =>
+            {
+                contextSwitches.Add(data.TimeStamp);
+                cpu.OnContextSwitch(data);
+            };
             kernel.StackWalkStack += data => stacks.Add(data.TimeStamp);
+
+            // Image loads, process names and the thread-to-process map all have to be in place before
+            // the samples that need them, which they are: WPR rundown emits the already-loaded modules
+            // and the existing process and thread tables at the start of the trace.
+            kernel.ImageLoad += cpu.OnImageLoad;
+            kernel.ImageDCStart += cpu.OnImageLoad;
+            kernel.ImageDCStop += cpu.OnImageLoad;
+            kernel.ProcessStart += cpu.OnProcess;
+            kernel.ProcessDCStart += cpu.OnProcess;
+            kernel.ProcessDCStop += cpu.OnProcess;
+            kernel.ThreadStart += cpu.OnThread;
+            kernel.ThreadDCStart += cpu.OnThread;
+            kernel.ThreadDCStop += cpu.OnThread;
+            kernel.PerfInfoCollectionStart += cpu.OnSamplingInterval;
+            kernel.PerfInfoSetInterval += cpu.OnSamplingInterval;
+            kernel.PerfInfoSample += data =>
+            {
+                samples.Add(data.TimeStamp);
+                cpu.OnSample(data);
+            };
 
             source.AllEvents += traceEvent =>
             {
@@ -592,6 +618,12 @@ public sealed class EtlArtifactParser : IArtifactParser
 
             var cswitchCoverage = contextSwitches.CoverageSeconds(firstTimestamp);
             var stackCoverage = stacks.CoverageSeconds(firstTimestamp);
+
+            // Rates come out of the sampled span, which the attribution owns: CoverageSeconds measures
+            // from the start of the *trace* on purpose, which is right for coverage and catastrophically
+            // wrong as a denominator for a ring buffer that holds seconds of samples inside an ETL
+            // spanning hours.
+            var attribution = cpu.Summarize();
 
             var metrics = new Dictionary<string, double>
             {
@@ -612,9 +644,26 @@ public sealed class EtlArtifactParser : IArtifactParser
                 ["stackCount"] = stacks.Count,
                 ["stackCoverageSeconds"] = stackCoverage,
                 ["stackCoverageRatio"] = Ratio(stackCoverage, durationSeconds),
+                ["cpuSampleCount"] = cpu.SampleCount,
+                ["cpuSampleCoverageSeconds"] = samples.CoverageSeconds(firstTimestamp),
+                ["cpuSampledSeconds"] = cpu.SampledSeconds,
             };
 
+            if (attribution is not null)
+            {
+                metrics["cpuTotalCores"] = Math.Round(attribution.TotalCores, 3);
+                metrics["cpuSubjectProcessCores"] = Math.Round(attribution.SubjectProcessCores, 3);
+                metrics["cpuBusiestThreadCores"] = Math.Round(attribution.BusiestThreadCores, 3);
+                metrics["cpuBusiestThreadId"] = attribution.BusiestThreadId;
+
+                foreach (var module in attribution.BusiestThreadModules)
+                {
+                    metrics[$"cpuBusiestThreadCores_{module.Module}"] = Math.Round(module.Cores, 4);
+                }
+            }
+
             var summary = BuildSummary(dpc, isr, durationSeconds, eventCount)
+                + (attribution is not null ? " " + attribution.Describe() : string.Empty)
                 + BuildCoverageSummary(contextSwitches, stacks, firstTimestamp, durationSeconds, source.EventsLost);
 
             return new ArtifactParseResult(

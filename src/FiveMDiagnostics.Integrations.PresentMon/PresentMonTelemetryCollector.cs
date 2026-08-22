@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Globalization;
 
 namespace FiveMDiagnostics.Integrations.PresentMon;
@@ -34,6 +34,20 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
     private int _frameGapCount;
     private DateTimeOffset _lastHealthSampleUtc = DateTimeOffset.MinValue;
     private int? _reportedStaleTargetPid;
+
+    /// <summary>
+    /// ETW session name for every capture this app makes.
+    /// </summary>
+    /// <remarks>
+    /// Stable, not unique per capture. It has to differ from PresentMon's default so another copy of
+    /// PresentMon cannot stop ours and we cannot stop theirs, and it has to stay the same across
+    /// restarts so <c>--stop_existing_session</c> can reclaim the session a killed PresentMon left
+    /// behind — that flag only stops a session of the same name. A name per capture got the first half
+    /// right and broke the second: every restart would strand another kernel session, and a long
+    /// session with a flaky capture would work its way through the machine's ETW session limit. A
+    /// single global mutex already keeps two copies of the app from running, so a constant is safe.
+    /// </remarks>
+    private const string EtwSessionName = "FiveMDiagnostics";
 
     public string Name => "PresentMon";
 
@@ -186,6 +200,7 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
 
             var arguments = context.Settings.PresentMon.ArgumentsTemplate
                 .Replace("{processId}", processId.ToString(CultureInfo.InvariantCulture), StringComparison.OrdinalIgnoreCase)
+                .Replace("{sessionName}", EtwSessionName, StringComparison.OrdinalIgnoreCase)
                 .Replace("{outputPath}", _currentOutputPath, StringComparison.OrdinalIgnoreCase);
             _readsFromStdout = arguments.Contains("--output_stdout", StringComparison.OrdinalIgnoreCase)
                 || arguments.Contains("-output_stdout", StringComparison.OrdinalIgnoreCase);
@@ -679,10 +694,30 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
         _rawOutputWriter?.Dispose();
         _rawOutputWriter = null;
         _readsFromStdout = false;
+
+        // A capture that produced nothing leaves a zero byte CSV behind, and a session folder with an
+        // empty capture file in it reads as lost data rather than as a capture that never started.
+        DeleteEmptyOutputFile(_currentOutputPath);
+
         _currentProcessId = null;
         _currentOutputPath = null;
         _lastFilePosition = 0;
         _headerIndex = null;
         _traceStartEstimateUtc = null;
+    }
+
+    private static void DeleteEmptyOutputFile(string? path)
+    {
+        try
+        {
+            if (path is { Length: > 0 } && File.Exists(path) && new FileInfo(path).Length == 0)
+            {
+                File.Delete(path);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Tidying up is not worth failing a teardown over.
+        }
     }
 }

@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 
 namespace FiveMDiagnostics.Integrations.Etw;
 
@@ -74,7 +74,7 @@ public static class WprProfileWriter
         {
             Directory.CreateDirectory(settings.WorkingDirectory);
             var path = Path.Combine(settings.WorkingDirectory, FileName);
-            var content = Build(settings.DeepCapture.RingBufferMegabytes);
+            var content = Build(settings.DeepCapture.RingBufferMegabytes, settings.DeepCapture.CollectFileStacks);
 
             // Rewritten every session rather than only when missing: the buffer size is a setting, and a
             // profile left over from a session that used a different one would silently win.
@@ -94,8 +94,9 @@ public static class WprProfileWriter
     /// <remarks>
     /// The keyword set is deliberately narrow, and every entry answers a question the app asks:
     /// <list type="bullet">
-    /// <item><description><c>CSwitch</c>/<c>ReadyThread</c> — what a blocked thread was waiting for, which is the whole
-    /// point of tracing a stall rather than sampling it.</description></item>
+    /// <item><description><c>CSwitch</c>/<c>ReadyThread</c> — what a blocked thread was waiting for, and how long it
+    /// waited for a processor once it was runnable, which is the whole point of tracing a stall rather
+    /// than sampling it.</description></item>
     /// <item><description><c>SampledProfile</c> — where CPU time went when a thread was running rather than waiting.</description></item>
     /// <item><description><c>DPC</c>/<c>Interrupt</c> — a driver holding the CPU at raised IRQL, which stalls every
     /// thread at once and is what <see cref="EtlArtifactParser"/> measures.</description></item>
@@ -107,11 +108,30 @@ public static class WprProfileWriter
     /// </list>
     /// Stacks are enabled only for the events whose stacks get read. Stack walking is most of what an
     /// event costs, so enabling it broadly is how a trace reaches several gigabytes.
+    /// <para>
+    /// <c>CSwitch</c> and <c>ReadyThread</c> stacks are deliberately absent even though both keywords
+    /// are on. A context switch stack is walked on every scheduling decision on every processor, which
+    /// on a sixteen thread machine is the single largest contributor to the trace — and it is what left
+    /// a 256 MB ring buffer holding barely seven seconds of history, when history is the entire reason
+    /// the ring buffer exists. The events themselves stay: they carry the wait reason and the ready
+    /// time, which is what the analysis reads, and they cost a fraction of their stacks.
+    /// </para>
+    /// <para>
+    /// <c>FileCreate</c> stacks answer a question the rest of the profile cannot — which component is
+    /// opening a given file, rather than which thread happens to be running when it does — but they are
+    /// opt-in via <see cref="DeepCaptureOptions.CollectFileStacks"/>. Measured at 830–923 file opens per
+    /// second system-wide against 9 300–11 800 CPU samples, they are about 9% more stack walking and a
+    /// corresponding bite out of ring buffer retention, which is too much to spend by default on a
+    /// stream nothing in the app reads yet.
+    /// </para>
     /// </remarks>
-    private static string Build(int ringBufferMegabytes)
+    private static string Build(int ringBufferMegabytes, bool collectFileStacks)
     {
         var systemBuffers = Math.Max(1, ringBufferMegabytes * 1024 / BufferSizeKilobytes);
         var eventBuffers = Math.Max(1, systemBuffers / EventBufferDivisor);
+        var fileStack = collectFileStacks
+            ? "\r\n                    <Stack Value=\"FileCreate\" />"
+            : string.Empty;
 
         return $"""
             <?xml version="1.0" encoding="utf-8"?>
@@ -150,9 +170,7 @@ public static class WprProfileWriter
                     <Keyword Value="MemoryInfoWS" />
                   </Keywords>
                   <Stacks>
-                    <Stack Value="CSwitch" />
-                    <Stack Value="ReadyThread" />
-                    <Stack Value="SampledProfile" />
+                    <Stack Value="SampledProfile" />{fileStack}
                     <Stack Value="DiskReadInit" />
                     <Stack Value="DiskWriteInit" />
                     <Stack Value="DiskFlushInit" />

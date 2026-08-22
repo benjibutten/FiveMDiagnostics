@@ -10,6 +10,7 @@
     <Project Path="src/FiveMDiagnostics.Integrations.Nvml/FiveMDiagnostics.Integrations.Nvml.csproj" />
     <Project Path="src/FiveMDiagnostics.Integrations.Obs/FiveMDiagnostics.Integrations.Obs.csproj" />
     <Project Path="src/FiveMDiagnostics.Integrations.PresentMon/FiveMDiagnostics.Integrations.PresentMon.csproj" />
+    <Project Path="src/FiveMDiagnostics.Tools.EtlAnalyzer/FiveMDiagnostics.Tools.EtlAnalyzer.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/FiveMDiagnostics.Tests/FiveMDiagnostics.Tests.csproj" />

@@ -117,6 +117,24 @@ Stutter is deviation from the cadence the machine is achieving, so thresholds de
 median frame time and the display refresh interval (whichever is larger), not a hardcoded 25 ms. A
 120 Hz display running at 120 fps flags spikes from roughly 12.5 ms; a 60 Hz one from roughly 25 ms.
 
+### Frame pacing is measured separately, and absolutely
+
+A relative threshold cannot see a slow degradation, because its baseline moves with the damage. In one
+6.5 hour session the machine spent 104 of 391 minutes unable to hold 60 fps — median frame rates of
+37–52 in blocks half an hour long — and the spike detector raised almost nothing for it, since a
+baseline that had drifted to 20 ms puts the 2x bar at 40 ms.
+
+`FramePacingMonitor` classifies the session a minute at a time against two things that do not drift:
+how much idle time the frame pipeline had left (`MsCPUWait` — a frame rate cap that is being met is
+several milliseconds of wait per frame, and a collapse towards zero means the CPU has become the
+limit), and the best cadence this same session has been shown to sustain, which only ever ratchets
+down. Every window is written to the session journal, healthy ones included, because the share of an
+evening that could not hold its frame rate is only computable with the good minutes on record next to
+the bad. Incidents are raised at the transition into a bad patch and then on a reminder cadence.
+
+Replayed over that session it classifies 91 of 390 minutes as saturated, finds a 27 minute unbroken
+run and a worst minute of 37.3 fps, and raises 14 incidents rather than 180.
+
 ## Solution layout
 
 - `src/FiveMDiagnostics.App.Wpf`: desktop UI, tray mode and app composition
@@ -129,6 +147,7 @@ median frame time and the display refresh interval (whichever is larger), not a 
 - `src/FiveMDiagnostics.Integrations.Obs`: raw `obs-websocket` polling
 - `src/FiveMDiagnostics.Integrations.Etw`: WPR deep capture and ETL parsing
 - `src/FiveMDiagnostics.Fakes`: simulated incident scenarios
+- `src/FiveMDiagnostics.Tools.EtlAnalyzer`: offline command line reader for deep capture ETLs
 - `tests/FiveMDiagnostics.Tests`: acceptance-oriented tests
 
 ## Requirements
@@ -151,6 +170,20 @@ Run tests:
 ```powershell
 dotnet test FiveMDiagnostics.slnx
 ```
+
+Read a deep capture ETL:
+
+```powershell
+dotnet run --project src/FiveMDiagnostics.Tools.EtlAnalyzer -- <trace.etl> cpu
+dotnet run --project src/FiveMDiagnostics.Tools.EtlAnalyzer -- <trace.etl> thread --tid 24096
+dotnet run --project src/FiveMDiagnostics.Tools.EtlAnalyzer -- <trace.etl> io
+```
+
+The app's own ETL parser answers whether a trace is usable and whether a driver held the CPU. The tool
+answers what comes next: which thread inside the game was the bottleneck, what code it was running,
+whether it was sharing a physical core, and whether the file system traffic ever reached the disk.
+Rates are reported in *cores*, so a thread at 0.89 cores is spending 19.6 ms of CPU inside a 22 ms
+frame — which is the number that explains a frame rate.
 
 ## Configuration
 

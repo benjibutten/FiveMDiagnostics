@@ -1,4 +1,4 @@
-using System.Text.Json.Serialization;
+﻿using System.Text.Json.Serialization;
 
 namespace FiveMDiagnostics.Core;
 
@@ -66,16 +66,27 @@ public sealed record PresentMonOptions
         // could therefore terminate the collector for the remainder of a long session.
         "--process_id {processId} --output_file \"{outputPath}\" " +
         "--no_console_stats --stop_existing_session --terminate_on_proc_exit",
+
+        // Read stdout, but used PresentMon's default ETW session name. Two PresentMon instances then
+        // fight over one session: whichever starts second stops the first, so a stray capture — or a
+        // second copy of this app — silently kills a running one.
+        "--process_id {processId} --output_stdout " +
+        "--no_console_stats --stop_existing_session --terminate_on_proc_exit",
     ];
 
     /// <summary>
     /// PresentMon 2.x invocation. No metrics flag: PresentMon's default already emits the full v2 column
-    /// set, and it is a superset of what <c>--v2_metrics</c> produces. <c>--stop_existing_session</c>
-    /// matters because a killed PresentMon leaves its ETW session behind and the next capture would
-    /// otherwise refuse to start.
+    /// set, and it is a superset of what <c>--v2_metrics</c> produces.
     /// </summary>
+    /// <remarks>
+    /// <c>--session_name</c> is what keeps two captures from colliding. PresentMon names its ETW session
+    /// <c>PresentMon</c> by default, so a second instance stops the first — observed as a capture that
+    /// announced "a trace session named PresentMon is already running and it will be stopped" and then
+    /// produced nothing. With a name of our own, <c>--stop_existing_session</c> only ever clears up
+    /// after this app's own killed process, which is what it was there for.
+    /// </remarks>
     public const string DefaultArgumentsTemplate =
-        "--process_id {processId} --output_stdout " +
+        "--process_id {processId} --output_stdout --session_name {sessionName} " +
         "--no_console_stats --stop_existing_session --terminate_on_proc_exit";
 
     public string? ExecutablePath { get; set; }
@@ -137,10 +148,29 @@ public sealed record DeepCaptureOptions
 
     /// <summary>
     /// Size of the in-memory ring buffer the background session records into, and therefore how much
-    /// history a marker can save. Roughly 35 MB/s without syscall tracing, so 256 MB is about seven
-    /// seconds of run-up — the part of the timeline where the cause of a stall actually is.
+    /// history a marker can save — the part of the timeline where the cause of a stall actually is.
     /// </summary>
+    /// <remarks>
+    /// Measured retention at 256 MB was about seven seconds while context switch stacks were being
+    /// walked. Those stacks are no longer collected, so the same buffer now holds substantially more;
+    /// the default is unchanged because this is non-paged pool the machine gives up for the whole
+    /// session, and the honest next step is to measure the new retention before spending more of it.
+    /// </remarks>
     public int RingBufferMegabytes { get; set; } = 256;
+
+    /// <summary>
+    /// Walks a stack on every file open, system-wide, so a capture can say which component is doing the
+    /// file work rather than leaving it to be inferred from where a thread's CPU samples landed.
+    /// </summary>
+    /// <remarks>
+    /// Off by default because the cost is real and the payoff is occasional. Measured across two
+    /// captures from the same machine, file opens run at 830–923 per second system-wide against 9 300 –
+    /// 11 800 CPU samples per second, so this adds roughly 9% more stack walks — and it spends ring
+    /// buffer, which is the resource that decides how many seconds of run-up a marker can save. Nothing
+    /// in the app reads these stacks yet; they are for reading the ETL by hand when the question is
+    /// specifically "which module is opening this file".
+    /// </remarks>
+    public bool CollectFileStacks { get; set; }
 
     /// <summary>
     /// How long a marker waits before stopping the ring buffer, so the recovery after the hitch is in
@@ -306,6 +336,79 @@ public sealed record AutoDetectOptions
     }
 }
 
+/// <summary>
+/// Thresholds for <see cref="FramePacingMonitor"/>, which classifies the session window by window into
+/// "the cadence held" and "the cadence did not".
+/// </summary>
+/// <remarks>
+/// These are absolute on purpose. <see cref="AutoDetectOptions"/> measures against a rolling baseline
+/// and therefore cannot see a slow degradation — the baseline moves with it. Everything here is
+/// measured either against zero (how much idle time the pipeline had left) or against the best cadence
+/// the machine has been shown to sustain in this same session, neither of which drifts with the damage.
+/// </remarks>
+public sealed record FramePacingOptions
+{
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// How much of the session each classified window covers. A minute is long enough that a single
+    /// hitch cannot colour it and short enough to locate a bad patch to the minute.
+    /// </summary>
+    public TimeSpan WindowLength { get; set; } = TimeSpan.FromMinutes(1);
+
+    /// <summary>
+    /// Frames a window needs before it is classified at all. Below this the window is a loading screen,
+    /// an alt-tab or a capture gap, and its median says nothing about the machine.
+    /// </summary>
+    public int MinimumFrames { get; set; } = 600;
+
+    /// <summary>
+    /// Median <c>MsCPUWait</c>, in milliseconds, below which the pipeline is out of headroom. A frame
+    /// rate cap that is being met shows up as several milliseconds of wait per frame; a measured 0.14 ms
+    /// means nothing is being waited for and the CPU is what limits the frame rate.
+    /// </summary>
+    public double SaturatedCpuWaitMs { get; set; } = 1.0;
+
+    /// <summary>Median <c>MsCPUWait</c> below which the margin is thin enough to be worth reporting.</summary>
+    public double MarginalCpuWaitMs { get; set; } = 4.0;
+
+    /// <summary>
+    /// How far the window's median frame time has to sit above the session's best cadence before the
+    /// vanished headroom counts as saturation rather than as a game that is simply uncapped.
+    /// </summary>
+    public double MarginalCadenceRatio { get; set; } = 1.08;
+
+    /// <summary>
+    /// Cadence ratio that means saturation on its own, used when no CPU/GPU breakdown is available and
+    /// frame time is the only signal there is.
+    /// </summary>
+    public double SaturatedCadenceRatio { get; set; } = 1.25;
+
+    /// <summary>
+    /// Saturated windows between reminders once a bad patch is under way. The transition into
+    /// saturation always raises an incident; without a reminder a half hour of 45 fps would be
+    /// represented by a single marker at its start.
+    /// </summary>
+    public int SustainedReminderWindows { get; set; } = 15;
+
+    /// <summary>Clamps hand-edited values into the range the monitor was designed for.</summary>
+    public void Normalize()
+    {
+        WindowLength = WindowLength < TimeSpan.FromSeconds(10)
+            ? TimeSpan.FromSeconds(10)
+            : WindowLength > TimeSpan.FromMinutes(15)
+                ? TimeSpan.FromMinutes(15)
+                : WindowLength;
+
+        MinimumFrames = Math.Clamp(MinimumFrames, 30, 100_000);
+        SaturatedCpuWaitMs = Math.Clamp(SaturatedCpuWaitMs, 0.05, 8);
+        MarginalCpuWaitMs = Math.Max(Math.Clamp(MarginalCpuWaitMs, 0.1, 16), SaturatedCpuWaitMs);
+        MarginalCadenceRatio = Math.Clamp(MarginalCadenceRatio, 1.01, 3);
+        SaturatedCadenceRatio = Math.Max(Math.Clamp(SaturatedCadenceRatio, 1.02, 5), MarginalCadenceRatio);
+        SustainedReminderWindows = Math.Clamp(SustainedReminderWindows, 1, 1000);
+    }
+}
+
 public sealed record PrivacyOptions
 {
     public bool IncludeSensitiveFieldsInExport { get; set; }
@@ -338,6 +441,7 @@ public sealed record DiagnosticsSettings
     public ObsOptions Obs { get; set; } = new();
     public DeepCaptureOptions DeepCapture { get; set; } = new();
     public AutoDetectOptions AutoDetect { get; set; } = new();
+    public FramePacingOptions FramePacing { get; set; } = new();
     public PrivacyOptions Privacy { get; set; } = new();
     public string Language { get; set; } = "en";
 

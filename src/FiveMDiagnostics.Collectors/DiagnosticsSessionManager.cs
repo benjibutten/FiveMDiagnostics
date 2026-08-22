@@ -1,4 +1,4 @@
-using System.Threading.Channels;
+﻿using System.Threading.Channels;
 
 namespace FiveMDiagnostics.Collectors;
 
@@ -46,6 +46,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private Task[] _collectorTasks = [];
     private volatile bool _isSessionActive;
     private AutoIncidentDetector? _autoDetector;
+    private FramePacingMonitor? _framePacing;
     private volatile IReadOnlyList<ArtifactAttachment>? _attachmentsSnapshot;
 
     /// <summary>
@@ -96,6 +97,15 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     public event EventHandler<GpuTelemetrySample>? GpuTelemetryUpdated;
 
     public event EventHandler<CaptureHealthTelemetrySample>? CaptureHealthUpdated;
+
+    /// <summary>Raised once per classified frame pacing window, healthy ones included.</summary>
+    public event EventHandler<FramePacingWindow>? FramePacingWindowCompleted;
+
+    /// <summary>
+    /// How the session has been spent so far, window by window. Empty until the first window closes,
+    /// and reset with the session.
+    /// </summary>
+    public FramePacingSummary FramePacing => _framePacing?.Summary ?? FramePacingSummary.Empty;
 
     public bool IsSessionActive => _isSessionActive;
 
@@ -167,7 +177,12 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             // whole session, and a hand-edited value is not allowed to ask for an arbitrary amount of it.
             _settings.DeepCapture.Normalize();
 
+            // Absolute rather than relative, so it keeps working in exactly the sustained bad patch
+            // where the spike detector's rolling baseline drifts up with the damage and goes quiet.
+            _settings.FramePacing.Normalize();
+
             _autoDetector = new AutoIncidentDetector(_settings.AutoDetect, Environment?.DisplayRefreshRateHz);
+            _framePacing = new FramePacingMonitor(_settings.FramePacing, Environment?.DisplayRefreshRateHz);
             _channel = Channel.CreateBounded<TelemetryEvent>(new BoundedChannelOptions(32768)
             {
                 SingleReader = true,
@@ -250,6 +265,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         _collectorTasks = [];
         _isSessionActive = false;
 
+        FinalizeFramePacing();
         CloseJournal();
         OnStateChanged();
     }
@@ -325,6 +341,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         _collectorTasks = [];
         _isSessionActive = false;
 
+        FinalizeFramePacing();
         Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), "Session stopped.");
         CloseJournal();
         OnStateChanged();
@@ -420,6 +437,43 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), $"Sessionslogg skrivs till {journal.Path}.");
     }
 
+    /// <summary>
+    /// Closes the pacing window in progress and reports the session total, then releases the monitor.
+    /// </summary>
+    /// <remarks>
+    /// Its own step, called before the journal closes, because it has to run before the field is
+    /// cleared and both teardown paths clear a block of fields at once. Doing this inside
+    /// <see cref="CloseJournal"/> looked tidier and was silently dead: the field was already null by
+    /// the time it ran, so the last window never reached the journal and the end-of-session total was
+    /// always empty.
+    /// <para>
+    /// The partial window matters. A session stopped because the evening turned bad ends inside the
+    /// patch that made the user stop, and that is the minute worth keeping.
+    /// </para>
+    /// </remarks>
+    private void FinalizeFramePacing()
+    {
+        var monitor = _framePacing;
+        if (monitor is null)
+        {
+            return;
+        }
+
+        if (monitor.Flush() is { } finalWindow)
+        {
+            _journal?.WritePacingWindow(finalWindow);
+            FramePacingWindowCompleted?.Invoke(this, finalWindow);
+        }
+
+        var summary = monitor.Summary;
+        if (summary.TotalWindows > 0)
+        {
+            Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), summary.Describe(_settings.FramePacing.WindowLength));
+        }
+
+        _framePacing = null;
+    }
+
     private void CloseJournal()
     {
         var journal = _journal;
@@ -456,6 +510,51 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         }
 
         CreateMarker(timestamp, trigger.Severity, trigger.Label, allowDeepCapture: false);
+    }
+
+    /// <summary>
+    /// Records a classified pacing window and raises an incident when the session enters, or stays in,
+    /// a state where the frame rate target is not being met.
+    /// </summary>
+    /// <remarks>
+    /// Every window is journalled, healthy ones included. The per-minute state of a whole session is
+    /// the single most useful artefact this app produces — "104 of 391 minutes could not hold 60 fps"
+    /// is the finding, and it can only be seen by looking at the minutes that were fine next to the
+    /// ones that were not. Incidents are raised sparingly by comparison: once when a bad patch starts,
+    /// then on a reminder cadence, because a half hour of saturation is one condition rather than
+    /// thirty of them.
+    /// </remarks>
+    private void OnPacingWindow(FramePacingWindow window)
+    {
+        _journal?.WritePacingWindow(window);
+        FramePacingWindowCompleted?.Invoke(this, window);
+
+        if (window.State != FramePacingState.Saturated)
+        {
+            return;
+        }
+
+        // Counted from the transition rather than from zero. The modulus has to be against the number
+        // of windows *since* the bad patch began, or an interval of one — meaning "every window" —
+        // matches nothing, because every integer is divisible by one.
+        var windowsSinceTransition = window.SustainedWindows - 1;
+        var isReminder = windowsSinceTransition > 0
+            && windowsSinceTransition % _settings.FramePacing.SustainedReminderWindows == 0;
+        if (!window.IsTransition && !isReminder)
+        {
+            return;
+        }
+
+        var minutes = window.SustainedWindows * _settings.FramePacing.WindowLength.TotalMinutes;
+        var label = window.IsTransition
+            ? $"Auto: FPS-taket nått, {window.AchievedFps:F0} fps mot {window.TargetFps:F0}"
+            : $"Auto: FPS-taket nått i {minutes:F0} min, {window.AchievedFps:F0} fps mot {window.TargetFps:F0}";
+
+        // Severe on the sustained reminder rather than at the transition: a single minute below target
+        // is common, and what makes this the worst thing in a session is that it does not recover.
+        var severity = window.IsTransition ? IncidentSeverity.Normal : IncidentSeverity.Severe;
+        MarkAutoIncident(window.End, new AutoIncidentTrigger(severity, label));
+        Report(StatusLevel.Warning, nameof(DiagnosticsSessionManager), window.Describe());
     }
 
     private IncidentMarker? CreateMarker(DateTimeOffset timestamp, IncidentSeverity severity, string? label, bool allowDeepCapture)
@@ -641,14 +740,19 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 {
                     CaptureHealthUpdated?.Invoke(this, healthSample);
                 }
-                else if (telemetryEvent is FrameTelemetrySample frameSample && _autoDetector is not null)
+                else if (telemetryEvent is FrameTelemetrySample frameSample)
                 {
                     // The marker has to be raised before the materializer sees this event, so the frame
                     // that triggered the incident lands inside its own window rather than one event
                     // short of it.
-                    if (_autoDetector.Observe(frameSample) is { } trigger)
+                    if (_autoDetector?.Observe(frameSample) is { } trigger)
                     {
                         MarkAutoIncident(frameSample.Timestamp, trigger);
+                    }
+
+                    if (_framePacing?.Observe(frameSample) is { } pacingWindow)
+                    {
+                        OnPacingWindow(pacingWindow);
                     }
                 }
 

@@ -9,6 +9,14 @@ public sealed class FiveMProcessTelemetryCollector : ITelemetryCollector
 {
     private ProcessMetricSnapshot? _previousSnapshot;
 
+    /// <summary>
+    /// The process id the last read failure was reported for. A resolver that is still handing out an
+    /// id Windows has already reaped produces one failure per polling interval — twice a second — and
+    /// a session that restarted the game logged sixteen identical warnings, all describing one event.
+    /// Reporting per id turns that back into one line per occurrence.
+    /// </summary>
+    private int? _reportedFailurePid;
+
     public string Name => "FiveMProcessTelemetry";
 
     public async Task RunAsync(CollectorContext context, CancellationToken cancellationToken)
@@ -37,6 +45,7 @@ public sealed class FiveMProcessTelemetryCollector : ITelemetryCollector
                             : 0;
 
                         _previousSnapshot = snapshot;
+                        _reportedFailurePid = null;
 
                         await context.Writer.WriteAsync(
                             new ProcessTelemetrySample(
@@ -52,17 +61,37 @@ public sealed class FiveMProcessTelemetryCollector : ITelemetryCollector
                             cancellationToken).ConfigureAwait(false);
                     }
                 }
+                catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+                {
+                    // The process ended between the resolver handing out the id and this read. Not a
+                    // fault of its own — the next poll re-resolves — so it is worth exactly one line.
+                    _previousSnapshot = null;
+                    ReportOnce(context, target.ProcessId, $"FiveM-processen (PID {target.ProcessId}) kördes inte längre när metrics skulle läsas.");
+                }
                 catch (Exception ex)
                 {
-                    context.StatusSink.Report(StatusLevel.Warning, Name, $"Kunde inte läsa FiveM-processens metrics: {ex.Message}");
+                    _previousSnapshot = null;
+                    ReportOnce(context, target.ProcessId, $"Kunde inte läsa FiveM-processens metrics: {ex.Message}");
                 }
             }
             else
             {
                 _previousSnapshot = null;
+                _reportedFailurePid = null;
             }
 
             await Task.Delay(context.Settings.ProcessPollingInterval, cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    private void ReportOnce(CollectorContext context, int processId, string message)
+    {
+        if (_reportedFailurePid == processId)
+        {
+            return;
+        }
+
+        _reportedFailurePid = processId;
+        context.StatusSink.Report(StatusLevel.Warning, Name, message);
     }
 }

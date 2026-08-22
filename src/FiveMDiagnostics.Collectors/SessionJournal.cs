@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -157,6 +157,7 @@ public sealed class SessionJournal : IDisposable
                 settings.PostIncidentWindow,
                 settings.MaxRetainedIncidents,
                 AutoDetect = settings.AutoDetect,
+                FramePacing = settings.FramePacing,
                 DeepCaptureEnabled = settings.DeepCapture.Enabled,
             },
         });
@@ -170,6 +171,32 @@ public sealed class SessionJournal : IDisposable
             entry.Level,
             entry.Source,
             entry.Message,
+        });
+    }
+
+    /// <summary>
+    /// Records one classified frame pacing window, whatever its state.
+    /// </summary>
+    /// <remarks>
+    /// Healthy windows are written too, and that is the point: the share of a session that could not
+    /// hold its frame rate is only computable if the good minutes are on record next to the bad ones.
+    /// At a minute per window a whole evening costs a few hundred short lines, which is a fraction of
+    /// what a single incident's payload takes.
+    /// </remarks>
+    public void WritePacingWindow(FramePacingWindow window)
+    {
+        Append("pacing", window.End, new
+        {
+            window.State,
+            window.Start,
+            window.FrameCount,
+            AchievedFps = Math.Round(window.AchievedFps, 2),
+            TargetFps = Math.Round(window.TargetFps, 2),
+            MedianFrameTimeMs = Math.Round(window.MedianFrameTimeMs, 3),
+            MedianCpuWaitMs = window.MedianCpuWaitMs is { } wait ? Math.Round(wait, 3) : (double?)null,
+            MedianCpuBusyMs = window.MedianCpuBusyMs is { } cpu ? Math.Round(cpu, 3) : (double?)null,
+            MedianGpuBusyMs = window.MedianGpuBusyMs is { } gpu ? Math.Round(gpu, 3) : (double?)null,
+            window.SustainedWindows,
         });
     }
 
