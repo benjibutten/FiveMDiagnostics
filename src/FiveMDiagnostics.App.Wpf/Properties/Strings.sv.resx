@@ -58,6 +58,17 @@
   <data name="CaptureFeedbackSyntheticReady" xml:space="preserve"><value>Syntetisk incident skapades direkt för test.</value></data>
 
   <!-- Controls -->
+  <data name="PacingHeader" xml:space="preserve"><value>Frame pacing denna session</value></data>
+  <data name="PacingIdle" xml:space="preserve"><value>Ingen frame pacing-data än. Första fönstret stängs efter en minut med frames.</value></data>
+  <data name="PacingSaturatedLabel" xml:space="preserve"><value>Höll inte bildfrekvensen:</value></data>
+  <data name="PacingWorstLabel" xml:space="preserve"><value>Sämsta minuten:</value></data>
+  <data name="PacingCurrentLabel" xml:space="preserve"><value>Just nu:</value></data>
+  <data name="PacingCaptureBudgetLabel" xml:space="preserve"><value>Deep captures kvar:</value></data>
+  <data name="PacingSaturatedFormat" xml:space="preserve"><value>{0} av {1} min ({2}), {3} marginella. Längsta obrutna period {4} min.</value></data>
+  <data name="PacingWorstFormat" xml:space="preserve"><value>{0} fps mot måltakten {1}</value></data>
+  <data name="PacingCurrentFormat" xml:space="preserve"><value>{0} — {1} fps, CPU-marginal {2} ms</value></data>
+  <data name="PacingCurrentNoHeadroomFormat" xml:space="preserve"><value>{0} — {1} fps</value></data>
+  <data name="PacingCaptureBudgetFormat" xml:space="preserve"><value>{0} av {1}</value></data>
   <data name="ControlsHeader" xml:space="preserve"><value>Kontroller</value></data>
   <data name="SessionGroup" xml:space="preserve"><value>Snabbstart</value></data>
   <data name="StartSession" xml:space="preserve"><value>Starta session</value></data>

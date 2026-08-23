@@ -57,6 +57,11 @@ public partial class App : System.Windows.Application
 				new NetStatsCsvArtifactParser(),
 				new ProfilerJsonArtifactParser(),
 				new ResmonArtifactParser(),
+
+				// Ahead of LogArtifactParser, which also claims .txt: the first parser that says it can
+				// handle a path wins, and an OBS log reduced to a keyword grep loses the render and
+				// encoding lag totals that are the only OBS telemetry four sessions have produced.
+				new ObsLogArtifactParser(),
 				new LogArtifactParser(),
 				new EtlArtifactParser(),
 			]);

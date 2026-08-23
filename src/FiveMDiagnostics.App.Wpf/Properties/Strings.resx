@@ -58,6 +58,17 @@
   <data name="CaptureFeedbackSyntheticReady" xml:space="preserve"><value>Synthetic incident created immediately for testing.</value></data>
 
   <!-- Controls -->
+  <data name="PacingHeader" xml:space="preserve"><value>Frame pacing this session</value></data>
+  <data name="PacingIdle" xml:space="preserve"><value>No frame pacing data yet. The first window closes after a minute of frames.</value></data>
+  <data name="PacingSaturatedLabel" xml:space="preserve"><value>Could not hold the frame rate:</value></data>
+  <data name="PacingWorstLabel" xml:space="preserve"><value>Worst minute:</value></data>
+  <data name="PacingCurrentLabel" xml:space="preserve"><value>Right now:</value></data>
+  <data name="PacingCaptureBudgetLabel" xml:space="preserve"><value>Deep captures left:</value></data>
+  <data name="PacingSaturatedFormat" xml:space="preserve"><value>{0} of {1} min ({2}), {3} marginal. Longest unbroken stretch {4} min.</value></data>
+  <data name="PacingWorstFormat" xml:space="preserve"><value>{0} fps against a target of {1}</value></data>
+  <data name="PacingCurrentFormat" xml:space="preserve"><value>{0} — {1} fps, CPU headroom {2} ms</value></data>
+  <data name="PacingCurrentNoHeadroomFormat" xml:space="preserve"><value>{0} — {1} fps</value></data>
+  <data name="PacingCaptureBudgetFormat" xml:space="preserve"><value>{0} of {1}</value></data>
   <data name="ControlsHeader" xml:space="preserve"><value>Controls</value></data>
   <data name="SessionGroup" xml:space="preserve"><value>Quick start</value></data>
   <data name="StartSession" xml:space="preserve"><value>Start session</value></data>

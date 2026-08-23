@@ -46,6 +46,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private Task[] _collectorTasks = [];
     private volatile bool _isSessionActive;
     private AutoIncidentDetector? _autoDetector;
+    private AutoDeepCaptureBudget? _autoCaptureBudget;
     private FramePacingMonitor? _framePacing;
     private volatile IReadOnlyList<ArtifactAttachment>? _attachmentsSnapshot;
 
@@ -106,6 +107,12 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// and reset with the session.
     /// </summary>
     public FramePacingSummary FramePacing => _framePacing?.Summary ?? FramePacingSummary.Empty;
+
+    /// <summary>
+    /// Automatic deep captures still available this session. Surfaced so the UI can say why a bad patch
+    /// has stopped producing traces, rather than leaving the user to wonder whether it broke.
+    /// </summary>
+    public int RemainingAutoCaptures => _autoCaptureBudget?.Remaining ?? _settings.DeepCapture.MaxAutoCapturesPerSession;
 
     public bool IsSessionActive => _isSessionActive;
 
@@ -182,6 +189,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _settings.FramePacing.Normalize();
 
             _autoDetector = new AutoIncidentDetector(_settings.AutoDetect, Environment?.DisplayRefreshRateHz);
+            _autoCaptureBudget = new AutoDeepCaptureBudget(_settings.DeepCapture);
             _framePacing = new FramePacingMonitor(_settings.FramePacing, Environment?.DisplayRefreshRateHz);
             _channel = Channel.CreateBounded<TelemetryEvent>(new BoundedChannelOptions(32768)
             {
@@ -260,6 +268,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         _pumpTask = null;
         _finalizeTask = null;
         _autoDetector = null;
+        _autoCaptureBudget = null;
         _ringBuffer = null;
         _incidentMaterializer = null;
         _collectorTasks = [];
@@ -338,6 +347,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         _analysisChannel = null;
         _analysisTask = null;
         _autoDetector = null;
+        _autoCaptureBudget = null;
         _collectorTasks = [];
         _isSessionActive = false;
 
@@ -495,21 +505,179 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             return null;
         }
 
-        return CreateMarker(DateTimeOffset.UtcNow, severity, label: null, allowDeepCapture: true);
+        // severityGated: a manual Normal marker only captures when the user has opted in, which is the
+        // historical behaviour and the reason CaptureNormalManualIncidents exists.
+        return CreateMarker(DateTimeOffset.UtcNow, severity, label: null, allowDeepCapture: true, severityGated: true);
     }
 
     /// <summary>
-    /// Marks an incident the detector found. Deep capture stays off: WPR is affordable once on demand
-    /// and not once every couple of minutes for a whole stream.
+    /// Marks an incident the detector found, and spends a deep capture on it when the hitch is severe
+    /// enough and the session's budget allows one.
     /// </summary>
-    private void MarkAutoIncident(DateTimeOffset timestamp, AutoIncidentTrigger trigger)
+    /// <remarks>
+    /// Deep capture used to be refused outright here. Saving the ring buffer is genuinely expensive —
+    /// a few hundred megabytes and an empty buffer afterwards — but refusing every automatic incident
+    /// meant a session could raise eighteen severe ones and produce no trace at all, which is what
+    /// happened and what left five hitch clusters unexplained. <see cref="AutoDeepCaptureBudget"/> now
+    /// decides, and the settings it reads are tight enough that a bad evening spends a handful.
+    /// </remarks>
+    /// <param name="sustainedSaturation">
+    /// Set when the trigger came from <see cref="FramePacingMonitor"/> rather than from one bad frame.
+    /// Such an incident carries no frame time to weigh, and the condition it describes — a frame rate
+    /// that is not recovering — is exactly the one a per-frame threshold cannot see.
+    /// </param>
+    private void MarkAutoIncident(DateTimeOffset timestamp, AutoIncidentTrigger trigger, bool sustainedSaturation = false)
     {
         if (_incidentMaterializer is null)
         {
             return;
         }
 
-        CreateMarker(timestamp, trigger.Severity, trigger.Label, allowDeepCapture: false);
+        var captureThis = sustainedSaturation
+            ? TryReserveSaturationCapture(timestamp)
+            : TryReserveAutoCapture(timestamp, trigger.FrameTimeMs);
+
+        CreateMarker(
+            timestamp,
+            trigger.Severity,
+            trigger.Label,
+            allowDeepCapture: captureThis,
+            trigger.FrameTimeMs,
+
+            // A pacing incident carries no frame time, so its bar starts at zero and the next suppressed
+            // frame of any size would clear it — replacing "FPS-taket nått i 15 min" with "Auto: 40 ms
+            // frame", which says far less about the same window.
+            allowFrameEscalation: !sustainedSaturation);
+    }
+
+    /// <summary>
+    /// Folds a threshold-crossing frame that arrived inside an already open incident into that incident.
+    /// </summary>
+    /// <remarks>
+    /// The cooldown that suppressed this trigger is doing its job — a burst of hitches is one event, not
+    /// twenty incidents. What it must not do is throw the observation away. The session this was written
+    /// for lost both of its worst frames that way, a 2 846 ms and a 1 683 ms, because each landed inside
+    /// a window opened seconds earlier by something trivial. Escalating renames the incident after the
+    /// worst frame it actually contains and raises its severity, so the export and the journal describe
+    /// the event rather than its opening act.
+    /// </remarks>
+    private void EscalateOpenIncident(DateTimeOffset timestamp, AutoIncidentTrigger trigger, AutoIncidentSuppression suppression)
+    {
+        if (_incidentMaterializer is null)
+        {
+            return;
+        }
+
+        var outcome = _incidentMaterializer.TryEscalate(
+            timestamp,
+            trigger.Severity,
+            trigger.Label,
+            trigger.FrameTimeMs,
+            out var escalated);
+
+        if (outcome == IncidentEscalation.NoOpenIncident)
+        {
+            MarkSuppressedFrameWithNoOpenWindow(timestamp, trigger, suppression);
+            return;
+        }
+
+        if (outcome == IncidentEscalation.AlreadyWorse || escalated is null)
+        {
+            return;
+        }
+
+        Report(
+            StatusLevel.Info,
+            nameof(DiagnosticsSessionManager),
+            $"Incident uppgraderad: {escalated.Label} ({escalated.Severity}). En värre frame inträffade inuti ett öppet fönster.");
+
+        // A frame this large is exactly what the budget exists for, and it is the reason the incident is
+        // worth a trace at all — so the escalation gets its own shot at one rather than inheriting the
+        // decision made for the smaller frame that opened the window.
+        if (TryReserveAutoCapture(timestamp, trigger.FrameTimeMs) && _settings.DeepCapture.Enabled && _sessionCts is not null)
+        {
+            StartDeepCapture(escalated, _sessionCts.Token);
+        }
+
+        OnStateChanged();
+    }
+
+    /// <summary>
+    /// Records a suppressed frame that arrived when no incident window was open to absorb it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The detector's cooldown is two minutes and an incident window closes sixty seconds after its
+    /// marker, so roughly a minute of every cycle has neither an incident collecting telemetry nor a
+    /// detector willing to raise one. A frame landing there used to vanish completely — no incident, no
+    /// trace, no journal line — which is the same silence that lost a 2 846 ms frame, just from the
+    /// other direction.
+    /// </para>
+    /// <para>
+    /// Only the cooldown is overridden, and only because it expires. Its stated purpose is to stop
+    /// incidents that mostly re-describe each other's telemetry, and that reasoning ends the moment the
+    /// previous window closes: a new incident then covers ninety seconds nothing else has looked at. An
+    /// exhausted <see cref="AutoDetectOptions.MaxIncidentsPerWindow"/> is refused outright — it is the
+    /// rate ceiling that keeps a bad hour from flooding the session, and a path around it would make it
+    /// no ceiling at all.
+    /// </para>
+    /// <para>
+    /// What qualifies is deliberately narrow: a frame worth a trace on its own, or a run of frames that
+    /// never reached the screen. The latter needs naming separately because its frame times are ordinary
+    /// by construction — the freeze is the run — so judging it by milliseconds would rank a visible
+    /// freeze below a mild spike and drop it here.
+    /// </para>
+    /// </remarks>
+    private void MarkSuppressedFrameWithNoOpenWindow(
+        DateTimeOffset timestamp,
+        AutoIncidentTrigger trigger,
+        AutoIncidentSuppression suppression)
+    {
+        if (suppression != AutoIncidentSuppression.Cooldown)
+        {
+            return;
+        }
+
+        var worthItsOwnIncident = trigger.Severity == IncidentSeverity.Severe
+            || trigger.Kind == AutoIncidentKind.DroppedFrameRun
+            || trigger.FrameTimeMs >= _settings.DeepCapture.AutoCaptureFrameTimeMs;
+
+        if (!worthItsOwnIncident)
+        {
+            return;
+        }
+
+        var captureThis = TryReserveAutoCapture(timestamp, trigger.FrameTimeMs);
+        CreateMarker(timestamp, trigger.Severity, trigger.Label, allowDeepCapture: captureThis, trigger.FrameTimeMs);
+    }
+
+    /// <summary>
+    /// Asks the session's capture budget for this hitch, reporting the reason when it refuses for a
+    /// reason the user would otherwise have to guess at.
+    /// </summary>
+    private bool TryReserveAutoCapture(DateTimeOffset timestamp, double frameTimeMs)
+    {
+        var budget = _autoCaptureBudget;
+        return budget is not null && ReportRefusal(budget.TryReserve(timestamp, frameTimeMs, out var refusal), refusal);
+    }
+
+    /// <summary>As above, for a frame rate that has stopped recovering rather than one bad frame.</summary>
+    private bool TryReserveSaturationCapture(DateTimeOffset timestamp)
+    {
+        var budget = _autoCaptureBudget;
+        return budget is not null && ReportRefusal(budget.TryReserveForSustainedSaturation(timestamp, out var refusal), refusal);
+    }
+
+    private bool ReportRefusal(bool reserved, string? refusal)
+    {
+        if (!reserved && refusal is not null)
+        {
+            // Only the budget and cooldown refusals carry a reason; an ordinary spike below the capture
+            // threshold returns null precisely so it does not fill the log.
+            Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), refusal);
+        }
+
+        return reserved;
     }
 
     /// <summary>
@@ -553,37 +721,64 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         // Severe on the sustained reminder rather than at the transition: a single minute below target
         // is common, and what makes this the worst thing in a session is that it does not recover.
         var severity = window.IsTransition ? IncidentSeverity.Normal : IncidentSeverity.Severe;
-        MarkAutoIncident(window.End, new AutoIncidentTrigger(severity, label));
+        MarkAutoIncident(
+            window.End,
+            new AutoIncidentTrigger(severity, label),
+            sustainedSaturation: severity == IncidentSeverity.Severe);
         Report(StatusLevel.Warning, nameof(DiagnosticsSessionManager), window.Describe());
     }
 
-    private IncidentMarker? CreateMarker(DateTimeOffset timestamp, IncidentSeverity severity, string? label, bool allowDeepCapture)
+    /// <param name="allowDeepCapture">
+    /// Whether this marker is permitted to save the ring buffer at all. Manual markers always are, and
+    /// then the severity rules below decide; automatic ones arrive here having already been through
+    /// <see cref="AutoDeepCaptureBudget"/>, so a true here means the budget was spent and the capture
+    /// must happen regardless of severity.
+    /// </param>
+    private IncidentMarker? CreateMarker(
+        DateTimeOffset timestamp,
+        IncidentSeverity severity,
+        string? label,
+        bool allowDeepCapture,
+        double frameTimeMs = 0,
+        bool severityGated = false,
+        bool allowFrameEscalation = true)
     {
         if (_incidentMaterializer is null)
         {
             return null;
         }
 
-        var marker = _incidentMaterializer.MarkIncident(timestamp, severity, label);
+        var marker = _incidentMaterializer.MarkIncident(timestamp, severity, label, frameTimeMs, allowFrameEscalation);
         Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), $"Incident markerad: {marker.Label} ({marker.Severity}).");
 
-        var shouldDeepCapture = severity == IncidentSeverity.Severe || _settings.DeepCapture.CaptureNormalManualIncidents;
+        var shouldDeepCapture = !severityGated
+            || severity == IncidentSeverity.Severe
+            || _settings.DeepCapture.CaptureNormalManualIncidents;
         if (allowDeepCapture && shouldDeepCapture && _settings.DeepCapture.Enabled && _sessionCts is not null)
         {
-            // The token is read here rather than inside the task: by the time the task runs, stopping
-            // the session may already have replaced the source with null.
-            var sessionToken = _sessionCts.Token;
-            var capture = Task.Run(() => CaptureDeepTraceAsync(marker, sessionToken));
-
-            lock (_sync)
-            {
-                _deepCaptureTasks.RemoveAll(task => task.IsCompleted);
-                _deepCaptureTasks.Add(capture);
-            }
+            StartDeepCapture(marker, _sessionCts.Token);
         }
 
         OnStateChanged();
         return marker;
+    }
+
+    /// <summary>
+    /// Runs a deep capture for a marker on its own task, tracked so stopping the session waits for it.
+    /// </summary>
+    /// <remarks>
+    /// The token is read by the caller rather than inside the task: by the time the task runs, stopping
+    /// the session may already have replaced the source with null.
+    /// </remarks>
+    private void StartDeepCapture(IncidentMarker marker, CancellationToken sessionToken)
+    {
+        var capture = Task.Run(() => CaptureDeepTraceAsync(marker, sessionToken));
+
+        lock (_sync)
+        {
+            _deepCaptureTasks.RemoveAll(task => task.IsCompleted);
+            _deepCaptureTasks.Add(capture);
+        }
     }
 
     public async Task<string?> ExportIncidentAsync(IncidentRecord? incident, bool includeSensitiveFields, bool includeAttachedArtifacts, CancellationToken cancellationToken = default)
@@ -745,9 +940,16 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                     // The marker has to be raised before the materializer sees this event, so the frame
                     // that triggered the incident lands inside its own window rather than one event
                     // short of it.
-                    if (_autoDetector?.Observe(frameSample) is { } trigger)
+                    if (_autoDetector?.Observe(frameSample) is { } observation)
                     {
-                        MarkAutoIncident(frameSample.Timestamp, trigger);
+                        if (observation.IsSuppressed)
+                        {
+                            EscalateOpenIncident(frameSample.Timestamp, observation.Trigger, observation.Suppression);
+                        }
+                        else
+                        {
+                            MarkAutoIncident(frameSample.Timestamp, observation.Trigger);
+                        }
                     }
 
                     if (_framePacing?.Observe(frameSample) is { } pacingWindow)

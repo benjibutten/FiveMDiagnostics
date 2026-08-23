@@ -132,6 +132,59 @@
                                 </StackPanel>
                             </Border>
 
+                            <!-- The share of the evening that did not hold the frame rate is the number that
+                                 actually answers "how was it tonight". Three sessions of averages hid a
+                                 problem that this line makes obvious, so it sits next to the controls
+                                 rather than being reconstructed from the journal afterwards. -->
+                            <Border Background="#10212C" BorderBrush="#2A4356" BorderThickness="1" CornerRadius="12" Padding="12" Margin="0,4,0,4">
+                                <StackPanel>
+                                    <TextBlock Text="{x:Static props:Strings.PacingHeader}" Foreground="{StaticResource AccentBrush}" FontWeight="SemiBold" />
+                                    <TextBlock Text="{Binding PacingSaturatedText}" TextWrapping="Wrap" Margin="0,6,0,0" />
+                                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                                        <StackPanel.Style>
+                                            <Style TargetType="StackPanel">
+                                                <Setter Property="Visibility" Value="Collapsed" />
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding HasPacingData}" Value="True">
+                                                        <Setter Property="Visibility" Value="Visible" />
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </StackPanel.Style>
+                                        <TextBlock Text="{x:Static props:Strings.PacingWorstLabel}" Foreground="{StaticResource AccentMutedBrush}" FontWeight="SemiBold" />
+                                        <TextBlock Text="{Binding PacingWorstText}" Margin="4,0,0,0" />
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                                        <StackPanel.Style>
+                                            <Style TargetType="StackPanel">
+                                                <Setter Property="Visibility" Value="Collapsed" />
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding HasPacingData}" Value="True">
+                                                        <Setter Property="Visibility" Value="Visible" />
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </StackPanel.Style>
+                                        <TextBlock Text="{x:Static props:Strings.PacingCurrentLabel}" Foreground="{StaticResource AccentMutedBrush}" FontWeight="SemiBold" />
+                                        <TextBlock Text="{Binding PacingCurrentText}" Margin="4,0,0,0" />
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                                        <StackPanel.Style>
+                                            <Style TargetType="StackPanel">
+                                                <Setter Property="Visibility" Value="Collapsed" />
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding HasPacingData}" Value="True">
+                                                        <Setter Property="Visibility" Value="Visible" />
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </StackPanel.Style>
+                                        <TextBlock Text="{x:Static props:Strings.PacingCaptureBudgetLabel}" Foreground="{StaticResource AccentMutedBrush}" FontWeight="SemiBold" />
+                                        <TextBlock Text="{Binding PacingCaptureBudgetText}" Margin="4,0,0,0" />
+                                    </StackPanel>
+                                </StackPanel>
+                            </Border>
+
                             <TextBlock Text="{x:Static props:Strings.DataGroup}" Style="{StaticResource SubHeaderStyle}" />
                             <WrapPanel>
                                 <Button Content="{x:Static props:Strings.ExportLatest}" Command="{Binding ExportSelectedIncidentCommand}" />

@@ -104,9 +104,24 @@ of that size up front.
 history across all sessions. Beyond that the oldest incidents are dropped from memory and from the list —
 exported bundles are unaffected.
 
-Auto-marked incidents **never trigger deep capture**. Saving the ring buffer writes a multi-hundred-megabyte
-ETL and empties the buffer, discarding the history the next marker would have used — affordable once on
-demand and ruinous every two minutes for six hours. Manual `Severe` markers still trigger it.
+Auto-marked incidents **may trigger deep capture, but only within a budget**. Saving the ring buffer
+writes a multi-hundred-megabyte ETL and empties the buffer, so this used to be refused outright — until a
+five and a half hour session raised eighteen severe incidents and produced no trace at all, leaving every
+one of its hitch clusters unexplained. Three gates now decide, and all three have to pass: the frame has
+to reach **DeepCapture.AutoCaptureFrameTimeMs** (300 ms), captures are spaced by
+**DeepCapture.AutoCaptureCooldown** (10 min) so a burst spends one rather than twenty, and
+**DeepCapture.MaxAutoCapturesPerSession** (6) is a hard ceiling. Set `DeepCapture.CaptureAutoIncidents`
+to `false` for the old behaviour.
+
+A sustained saturation window can spend a capture too, even with no remarkable frame in it — that is the
+condition a frame time threshold structurally cannot see, and it was 104 of 391 minutes in one session.
+Manual `Severe` markers still trigger a capture outside the budget.
+
+A frame that crosses a threshold while an incident is already open **escalates that incident** rather than
+being discarded: the marker is renamed after the worst frame the window actually contains, and its severity
+can only rise. Without this the window was named after whichever frame happened to open it, which is
+systematically the smallest one. A sustained saturation incident is exempt, since its label already says
+more than any single frame inside it could.
 
 Manual marking is unchanged and still worth using: it records that a human *perceived* something, which
 the telemetry alone cannot establish.
@@ -285,7 +300,8 @@ unavailable, leaving every other collector untouched.
 
 Every session runs the standard capture. The deeper WPR capture is switched on automatically by
 `Mark Severe`; a settings checkbox can also opt normal *manual* markers into deep capture. Automatic
-incidents never start WPR, preventing recurring trace overhead during a bad session.
+incidents can start WPR within the budget described above, which keeps a bad session to a handful of
+traces rather than one every couple of minutes.
 
 ### Standard capture
 
@@ -303,9 +319,13 @@ incidents never start WPR, preventing recurring trace overhead during a bad sess
   history to an ETL, and starts a fresh one. Starting at the marker meant the trace began after the
   interesting part was already over — by the time a human presses the key or the detector classifies a
   hitch, the frames that caused it are seconds in the past.
-- **DeepCapture.RingBufferMegabytes** (256) decides how much run-up a marker can save — roughly seven
-  seconds at the event rates a stall produces. **DeepCapture.PostMarkerTail** (5 s) is how long the marker
-  waits before stopping, so the recovery is in the trace too.
+- **DeepCapture.RingBufferMegabytes** (768) decides how much run-up a marker can save. Measured rather
+  than estimated: a 256 MB capture retained 13.3 seconds of samples, about 19 MB/s, so the default buys
+  roughly forty seconds. That size is chosen to outlast human reaction time — the capture that prompted it
+  reached back 5.9 seconds and missed its own stall by 0.4, because noticing a hitch and reaching the
+  marker takes six or seven seconds. **DeepCapture.PostMarkerTail** (2 s) is how long the marker waits
+  before stopping, so the recovery is in the trace too; it is short because the session keeps recording
+  throughout it, and every second of tail displaces a second of run-up from the far end of the ring.
 - Triggered automatically on `Mark Severe`; optionally by a normal manual marker when explicitly enabled
 - **Requires the app to run as administrator.** `wpr.exe` cannot self-elevate, so the app checks up front
   and reports that clearly rather than failing part-way through and leaving a trace session running.

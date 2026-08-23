@@ -1,5 +1,18 @@
 namespace FiveMDiagnostics.Core;
 
+/// <summary>What happened when a threshold-crossing frame was offered to the incidents already open.</summary>
+public enum IncidentEscalation
+{
+    /// <summary>No incident window covered that moment, so the caller still owes the frame an incident.</summary>
+    NoOpenIncident,
+
+    /// <summary>A window covered it and already describes something at least as bad.</summary>
+    AlreadyWorse,
+
+    /// <summary>The open incident now describes this frame instead.</summary>
+    Escalated,
+}
+
 public sealed class IncidentMaterializer
 {
     private readonly object _sync = new();
@@ -16,7 +29,25 @@ public sealed class IncidentMaterializer
         _postWindow = postWindow;
     }
 
-    public IncidentMarker MarkIncident(DateTimeOffset timestamp, IncidentSeverity severity, string? label = null)
+    /// <param name="frameTimeMs">
+    /// The frame that prompted the marker, when one did. Seeds the bar <see cref="TryEscalate"/>
+    /// measures against, so a later frame has to actually be worse than the one this incident is named
+    /// after before it may rewrite the label.
+    /// </param>
+    /// <param name="allowFrameEscalation">
+    /// False for an incident that is not described by a frame time at all — a sustained saturation
+    /// window, where no single frame is remarkable and the finding is that the frame rate stopped
+    /// recovering. That label says strictly more than any frame inside it could, so letting a 40 ms
+    /// frame overwrite it loses information. It would happen on the very next suppressed frame
+    /// otherwise, because a pacing incident carries no frame time and so starts with a bar of zero that
+    /// anything at all clears.
+    /// </param>
+    public IncidentMarker MarkIncident(
+        DateTimeOffset timestamp,
+        IncidentSeverity severity,
+        string? label = null,
+        double frameTimeMs = 0,
+        bool allowFrameEscalation = true)
     {
         var marker = new IncidentMarker(
             Guid.NewGuid(),
@@ -28,7 +59,11 @@ public sealed class IncidentMaterializer
             marker,
             timestamp - _preWindow,
             timestamp + _postWindow,
-            _ringBuffer.Snapshot(timestamp - _preWindow, timestamp));
+            _ringBuffer.Snapshot(timestamp - _preWindow, timestamp))
+        {
+            WorstFrameTimeMs = frameTimeMs,
+            AllowFrameEscalation = allowFrameEscalation,
+        };
 
         lock (_sync)
         {
@@ -37,6 +72,79 @@ public sealed class IncidentMaterializer
         }
 
         return marker;
+    }
+
+    /// <summary>
+    /// Rewrites an open incident to describe a worse hitch that landed inside its window.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Incident windows span ninety seconds and the detector holds a cooldown, so at most one incident
+    /// covers any given moment. That is the right rate — a burst is one event — but it meant the window
+    /// was named after whichever frame happened to open it, which is systematically the smallest one:
+    /// a 41 ms frame opened a window, and the 1 018 ms frame nine seconds later inherited its label. In
+    /// the same session a 2 846 ms frame, the worst of the evening, was recorded nowhere at all.
+    /// </para>
+    /// <para>
+    /// So the marker is replaced rather than the incident duplicated. The identity, the window bounds
+    /// and every event collected so far are kept; only the severity and label move up to the worst frame
+    /// seen. <see cref="IncidentEscalation.AlreadyWorse"/> is what stops a long freeze from escalating
+    /// on every frame of itself.
+    /// </para>
+    /// <para>
+    /// The outcome separates "nothing was open" from "the open one is already worse", because the caller
+    /// has to react differently. The detector holds a two minute cooldown while an incident window closes
+    /// sixty seconds after its marker, so there is a minute in every cycle when a frame is suppressed and
+    /// no window exists to absorb it. Collapsing both cases into one null return dropped those frames
+    /// entirely, which is the exact loss this path was added to prevent.
+    /// </para>
+    /// </remarks>
+    public IncidentEscalation TryEscalate(
+        DateTimeOffset timestamp,
+        IncidentSeverity severity,
+        string label,
+        double frameTimeMs,
+        out IncidentMarker? escalated)
+    {
+        escalated = null;
+
+        lock (_sync)
+        {
+            if (_pending.Count == 0)
+            {
+                return IncidentEscalation.NoOpenIncident;
+            }
+
+            // Windows cannot overlap in practice, but picking the newest keeps the choice defined if the
+            // cooldown is ever configured shorter than the window.
+            var open = _pending.Values
+                .Where(item => timestamp >= item.WindowStart && timestamp <= item.WindowEnd)
+                .OrderByDescending(item => item.Marker.MarkedAt)
+                .FirstOrDefault();
+
+            if (open is null)
+            {
+                return IncidentEscalation.NoOpenIncident;
+            }
+
+            if (!open.AllowFrameEscalation || frameTimeMs <= open.WorstFrameTimeMs)
+            {
+                return IncidentEscalation.AlreadyWorse;
+            }
+
+            open.WorstFrameTimeMs = frameTimeMs;
+
+            // Severity only ever rises. An incident opened as Severe stays Severe even if the frame that
+            // escalates its label happens to classify as Normal against a baseline that has since moved.
+            escalated = open.Marker with
+            {
+                Severity = severity > open.Marker.Severity ? severity : open.Marker.Severity,
+                Label = label,
+            };
+
+            open.Marker = escalated;
+            return IncidentEscalation.Escalated;
+        }
     }
 
     public IReadOnlyList<IncidentRecord> OnTelemetry(TelemetryEvent telemetryEvent, EnvironmentMetadata environment, IReadOnlyList<ArtifactAttachment> attachments)
@@ -113,7 +221,16 @@ public sealed class IncidentMaterializer
             Events = new List<TelemetryEvent>(initialEvents);
         }
 
-        public IncidentMarker Marker { get; }
+        public IncidentMarker Marker { get; set; }
+
+        /// <summary>
+        /// Worst frame this incident has been told about, so escalation is monotonic and a single long
+        /// freeze rewrites the marker once rather than on every frame it spans.
+        /// </summary>
+        public double WorstFrameTimeMs { get; set; }
+
+        /// <summary>Whether a frame time may rename this incident at all. See MarkIncident.</summary>
+        public bool AllowFrameEscalation { get; set; } = true;
 
         public DateTimeOffset WindowStart { get; }
 

@@ -39,6 +39,18 @@ public static class Strings
     public static string CaptureFeedbackReadyWithPendingFormat => ResourceManager.GetString("CaptureFeedbackReadyWithPendingFormat", Culture) ?? "{0} is now ready. There are still {1} capture(s) being collected.";
     public static string CaptureFeedbackSyntheticReady => ResourceManager.GetString("CaptureFeedbackSyntheticReady", Culture) ?? "Synthetic incident created immediately for testing.";
 
+    public static string PacingHeader => ResourceManager.GetString("PacingHeader", Culture) ?? "Frame pacing this session";
+    public static string PacingIdle => ResourceManager.GetString("PacingIdle", Culture) ?? "No frame pacing data yet. The first window closes after a minute of frames.";
+    public static string PacingSaturatedLabel => ResourceManager.GetString("PacingSaturatedLabel", Culture) ?? "Could not hold the frame rate:";
+    public static string PacingWorstLabel => ResourceManager.GetString("PacingWorstLabel", Culture) ?? "Worst minute:";
+    public static string PacingCurrentLabel => ResourceManager.GetString("PacingCurrentLabel", Culture) ?? "Right now:";
+    public static string PacingCaptureBudgetLabel => ResourceManager.GetString("PacingCaptureBudgetLabel", Culture) ?? "Deep captures left:";
+    public static string PacingSaturatedFormat => ResourceManager.GetString("PacingSaturatedFormat", Culture) ?? "{0} of {1} min ({2}), {3} marginal. Longest unbroken stretch {4} min.";
+    public static string PacingWorstFormat => ResourceManager.GetString("PacingWorstFormat", Culture) ?? "{0} fps against a target of {1}";
+    public static string PacingCurrentFormat => ResourceManager.GetString("PacingCurrentFormat", Culture) ?? "{0} — {1} fps, CPU headroom {2} ms";
+    public static string PacingCurrentNoHeadroomFormat => ResourceManager.GetString("PacingCurrentNoHeadroomFormat", Culture) ?? "{0} — {1} fps";
+    public static string PacingCaptureBudgetFormat => ResourceManager.GetString("PacingCaptureBudgetFormat", Culture) ?? "{0} of {1}";
+
     public static string ControlsHeader => ResourceManager.GetString("ControlsHeader", Culture) ?? "Controls";
     public static string SessionGroup => ResourceManager.GetString("SessionGroup", Culture) ?? "Quick start";
     public static string StartSession => ResourceManager.GetString("StartSession", Culture) ?? "Start session";

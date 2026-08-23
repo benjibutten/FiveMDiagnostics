@@ -1,4 +1,5 @@
 using System.IO.Compression;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -98,7 +99,7 @@ public sealed class IncidentBundleExporter : IIncidentExporter
         builder.AppendLine($"Window: {incident.WindowStart:O} -> {incident.WindowEnd:O}");
         builder.AppendLine($"Server profile: {incident.Environment.ServerProfileName}");
         var health = BuildCaptureHealth(incident);
-        builder.AppendLine($"Capture health: {health.FrameCount} frames, range {health.FirstFrameAt:O} -> {health.LastFrameAt:O} ({health.FrameSpanSeconds:F1} s), incident gaps {health.GapCount}, largest incident gap {health.LargestGapSeconds:F2} s, session restarts at incident end {health.SessionRestartCountAtEnd}.");
+        builder.AppendLine(FormattableString.Invariant($"Capture health: {health.FrameCount} frames, range {health.FirstFrameAt:O} -> {health.LastFrameAt:O} ({health.FrameSpanSeconds:F1} s), incident gaps {health.GapCount}, largest incident gap {health.LargestGapSeconds:F2} s, session restarts at incident end {health.SessionRestartCountAtEnd}."));
         builder.AppendLine($"Window coverage: pre-buffer {(health.PreWindowCovered ? "complete" : "incomplete")}, post-window {(health.PostWindowCovered ? "complete" : "incomplete")}, full window {(health.FullWindowCovered ? "yes" : "no")}.");
         builder.AppendLine();
         builder.AppendLine(incident.Analysis?.Summary ?? "Ingen analys kördes före export.");
@@ -107,7 +108,7 @@ public sealed class IncidentBundleExporter : IIncidentExporter
 
         foreach (var hypothesis in incident.Analysis?.Hypotheses.Take(5) ?? [])
         {
-            builder.AppendLine($"- {hypothesis.Category}: {hypothesis.Confidence:P0}");
+            builder.AppendLine(FormattableString.Invariant($"- {hypothesis.Category}: {hypothesis.Confidence:P0}"));
             foreach (var evidence in hypothesis.Evidence)
             {
                 builder.AppendLine($"  * {evidence}");
@@ -244,16 +245,16 @@ public sealed class IncidentBundleExporter : IIncidentExporter
         {
             FrameTelemetrySample frame =>
             [
-                ("frameTimeMs", frame.FrameTimeMs.ToString("F2")),
-                ("cpuBusyMs", frame.CpuBusyMs?.ToString("F2") ?? string.Empty),
-                ("cpuWaitMs", frame.CpuWaitMs?.ToString("F2") ?? string.Empty),
-                ("gpuBusyMs", frame.GpuBusyMs?.ToString("F2") ?? string.Empty),
-                ("gpuWaitMs", frame.GpuWaitMs?.ToString("F2") ?? string.Empty),
-                ("gpuLatencyMs", frame.GpuLatencyMs?.ToString("F2") ?? string.Empty),
-                ("displayLatencyMs", frame.DisplayLatencyMs?.ToString("F2") ?? string.Empty),
-                ("flipDelayMs", frame.FlipDelayMs?.ToString("F2") ?? string.Empty),
-                ("inputLatencyMs", frame.InputLatencyMs?.ToString("F2") ?? string.Empty),
-                ("msBetweenDisplayChange", frame.MsBetweenDisplayChange?.ToString("F2") ?? string.Empty),
+                ("frameTimeMs", frame.FrameTimeMs.ToString("F2", CultureInfo.InvariantCulture)),
+                ("cpuBusyMs", frame.CpuBusyMs?.ToString("F2", CultureInfo.InvariantCulture) ?? string.Empty),
+                ("cpuWaitMs", frame.CpuWaitMs?.ToString("F2", CultureInfo.InvariantCulture) ?? string.Empty),
+                ("gpuBusyMs", frame.GpuBusyMs?.ToString("F2", CultureInfo.InvariantCulture) ?? string.Empty),
+                ("gpuWaitMs", frame.GpuWaitMs?.ToString("F2", CultureInfo.InvariantCulture) ?? string.Empty),
+                ("gpuLatencyMs", frame.GpuLatencyMs?.ToString("F2", CultureInfo.InvariantCulture) ?? string.Empty),
+                ("displayLatencyMs", frame.DisplayLatencyMs?.ToString("F2", CultureInfo.InvariantCulture) ?? string.Empty),
+                ("flipDelayMs", frame.FlipDelayMs?.ToString("F2", CultureInfo.InvariantCulture) ?? string.Empty),
+                ("inputLatencyMs", frame.InputLatencyMs?.ToString("F2", CultureInfo.InvariantCulture) ?? string.Empty),
+                ("msBetweenDisplayChange", frame.MsBetweenDisplayChange?.ToString("F2", CultureInfo.InvariantCulture) ?? string.Empty),
                 ("presentMode", frame.PresentMode ?? string.Empty),
                 ("dropped", frame.Dropped.ToString()),
             ],
@@ -261,33 +262,33 @@ public sealed class IncidentBundleExporter : IIncidentExporter
             [
                 ("isAvailable", gpu.IsAvailable.ToString()),
                 ("adapterName", gpu.AdapterName ?? string.Empty),
-                ("utilizationPercent", gpu.UtilizationPercent?.ToString("F0") ?? string.Empty),
-                ("vramUsedBytes", gpu.UsedVramBytes?.ToString() ?? string.Empty),
-                ("vramTotalBytes", gpu.TotalVramBytes?.ToString() ?? string.Empty),
-                ("vramUsagePercent", gpu.VramUsagePercent?.ToString("F1") ?? string.Empty),
-                ("encoderUtilizationPercent", gpu.EncoderUtilizationPercent?.ToString("F0") ?? string.Empty),
-                ("decoderUtilizationPercent", gpu.DecoderUtilizationPercent?.ToString("F0") ?? string.Empty),
-                ("temperatureCelsius", gpu.TemperatureCelsius?.ToString() ?? string.Empty),
+                ("utilizationPercent", gpu.UtilizationPercent?.ToString("F0", CultureInfo.InvariantCulture) ?? string.Empty),
+                ("vramUsedBytes", gpu.UsedVramBytes?.ToString(CultureInfo.InvariantCulture) ?? string.Empty),
+                ("vramTotalBytes", gpu.TotalVramBytes?.ToString(CultureInfo.InvariantCulture) ?? string.Empty),
+                ("vramUsagePercent", gpu.VramUsagePercent?.ToString("F1", CultureInfo.InvariantCulture) ?? string.Empty),
+                ("encoderUtilizationPercent", gpu.EncoderUtilizationPercent?.ToString("F0", CultureInfo.InvariantCulture) ?? string.Empty),
+                ("decoderUtilizationPercent", gpu.DecoderUtilizationPercent?.ToString("F0", CultureInfo.InvariantCulture) ?? string.Empty),
+                ("temperatureCelsius", gpu.TemperatureCelsius?.ToString(CultureInfo.InvariantCulture) ?? string.Empty),
                 ("throttleReasons", string.Join(';', gpu.ThrottleReasons)),
             ],
             SystemTelemetrySample system => FlattenSystem(system),
             ProcessTelemetrySample process =>
             [
                 ("processName", process.ProcessName),
-                ("cpuUsagePercent", process.CpuUsagePercent.ToString("F1")),
-                ("privateBytes", process.PrivateBytes.ToString()),
-                ("workingSetBytes", process.WorkingSetBytes.ToString()),
-                ("threadCount", process.ThreadCount.ToString()),
-                ("readBytesPerSecond", process.ReadBytesPerSecond.ToString()),
-                ("writeBytesPerSecond", process.WriteBytesPerSecond.ToString()),
+                ("cpuUsagePercent", process.CpuUsagePercent.ToString("F1", CultureInfo.InvariantCulture)),
+                ("privateBytes", process.PrivateBytes.ToString(CultureInfo.InvariantCulture)),
+                ("workingSetBytes", process.WorkingSetBytes.ToString(CultureInfo.InvariantCulture)),
+                ("threadCount", process.ThreadCount.ToString(CultureInfo.InvariantCulture)),
+                ("readBytesPerSecond", process.ReadBytesPerSecond.ToString(CultureInfo.InvariantCulture)),
+                ("writeBytesPerSecond", process.WriteBytesPerSecond.ToString(CultureInfo.InvariantCulture)),
             ],
             ObsTelemetrySample obs =>
             [
                 ("isConnected", obs.IsConnected.ToString()),
-                ("activeFps", obs.ActiveFps?.ToString("F1") ?? string.Empty),
-                ("averageFrameRenderTimeMs", obs.AverageFrameRenderTimeMs?.ToString("F1") ?? string.Empty),
-                ("renderSkippedFrames", obs.RenderSkippedFrames?.ToString() ?? string.Empty),
-                ("outputSkippedFrames", obs.OutputSkippedFrames?.ToString() ?? string.Empty),
+                ("activeFps", obs.ActiveFps?.ToString("F1", CultureInfo.InvariantCulture) ?? string.Empty),
+                ("averageFrameRenderTimeMs", obs.AverageFrameRenderTimeMs?.ToString("F1", CultureInfo.InvariantCulture) ?? string.Empty),
+                ("renderSkippedFrames", obs.RenderSkippedFrames?.ToString(CultureInfo.InvariantCulture) ?? string.Empty),
+                ("outputSkippedFrames", obs.OutputSkippedFrames?.ToString(CultureInfo.InvariantCulture) ?? string.Empty),
                 ("isProcessRunning", obs.IsProcessRunning.ToString()),
                 ("isWebSocketConnected", obs.IsConnected.ToString()),
                 ("isStreaming", obs.IsStreaming.ToString()),
@@ -295,14 +296,14 @@ public sealed class IncidentBundleExporter : IIncidentExporter
             ],
             CaptureHealthTelemetrySample health =>
             [
-                ("frameCount", health.FrameCount.ToString()),
-                ("firstFrameAt", health.FirstFrameAt?.ToString("O") ?? string.Empty),
-                ("lastFrameAt", health.LastFrameAt?.ToString("O") ?? string.Empty),
-                ("largestFrameGapSeconds", health.LargestFrameGapSeconds.ToString("F3")),
-                ("continuousFrameSpanSeconds", health.ContinuousFrameSpanSeconds.ToString("F1")),
-                ("restartCount", health.RestartCount.ToString()),
+                ("frameCount", health.FrameCount.ToString(CultureInfo.InvariantCulture)),
+                ("firstFrameAt", health.FirstFrameAt?.ToString("O", CultureInfo.InvariantCulture) ?? string.Empty),
+                ("lastFrameAt", health.LastFrameAt?.ToString("O", CultureInfo.InvariantCulture) ?? string.Empty),
+                ("largestFrameGapSeconds", health.LargestFrameGapSeconds.ToString("F3", CultureInfo.InvariantCulture)),
+                ("continuousFrameSpanSeconds", health.ContinuousFrameSpanSeconds.ToString("F1", CultureInfo.InvariantCulture)),
+                ("restartCount", health.RestartCount.ToString(CultureInfo.InvariantCulture)),
                 ("captureProcessRunning", health.CaptureProcessRunning.ToString()),
-                ("frameGapCount", health.FrameGapCount.ToString()),
+                ("frameGapCount", health.FrameGapCount.ToString(CultureInfo.InvariantCulture)),
             ],
             NetworkEndpointSample network =>
             [
@@ -313,14 +314,14 @@ public sealed class IncidentBundleExporter : IIncidentExporter
             [
                 ("host", probe.Host),
                 ("success", probe.Success.ToString()),
-                ("rttMs", probe.RoundTripTimeMs?.ToString("F1") ?? string.Empty),
+                ("rttMs", probe.RoundTripTimeMs?.ToString("F1", CultureInfo.InvariantCulture) ?? string.Empty),
                 ("failureReason", probe.FailureReason ?? string.Empty),
             ],
             ArtifactEvidence artifact =>
             [
                 ("kind", artifact.Kind.ToString()),
                 ("summary", artifact.Summary),
-                ("metrics", string.Join(';', artifact.Metrics.Select(item => $"{item.Key}={item.Value:F2}"))),
+                ("metrics", string.Join(';', artifact.Metrics.Select(item => FormattableString.Invariant($"{item.Key}={item.Value:F2}")))),
             ],
             _ => [("summary", telemetryEvent.Source)],
         };
@@ -328,17 +329,17 @@ public sealed class IncidentBundleExporter : IIncidentExporter
 
     private static IEnumerable<(string Key, string Value)> FlattenSystem(SystemTelemetrySample system)
     {
-        yield return ("totalCpuUsagePercent", system.TotalCpuUsagePercent.ToString("F1"));
-        yield return ("memoryCommitPercent", system.MemoryCommitPercent.ToString("F1"));
-        yield return ("availableMemoryMb", system.AvailableMemoryMb.ToString());
-        yield return ("diskAverageLatencyMs", system.DiskAverageLatencyMs?.ToString("F2") ?? string.Empty);
-        yield return ("diskQueueLength", system.DiskQueueLength?.ToString("F2") ?? string.Empty);
-        yield return ("hardFaultPagesPerSecond", system.HardFaultPagesPerSecond?.ToString("F2") ?? string.Empty);
-        yield return ("topCpuProcesses", string.Join(';', system.TopCpuProcesses.Select(item => $"{item.ProcessName}:{item.CpuPercent:F1}%")));
-        yield return ("topDiskProcesses", string.Join(';', system.TopDiskProcesses.Select(item => $"{item.ProcessName}:{item.IoBytesPerSecond}")));
+        yield return ("totalCpuUsagePercent", system.TotalCpuUsagePercent.ToString("F1", CultureInfo.InvariantCulture));
+        yield return ("memoryCommitPercent", system.MemoryCommitPercent.ToString("F1", CultureInfo.InvariantCulture));
+        yield return ("availableMemoryMb", system.AvailableMemoryMb.ToString(CultureInfo.InvariantCulture));
+        yield return ("diskAverageLatencyMs", system.DiskAverageLatencyMs?.ToString("F2", CultureInfo.InvariantCulture) ?? string.Empty);
+        yield return ("diskQueueLength", system.DiskQueueLength?.ToString("F2", CultureInfo.InvariantCulture) ?? string.Empty);
+        yield return ("hardFaultPagesPerSecond", system.HardFaultPagesPerSecond?.ToString("F2", CultureInfo.InvariantCulture) ?? string.Empty);
+        yield return ("topCpuProcesses", string.Join(';', system.TopCpuProcesses.Select(item => FormattableString.Invariant($"{item.ProcessName}:{item.CpuPercent:F1}%"))));
+        yield return ("topDiskProcesses", string.Join(';', system.TopDiskProcesses.Select(item => FormattableString.Invariant($"{item.ProcessName}:{item.IoBytesPerSecond}"))));
         foreach (var core in system.PerCoreUsagePercent.OrderBy(item => item.Key, StringComparer.OrdinalIgnoreCase))
         {
-            yield return ($"cpuCore.{core.Key}.usagePercent", core.Value.ToString("F1"));
+            yield return ($"cpuCore.{core.Key}.usagePercent", core.Value.ToString("F1", CultureInfo.InvariantCulture));
         }
     }
 

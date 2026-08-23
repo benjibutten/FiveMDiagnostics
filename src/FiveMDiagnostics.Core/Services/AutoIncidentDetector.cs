@@ -1,7 +1,72 @@
 namespace FiveMDiagnostics.Core;
 
+/// <summary>What kind of observation crossed a threshold.</summary>
+public enum AutoIncidentKind
+{
+    /// <summary>A frame whose time is the measurement, and which <see cref="AutoIncidentTrigger.FrameTimeMs"/> describes.</summary>
+    FrameTime,
+
+    /// <summary>
+    /// A run of frames that never reached the screen. The visible freeze is the run, not any one frame:
+    /// each present looks healthy and carries an ordinary frame time, so anything downstream that judges
+    /// severity by <see cref="AutoIncidentTrigger.FrameTimeMs"/> would rank a freeze below a mild spike.
+    /// </summary>
+    DroppedFrameRun,
+}
+
 /// <summary>Why the detector decided to mark an incident on its own.</summary>
-public sealed record AutoIncidentTrigger(IncidentSeverity Severity, string Label);
+/// <param name="FrameTimeMs">
+/// The frame that crossed the threshold. Carried because two decisions downstream need the magnitude
+/// rather than the category: whether the hitch is worth spending a deep capture on, and whether it is
+/// worse than the incident already open over this moment. Not meaningful for
+/// <see cref="AutoIncidentKind.DroppedFrameRun"/>, where the frame times are normal by construction.
+/// </param>
+public sealed record AutoIncidentTrigger(
+    IncidentSeverity Severity,
+    string Label,
+    double FrameTimeMs = 0,
+    AutoIncidentKind Kind = AutoIncidentKind.FrameTime);
+
+/// <summary>Why the detector declined to act on a threshold-crossing frame.</summary>
+public enum AutoIncidentSuppression
+{
+    /// <summary>Not suppressed; the detector raised this one.</summary>
+    None,
+
+    /// <summary>
+    /// Too soon after the last incident. This expires: once the previous incident window has closed, a
+    /// new incident would describe telemetry nothing else has looked at, so the caller may still act.
+    /// </summary>
+    Cooldown,
+
+    /// <summary>
+    /// The rolling incident budget is spent. This is a hard rate ceiling rather than a spacing rule, so
+    /// the caller must not raise an incident for it under any circumstances — the whole point of the
+    /// budget is that a bad hour cannot flood the session with incidents.
+    /// </summary>
+    BudgetExhausted,
+}
+
+/// <summary>
+/// A frame that crossed a threshold, and whether the detector was allowed to act on it.
+/// </summary>
+/// <remarks>
+/// Suppressed triggers used to be indistinguishable from quiet frames: the detector returned null for
+/// both, so a catastrophic frame arriving inside an open incident's window vanished. A 2 846 ms frame —
+/// the worst of its whole session — left no trace anywhere because a 41 ms frame had opened a window
+/// nine seconds earlier. Reporting the suppression separately lets the caller escalate the incident
+/// that is already running instead of losing the observation.
+/// <para>
+/// The reason is part of the report because the two are not interchangeable. A cooldown is a spacing
+/// rule that expires; an exhausted budget is the ceiling that keeps a bad hour from flooding the
+/// session. Reporting both as a plain "suppressed" let the caller raise incidents past the budget,
+/// which is the one thing the budget exists to prevent.
+/// </para>
+/// </remarks>
+public sealed record AutoIncidentObservation(AutoIncidentTrigger Trigger, AutoIncidentSuppression Suppression)
+{
+    public bool IsSuppressed => Suppression != AutoIncidentSuppression.None;
+}
 
 /// <summary>
 /// Decides, frame by frame, when a stutter is bad enough to materialize an incident without the user
@@ -14,10 +79,10 @@ public sealed record AutoIncidentTrigger(IncidentSeverity Severity, string Label
 /// manual marker still records that a human perceived something, which is evidence the telemetry alone
 /// cannot supply.
 /// <para>
-/// Auto-marked incidents deliberately never trigger deep capture. Saving the ring buffer writes a
-/// multi hundred megabyte ETL and restarts the background session, discarding the history it had
-/// accumulated — acceptable once when the user asks for it, ruinous every couple of minutes for six
-/// hours.
+/// Auto-marked incidents may now save a deep capture, but only through the budget in
+/// <see cref="DeepCaptureOptions.MaxAutoCapturesPerSession"/>. Saving the ring buffer writes a multi
+/// hundred megabyte ETL and leaves the background session empty until it refills, so this is rationed
+/// to the few frames catastrophic enough to be worth one — not granted to every incident.
 /// </para>
 /// </remarks>
 public sealed class AutoIncidentDetector
@@ -74,10 +139,16 @@ public sealed class AutoIncidentDetector
     public int TriggersInCurrentWindow => _triggersInWindow.Count;
 
     /// <summary>
-    /// Feeds one presented frame in and returns a trigger when this frame crosses a threshold. Returns
-    /// null on every other frame, which is the overwhelming majority of calls.
+    /// Feeds one presented frame in and returns an observation when this frame crosses a threshold.
+    /// Returns null on every other frame, which is the overwhelming majority of calls.
     /// </summary>
-    public AutoIncidentTrigger? Observe(FrameTelemetrySample sample)
+    /// <remarks>
+    /// Classification now happens before the cooldown and budget gates rather than after them, so a
+    /// frame that crossed a threshold is reported either way — as a trigger to act on, or as a
+    /// suppressed observation the caller can fold into the incident already open. Only an unsuppressed
+    /// trigger spends budget or resets the cooldown.
+    /// </remarks>
+    public AutoIncidentObservation? Observe(FrameTelemetrySample sample)
     {
         RecordFrameTime(sample.FrameTimeMs);
 
@@ -95,19 +166,9 @@ public sealed class AutoIncidentDetector
             return null;
         }
 
-        if (!HasBudget(sample.Timestamp))
-        {
-            return null;
-        }
-
         // Without a settled baseline every threshold is guesswork, and the first seconds after a level
         // load are the least representative frames of the whole session.
         if (_sampleCount < _options.MinimumSamples)
-        {
-            return null;
-        }
-
-        if (_lastTriggerAt is { } last && sample.Timestamp - last < _options.Cooldown)
         {
             return null;
         }
@@ -118,11 +179,24 @@ public sealed class AutoIncidentDetector
             return null;
         }
 
+        // Deliberately leaves _droppedRun standing in both suppressed paths. A freeze that is still going
+        // has not ended just because it fell inside a cooldown, and clearing the run here would make the
+        // observation stop being reported halfway through the very stall it describes.
+        if (_lastTriggerAt is { } last && sample.Timestamp - last < _options.Cooldown)
+        {
+            return new AutoIncidentObservation(trigger, AutoIncidentSuppression.Cooldown);
+        }
+
+        if (!HasBudget(sample.Timestamp))
+        {
+            return new AutoIncidentObservation(trigger, AutoIncidentSuppression.BudgetExhausted);
+        }
+
         _lastTriggerAt = sample.Timestamp;
         _triggersInWindow.Enqueue(sample.Timestamp);
         _triggerCount++;
         _droppedRun = 0;
-        return trigger;
+        return new AutoIncidentObservation(trigger, AutoIncidentSuppression.None);
     }
 
     /// <summary>
@@ -152,14 +226,16 @@ public sealed class AutoIncidentDetector
         {
             return new AutoIncidentTrigger(
                 IncidentSeverity.Severe,
-                $"Auto: {sample.FrameTimeMs:F0} ms frame (baslinje {baseline:F1} ms)");
+                $"Auto: {sample.FrameTimeMs:F0} ms frame (baslinje {baseline:F1} ms)",
+                sample.FrameTimeMs);
         }
 
         if (sample.FrameTimeMs >= baseline * _options.SpikeMultiplier)
         {
             return new AutoIncidentTrigger(
                 IncidentSeverity.Normal,
-                $"Auto: {sample.FrameTimeMs:F0} ms frame (baslinje {baseline:F1} ms)");
+                $"Auto: {sample.FrameTimeMs:F0} ms frame (baslinje {baseline:F1} ms)",
+                sample.FrameTimeMs);
         }
 
         // A run of frames that never reached the screen is a visible freeze even when each individual
@@ -168,7 +244,9 @@ public sealed class AutoIncidentDetector
         {
             return new AutoIncidentTrigger(
                 IncidentSeverity.Normal,
-                $"Auto: {_droppedRun} frames i rad nådde aldrig skärmen");
+                $"Auto: {_droppedRun} frames i rad nådde aldrig skärmen",
+                sample.FrameTimeMs,
+                AutoIncidentKind.DroppedFrameRun);
         }
 
         return null;

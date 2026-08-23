@@ -20,18 +20,71 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
 
     public async Task RunAsync(CollectorContext context, CancellationToken cancellationToken)
     {
-        while (!cancellationToken.IsCancellationRequested)
+        var sessionStart = context.UtcNow();
+        var everConnected = false;
+
+        try
         {
-            if (context.ProcessResolver.TryGetTargetProcess() is not null)
+            while (!cancellationToken.IsCancellationRequested)
             {
-                var sample = await PollAsync(context.Settings.Obs, cancellationToken).ConfigureAwait(false);
-                await context.Writer.WriteAsync(sample, cancellationToken).ConfigureAwait(false);
+                if (context.ProcessResolver.TryGetTargetProcess() is not null)
+                {
+                    var sample = await PollAsync(context.Settings.Obs, cancellationToken).ConfigureAwait(false);
+                    everConnected |= sample.IsConnected;
+                    await context.Writer.WriteAsync(sample, cancellationToken).ConfigureAwait(false);
+                }
+
+                await Task.Delay(context.Settings.Obs.PollingInterval, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            // Runs on the way out, cancellation included, because that is when the session is ending and
+            // the pointer is worth having. Reported rather than sampled: OBS writes its lag totals when
+            // an output stops, which is usually a minute or two after the diagnostics session, so the
+            // numbers are genuinely not available yet and the honest thing is to say where they will be.
+            if (!everConnected)
+            {
+                ReportLogFallback(context, sessionStart);
             }
 
-            await Task.Delay(context.Settings.Obs.PollingInterval, cancellationToken).ConfigureAwait(false);
+            await ResetSocketAsync().ConfigureAwait(false);
         }
+    }
 
-        await ResetSocketAsync().ConfigureAwait(false);
+    /// <summary>
+    /// Names the OBS log that covers this session, so the render and encoding lag figures can be
+    /// recovered by importing it even though the WebSocket never connected.
+    /// </summary>
+    /// <remarks>
+    /// Four sessions running, the WebSocket was not connected for a single incident, and the render and
+    /// encoding lag were simply absent from every report. OBS had been writing them to a text file the
+    /// whole time. This does not make the file into telemetry — one figure for a whole session cannot be
+    /// lined up against an incident — but it turns "no OBS data" into "here is where the OBS data is".
+    /// </remarks>
+    private void ReportLogFallback(CollectorContext context, DateTimeOffset sessionStart)
+    {
+        try
+        {
+            var summary = ObsSessionLogReader.TryReadLatest(sessionStart, context.UtcNow());
+            if (summary is null)
+            {
+                return;
+            }
+
+            context.StatusSink.Report(
+                StatusLevel.Info,
+                Name,
+                $"OBS WebSocket var aldrig ansluten, så render- och encoding lag saknas per incident. OBS egen logg "
+                + $"({summary.LogPath}) täcker sessionen — importera den som artefakt när streamen avslutats. "
+                + $"Nuvarande innehåll: {summary.Describe()}");
+        }
+        catch (Exception ex)
+        {
+            // A missing or unreadable log is not a session failure; it just means the fallback has
+            // nothing to offer.
+            context.StatusSink.Report(StatusLevel.Info, Name, $"OBS-loggen kunde inte läsas: {ex.Message}");
+        }
     }
 
     public void Dispose()

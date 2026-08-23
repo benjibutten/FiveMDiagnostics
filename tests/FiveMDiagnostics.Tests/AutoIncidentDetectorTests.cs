@@ -59,20 +59,25 @@ public sealed class AutoIncidentDetectorTests
         Assert.InRange(detector.BaselineMs, 16.0, 17.5);
     }
 
+    /// <summary>
+    /// The cooldown still allows only one incident, but the frame it suppresses is now reported rather
+    /// than discarded — the session manager folds it into the incident already open. Losing it entirely
+    /// is how a 2 846 ms frame, the worst of its session, ended up recorded nowhere.
+    /// </summary>
     [Fact]
-    public void CooldownSuppressesTheSecondSpike()
+    public void CooldownSuppressesTheSecondSpikeButStillReportsIt()
     {
         var detector = new AutoIncidentDetector(
             new AutoDetectOptions { Cooldown = TimeSpan.FromMinutes(2) },
             60);
 
         var timestamp = Start;
-        AutoIncidentTrigger? first = null;
-        AutoIncidentTrigger? second = null;
+        AutoIncidentObservation? first = null;
+        AutoIncidentObservation? second = null;
 
         for (var i = 0; i < 400; i++)
         {
-            // Two spikes twenty seconds apart; only the first should survive the cooldown.
+            // Two spikes twenty seconds apart; only the first may raise an incident.
             var frameTimeMs = i is 200 or 250 ? 60 : 16.7;
             var result = detector.Observe(Frame(timestamp, frameTimeMs));
             if (i == 200)
@@ -88,7 +93,14 @@ public sealed class AutoIncidentDetectorTests
         }
 
         Assert.NotNull(first);
-        Assert.Null(second);
+        Assert.False(first!.IsSuppressed);
+
+        Assert.NotNull(second);
+        Assert.True(second!.IsSuppressed);
+        Assert.Equal(60, second.Trigger.FrameTimeMs, 1);
+
+        // Suppressed observations must not spend the budget, or a burst would disarm the detector.
+        Assert.Equal(1, detector.TriggerCount);
     }
 
     [Fact]
@@ -185,15 +197,16 @@ public sealed class AutoIncidentDetectorTests
         }
 
         // Frame times stay healthy — only the display path is stalled.
-        AutoIncidentTrigger? trigger = null;
+        AutoIncidentObservation? observation = null;
         for (var i = 0; i < 3; i++)
         {
-            trigger = detector.Observe(Frame(timestamp, 16.7, dropped: true));
+            observation = detector.Observe(Frame(timestamp, 16.7, dropped: true));
             timestamp = timestamp.AddMilliseconds(16.7);
         }
 
-        Assert.NotNull(trigger);
-        Assert.Contains("aldrig skärmen", trigger!.Label);
+        Assert.NotNull(observation);
+        Assert.False(observation!.IsSuppressed);
+        Assert.Contains("aldrig skärmen", observation.Trigger.Label);
     }
 
     [Fact]
@@ -207,10 +220,15 @@ public sealed class AutoIncidentDetectorTests
         Assert.Equal(0, detector.TriggerCount);
     }
 
+    /// <summary>
+    /// Returns the trigger the detector acted on, so a suppressed observation reads as "nothing fired"
+    /// here exactly as a null did before <see cref="AutoIncidentObservation"/> existed. Tests that care
+    /// about suppression call <see cref="AutoIncidentDetector.Observe"/> directly.
+    /// </summary>
     private static AutoIncidentTrigger? Feed(AutoIncidentDetector detector, int frameCount, double frameTimeMs, double finalFrameMs)
     {
         var timestamp = Start;
-        AutoIncidentTrigger? last = null;
+        AutoIncidentObservation? last = null;
 
         for (var i = 0; i < frameCount; i++)
         {
@@ -219,7 +237,7 @@ public sealed class AutoIncidentDetectorTests
             timestamp = timestamp.AddMilliseconds(value);
         }
 
-        return last;
+        return last is { IsSuppressed: false } ? last.Trigger : null;
     }
 
     private static FrameTelemetrySample Frame(DateTimeOffset timestamp, double frameTimeMs, bool dropped = false)

@@ -144,12 +144,30 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         var gpuBound = 0;
         var presentBound = 0;
 
+        // Time as well as count. Counting spikes gives a 1 258 ms frame and a 34 ms frame one vote each,
+        // which is how a window whose entire lost time was one CPU-bound stall came out at "6 of 12
+        // CPU-bound" and let a storage verdict through. What the player lost is milliseconds, so the
+        // share that decides an attribution has to be measured in them.
+        //
+        // The denominator is every spike, not merely the ones an attribution could be made for.
+        // Dividing by the classified time instead would let a window with one CPU-bound frame and
+        // eleven unattributable ones report 100% CPU-bound, which is a claim about 1/12 of the
+        // evidence. Unknown time counts against the CPU share, so thin attribution coverage
+        // produces a low share and the cap below simply does not fire — which is the conservative
+        // direction, and the same way the count-based share behaved before this.
+        var totalSpikeMs = 0d;
+        var cpuBoundMs = 0d;
+
         foreach (var spike in spikes)
         {
-            switch (ClassifySpike(spike, baseline))
+            var kind = ClassifySpike(spike, baseline);
+            totalSpikeMs += spike.FrameTimeMs;
+
+            switch (kind)
             {
                 case SpikeKind.CpuBound:
                     cpuBound++;
+                    cpuBoundMs += spike.FrameTimeMs;
                     break;
                 case SpikeKind.GpuBound:
                     gpuBound++;
@@ -176,6 +194,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             cpuBound,
             gpuBound,
             presentBound,
+            cpuBoundMs,
+            totalSpikeMs,
             frameSamples.Select(item => item.CpuBusyMs ?? 0).DefaultIfEmpty().Max(),
             frameSamples.Select(item => item.GpuBusyMs ?? 0).DefaultIfEmpty().Max(),
             frameSamples.Select(item => item.GpuWaitMs ?? 0).DefaultIfEmpty().Max(),
@@ -771,22 +791,39 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             // so the ceiling has to reflect their absence rather than the tally of what remained.
             var ceiling = hasDiskCounterData ? MeasuredConfidenceCeiling : FallbackConfidenceCeiling;
 
-            // Per-frame attribution outranks every circumstantial storage signal there is. A stalled
-            // disk stalls a frame by making the CPU wait, so a window whose spikes are overwhelmingly
-            // CPU-busy has already ruled storage out — the disk cannot be the cause of a frame the CPU
-            // spent computing. Throughput and a busy neighbour still produced 57 top-ranked disk
-            // verdicts in a session where 98% of the spikes were CPU-bound, and this is what stops that
-            // happening rather than another adjustment to the individual thresholds.
-            if (metrics.HasCpuGpuBreakdown && metrics.SpikeCount > 0 && !hasMeasuredStallSignal)
+            // Per-frame attribution outranks every storage signal there is, the measured ones included.
+            // A stalled disk stalls a frame by making the CPU wait; time the CPU spent executing is time
+            // it was not blocked on storage, so a window whose lost time is overwhelmingly CPU-busy has
+            // already ruled storage out no matter what the disk counters read. Concurrent is not causal:
+            // the counters are a window maximum over ninety seconds, and a latency peak somewhere in
+            // that window says nothing about the frame that actually hitched.
+            //
+            // This deliberately applies even when hasMeasuredStallSignal is set. Restricting it to
+            // windows without measured signals was the earlier version of this rule, and it left the
+            // exact case it was written for untouched — the incident that scored 88% had both a latency
+            // reading and a 1 258 ms frame whose CPU was busy for 1 242 ms of it.
+            if (metrics.HasCpuGpuBreakdown && metrics.SpikeCount > 0)
             {
                 var cpuBoundShare = (double)metrics.CpuBoundSpikes / metrics.SpikeCount;
-                if (cpuBoundShare >= DecisiveAttributionShare)
+
+                // Weighted by time first, and by count only as a fallback when nothing could be
+                // attributed. Counting treats a 1 258 ms stall and a 34 ms wobble as one vote each,
+                // which is how a window that lost 1.4 seconds — 95% of it inside a single CPU-bound
+                // frame — scored 50% by count and let the storage verdict stand. Milliseconds are what
+                // the player lost, so milliseconds are what the attribution is measured in.
+                var decisiveShare = metrics.CpuBoundTimeShare ?? cpuBoundShare;
+                if (decisiveShare >= DecisiveAttributionShare)
                 {
                     ceiling = Math.Min(ceiling, ContradictedConfidenceCeiling);
+
+                    var counterNote = hasMeasuredStallSignal
+                        ? "Disksignalerna i fönstret är samtidiga, men kan inte förklara en frame som CPU:n tillbringade med att räkna"
+                        : "Ingen disklatens, diskkö eller paging översteg heller tröskeln";
+
                     evidence.Add(
-                        $"NEDVIKTAD: {metrics.CpuBoundSpikes} av {metrics.SpikeCount} spikes ({cpuBoundShare:P0}) var CPU-bundna, "
-                        + "och ingen disklatens, diskkö eller paging översteg tröskeln. Frametiden gick åt till att räkna, "
-                        + $"inte till att vänta på lagring, så konfidensen är takad till {ContradictedConfidenceCeiling:P0}.");
+                        $"NEDVIKTAD: {decisiveShare:P0} av spike-tiden ({metrics.CpuBoundSpikeMs:F0} av {metrics.TotalSpikeMs:F0} ms, "
+                        + $"{metrics.CpuBoundSpikes} av {metrics.SpikeCount} spikes) var CPU-bunden. {counterNote}, "
+                        + $"så konfidensen är takad till {ContradictedConfidenceCeiling:P0}.");
                 }
             }
 
@@ -1235,6 +1272,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         int CpuBoundSpikes,
         int GpuBoundSpikes,
         int PresentBoundSpikes,
+        double CpuBoundSpikeMs,
+        double TotalSpikeMs,
         double MaxCpuBusyMs,
         double MaxGpuBusyMs,
         double MaxGpuWaitMs,
@@ -1244,7 +1283,14 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         DisplayChangeMetrics DisplayChange)
     {
         public static FrameMetrics Empty { get; } =
-            new(0, 0, 16.67, 25, 40, 0, 0, 0, 0, 0, 0, false, 0, 0, 0, 0, 0, 0, 0, 0, PresentModeMetrics.Empty, DisplayChangeMetrics.Empty);
+            new(0, 0, 16.67, 25, 40, 0, 0, 0, 0, 0, 0, false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, PresentModeMetrics.Empty, DisplayChangeMetrics.Empty);
+
+        /// <summary>
+        /// Share of the window's whole lost time that the CPU spent computing rather than waiting.
+        /// Spikes that could not be attributed are in the denominator, so an incomplete attribution
+        /// lowers this rather than flattering it. Null when there were no spikes at all.
+        /// </summary>
+        public double? CpuBoundTimeShare => TotalSpikeMs > 0 ? CpuBoundSpikeMs / TotalSpikeMs : null;
     }
 
     private sealed record PresentModeMetrics(

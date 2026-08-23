@@ -151,12 +151,26 @@ public sealed record DeepCaptureOptions
     /// history a marker can save — the part of the timeline where the cause of a stall actually is.
     /// </summary>
     /// <remarks>
-    /// Measured retention at 256 MB was about seven seconds while context switch stacks were being
-    /// walked. Those stacks are no longer collected, so the same buffer now holds substantially more;
-    /// the default is unchanged because this is non-paged pool the machine gives up for the whole
-    /// session, and the honest next step is to measure the new retention before spending more of it.
+    /// Now measured rather than guessed. A 256 MB capture from a live session retained 13.3 seconds of
+    /// samples once context switch stacks stopped being walked, which is about 19 MB per second. That is
+    /// not enough: a human needs six to seven seconds to feel a hitch and reach the marker, and the
+    /// capture that prompted this change reached back 5.9 seconds and missed its own stall by 0.4. The
+    /// default buys roughly forty seconds at the measured rate, so the run-up survives the reaction
+    /// time. It is non-paged pool held for the whole session, which is why it is not larger still.
     /// </remarks>
-    public int RingBufferMegabytes { get; set; } = 256;
+    public int RingBufferMegabytes { get; set; } = 768;
+
+    /// <summary>Bytes per second of ring buffer the generated profile was measured to produce.</summary>
+    /// <remarks>
+    /// From a 256 MB capture that retained 13.26 s of CPU samples. Used only to tell the user how many
+    /// seconds of history their buffer size buys, which is the number that actually matters and is
+    /// otherwise invisible until the ETL is opened.
+    /// </remarks>
+    public const double MeasuredRingBufferBytesPerSecond = 19.3 * 1024 * 1024;
+
+    /// <summary>Rough seconds of history the configured buffer holds, at the measured fill rate.</summary>
+    public double EstimatedRingBufferSeconds =>
+        RingBufferMegabytes * 1024d * 1024d / MeasuredRingBufferBytesPerSecond;
 
     /// <summary>
     /// Walks a stack on every file open, system-wide, so a capture can say which component is doing the
@@ -177,7 +191,14 @@ public sealed record DeepCaptureOptions
     /// the trace as well as the run-up. The pre-incident history costs no wait at all: it is already in
     /// the buffer by the time the marker arrives.
     /// </summary>
-    public TimeSpan PostMarkerTail { get; set; } = TimeSpan.FromSeconds(5);
+    /// <remarks>
+    /// The tail is not free, and that is why it is short. The session keeps recording throughout it, so
+    /// every second of tail displaces a second of run-up from the far end of the ring. A capture with a
+    /// five second tail was measured holding 5.9 s before the marker and 7.3 s after it — the tail plus
+    /// the couple of seconds <c>wpr -stop</c> takes to drain — meaning more of the buffer described the
+    /// recovery than the cause. Two seconds still shows whether the frame rate came back.
+    /// </remarks>
+    public TimeSpan PostMarkerTail { get; set; } = TimeSpan.FromSeconds(2);
 
     /// <summary>
     /// Duration of a one-shot capture, used only when no ring buffer session is running — an unelevated
@@ -188,10 +209,52 @@ public sealed record DeepCaptureOptions
 
     /// <summary>
     /// Severe manual markers retain their historical automatic capture behaviour. Enabling this also
-    /// captures normal manual markers; it never applies to automatic incidents, which could otherwise
-    /// create recurring WPR load during a bad session.
+    /// captures normal manual markers.
     /// </summary>
     public bool CaptureNormalManualIncidents { get; set; }
+
+    /// <summary>
+    /// Lets the detector save a trace on its own, without waiting for someone to press the marker.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Automatic captures used to be refused outright, on the reasoning that WPR is affordable once on
+    /// demand and ruinous every couple of minutes. The reasoning was right and the rule was still wrong:
+    /// a five and a half hour session raised eighteen severe incidents and produced no trace at all,
+    /// because the only marker anyone pressed was one, and it missed its own stall. The two worst frames
+    /// of that session — 2 846 ms and 1 683 ms — went unrecorded entirely.
+    /// </para>
+    /// <para>
+    /// What was actually needed was a budget rather than a prohibition. The gates below are deliberately
+    /// tight: only frames far beyond an ordinary spike qualify, and only a handful per session. The same
+    /// session contained sixteen frames over 300 ms, so six captures would have covered the events that
+    /// mattered at the cost of six flushes across an evening.
+    /// </para>
+    /// </remarks>
+    public bool CaptureAutoIncidents { get; set; } = true;
+
+    /// <summary>
+    /// Frame time, in milliseconds, an automatically detected hitch has to reach before it may spend a
+    /// capture. Absolute rather than a multiple of baseline, for the same reason
+    /// <see cref="FramePacingOptions"/> is: the multiplier moves with the damage, and a threshold meant
+    /// to catch the rare catastrophic frame must not drift upwards during a bad patch.
+    /// </summary>
+    public double AutoCaptureFrameTimeMs { get; set; } = 300;
+
+    /// <summary>
+    /// Captures the detector may spend in one session. Each one writes a multi hundred megabyte ETL and
+    /// leaves the ring buffer empty until it refills, so this is the setting that keeps a bad evening
+    /// from filling the disk.
+    /// </summary>
+    public int MaxAutoCapturesPerSession { get; set; } = 6;
+
+    /// <summary>
+    /// Minimum spacing between automatic captures. Hitches arrive in bursts — 41% of the ones measured
+    /// came within five seconds of another — and a burst is one event worth one trace, not twenty. The
+    /// spacing also gives the ring buffer time to refill, which a capture inside the cooldown would find
+    /// nearly empty anyway.
+    /// </summary>
+    public TimeSpan AutoCaptureCooldown { get; set; } = TimeSpan.FromMinutes(10);
 
     /// <summary>Clamps hand-edited values that would otherwise make the ring buffer useless or ruinous.</summary>
     public void Normalize()
@@ -206,6 +269,22 @@ public sealed record DeepCaptureOptions
             : PostMarkerTail > TimeSpan.FromSeconds(60)
                 ? TimeSpan.FromSeconds(60)
                 : PostMarkerTail;
+
+        // A threshold at or below an ordinary spike would let a routine 40 ms frame spend a capture, and
+        // the budget would be gone in the first minute. 100 ms is already three missed frames at 60 Hz.
+        AutoCaptureFrameTimeMs = double.IsNaN(AutoCaptureFrameTimeMs) || AutoCaptureFrameTimeMs < 100
+            ? 300
+            : Math.Min(AutoCaptureFrameTimeMs, 60_000);
+
+        MaxAutoCapturesPerSession = Math.Clamp(MaxAutoCapturesPerSession, 0, 100);
+
+        // Shorter than the post-marker tail plus the drain and the next capture starts against a ring
+        // that holds almost nothing.
+        AutoCaptureCooldown = AutoCaptureCooldown < TimeSpan.FromSeconds(30)
+            ? TimeSpan.FromSeconds(30)
+            : AutoCaptureCooldown > TimeSpan.FromHours(6)
+                ? TimeSpan.FromHours(6)
+                : AutoCaptureCooldown;
     }
 }
 

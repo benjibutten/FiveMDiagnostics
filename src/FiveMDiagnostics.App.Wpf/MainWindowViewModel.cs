@@ -47,6 +47,11 @@ public sealed class MainWindowViewModel : ObservableObject
     private string _liveCpuText = Strings.LiveStatsIdle;
     private string _liveMemoryText = Strings.LiveStatsIdle;
     private string _liveVramText = Strings.LiveStatsIdle;
+    private string _pacingSaturatedText = Strings.PacingIdle;
+    private string _pacingWorstText = string.Empty;
+    private string _pacingCurrentText = string.Empty;
+    private string _pacingCaptureBudgetText = string.Empty;
+    private bool _hasPacingData;
 
     public MainWindowViewModel(DiagnosticsSessionManager sessionManager, SettingsStore settingsStore, DiagnosticsSettings settings, IUserDialogService dialogService)
     {
@@ -94,6 +99,7 @@ public sealed class MainWindowViewModel : ObservableObject
         _sessionManager.SystemTelemetryUpdated += OnSystemTelemetryUpdated;
         _sessionManager.GpuTelemetryUpdated += OnGpuTelemetryUpdated;
         _sessionManager.CaptureHealthUpdated += OnCaptureHealthUpdated;
+        _sessionManager.FramePacingWindowCompleted += OnFramePacingWindowCompleted;
 
         foreach (var incident in _sessionManager.GetRecentIncidents())
         {
@@ -192,6 +198,42 @@ public sealed class MainWindowViewModel : ObservableObject
     {
         get => _liveVramText;
         private set => SetProperty(ref _liveVramText, value);
+    }
+
+    /// <summary>
+    /// How much of the session did not hold the frame rate. This is the headline number: "0 saturated
+    /// minutes out of 341" is the answer to "did tonight go well", and three sessions of averages hid a
+    /// problem that this one line makes obvious.
+    /// </summary>
+    public string PacingSaturatedText
+    {
+        get => _pacingSaturatedText;
+        private set => SetProperty(ref _pacingSaturatedText, value);
+    }
+
+    public string PacingWorstText
+    {
+        get => _pacingWorstText;
+        private set => SetProperty(ref _pacingWorstText, value);
+    }
+
+    public string PacingCurrentText
+    {
+        get => _pacingCurrentText;
+        private set => SetProperty(ref _pacingCurrentText, value);
+    }
+
+    public string PacingCaptureBudgetText
+    {
+        get => _pacingCaptureBudgetText;
+        private set => SetProperty(ref _pacingCaptureBudgetText, value);
+    }
+
+    /// <summary>False until the first window closes, so the panel shows a hint rather than zeroes.</summary>
+    public bool HasPacingData
+    {
+        get => _hasPacingData;
+        private set => SetProperty(ref _hasPacingData, value);
     }
 
     public string ServerProfileName
@@ -488,6 +530,52 @@ public sealed class MainWindowViewModel : ObservableObject
         }));
     }
 
+    /// <summary>
+    /// Refreshes the pacing panel once per classified window — about once a minute, so this can format
+    /// on the dispatcher without the batching the per-frame paths need.
+    /// </summary>
+    private void OnFramePacingWindowCompleted(object? sender, FramePacingWindow window)
+    {
+        var summary = _sessionManager.FramePacing;
+        var windowMinutes = _sessionManager.Settings.FramePacing.WindowLength.TotalMinutes;
+        var notHealthy = summary.SaturatedWindows + summary.MarginalWindows;
+
+        var saturated = summary.TotalWindows == 0
+            ? Strings.PacingIdle
+            : string.Format(
+                Strings.PacingSaturatedFormat,
+                summary.SaturatedWindows,
+                summary.TotalWindows,
+                summary.SaturatedShare.ToString("P0"),
+                summary.MarginalWindows,
+                (summary.LongestSaturatedRun * windowMinutes).ToString("F0"));
+
+        var worst = summary.TotalWindows == 0
+            ? string.Empty
+            : string.Format(Strings.PacingWorstFormat, summary.WorstFps.ToString("F1"), summary.TargetFps.ToString("F1"));
+
+        // PresentMon v1 supplies no CPU wait, and the interpolation for a null double renders as nothing
+        // at all — leaving "Saturated — 45.0 fps, CPU headroom  ms" on screen. The measurement is the
+        // whole point of the panel, so its absence gets its own wording rather than a blank.
+        var current = window.MedianCpuWaitMs is { } wait
+            ? string.Format(Strings.PacingCurrentFormat, window.State, window.AchievedFps.ToString("F1"), wait.ToString("F1"))
+            : string.Format(Strings.PacingCurrentNoHeadroomFormat, window.State, window.AchievedFps.ToString("F1"));
+
+        var budget = string.Format(
+            Strings.PacingCaptureBudgetFormat,
+            _sessionManager.RemainingAutoCaptures,
+            _sessionManager.Settings.DeepCapture.MaxAutoCapturesPerSession);
+
+        _ = _dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+        {
+            HasPacingData = summary.TotalWindows > 0 || notHealthy > 0;
+            PacingSaturatedText = saturated;
+            PacingWorstText = worst;
+            PacingCurrentText = current;
+            PacingCaptureBudgetText = budget;
+        }));
+    }
+
     private void OnStatusReported(object? sender, DiagnosticStatusEntry status)
     {
         _pendingStatusEntries.Enqueue(status);
@@ -586,6 +674,12 @@ public sealed class MainWindowViewModel : ObservableObject
             LiveCpuText = Strings.LiveStatsIdle;
             LiveMemoryText = Strings.LiveStatsIdle;
             LiveVramText = Strings.LiveStatsIdle;
+
+            // Pacing figures belong to the session that produced them. The session manager builds a fresh
+            // FramePacingMonitor on every start, but the view model keeps whatever it was last told —
+            // so without this the next session shows the previous evening's saturation share until its
+            // first window closes a minute later, which is exactly when someone is looking.
+            ResetPacing();
         }
 
         OnPropertyChanged(nameof(SessionStateText));
@@ -594,6 +688,15 @@ public sealed class MainWindowViewModel : ObservableObject
         MarkStutterCommand.RaiseCanExecuteChanged();
         MarkSevereStutterCommand.RaiseCanExecuteChanged();
         ExportSelectedIncidentCommand.RaiseCanExecuteChanged();
+    }
+
+    private void ResetPacing()
+    {
+        HasPacingData = false;
+        PacingSaturatedText = Strings.PacingIdle;
+        PacingWorstText = string.Empty;
+        PacingCurrentText = string.Empty;
+        PacingCaptureBudgetText = string.Empty;
     }
 
     private void RequestStateRefresh()

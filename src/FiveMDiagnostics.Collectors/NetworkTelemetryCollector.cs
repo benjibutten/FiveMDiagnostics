@@ -17,9 +17,24 @@ public sealed class NetworkTelemetryCollector : ITelemetryCollector, IDisposable
     private const int FiveMDefaultPort = 30120;
 
     /// <summary>
-    /// How many consecutive polls an endpoint must persist before it is treated as the game server. A
-    /// CDN fetch, an overlay's telemetry call or a launcher update appears for a poll or two; the
-    /// session connection stays for the whole session.
+    /// Port range FiveM servers are reachable on. The default is 30120 and community servers shift a
+    /// few either way, so the whole 30000-series counts as plausibly a game server.
+    /// </summary>
+    /// <remarks>
+    /// This range is the fix for a measured failure. Persistence alone accepted 23.36.77.184:443 — a
+    /// CDN the NUI keeps a connection open to — as the game server 26 seconds into a five hour session,
+    /// and every latency figure in that session's incident reports then described a content delivery
+    /// network. Staying open for hours is what a CDN connection and a game connection have in common,
+    /// so persistence cannot tell them apart. The port can.
+    /// </remarks>
+    private const int FiveMPortRangeStart = 30000;
+
+    private const int FiveMPortRangeEnd = 30999;
+
+    /// <summary>
+    /// How many consecutive polls an endpoint in the FiveM range must persist before it is treated as
+    /// the game server. A launcher fetch that happens to land in the range appears for a poll or two;
+    /// the session connection stays for the whole session.
     /// </summary>
     private const int StableEndpointPolls = 3;
 
@@ -30,6 +45,7 @@ public sealed class NetworkTelemetryCollector : ITelemetryCollector, IDisposable
     private string? _candidateEndpointKey;
     private int _candidateObservations;
     private int _latchedHostAbsentPolls;
+    private bool _reportedNoPlausibleHost;
 
     public string Name => "NetworkTelemetry";
 
@@ -68,9 +84,11 @@ public sealed class NetworkTelemetryCollector : ITelemetryCollector, IDisposable
     /// </summary>
     /// <remarks>
     /// Probing the wrong host is worse than not probing: RTT to some CDN would be presented as evidence
-    /// about the game server. So a candidate is accepted only on FiveM's default port, or after it has
-    /// persisted across several polls, and the latch is dropped whenever the target process changes so a
-    /// stale address cannot leak into the next session.
+    /// about the game server, and it looks entirely healthy while the game connection is not. So a
+    /// candidate has to be on a port a FiveM server actually listens on — the default outright, the rest
+    /// of the 30000-series after it has persisted — and anything else is refused rather than guessed at.
+    /// The latch is dropped whenever the target process changes so a stale address cannot leak into the
+    /// next session.
     /// </remarks>
     private string? ResolveProbeHost(CollectorContext context, int processId, IReadOnlyList<RemoteEndpointInfo> remoteEndpoints)
     {
@@ -110,6 +128,20 @@ public sealed class NetworkTelemetryCollector : ITelemetryCollector, IDisposable
         {
             _candidateEndpointKey = null;
             _candidateObservations = 0;
+
+            // Said once rather than every poll. Silence here used to be indistinguishable from "probing
+            // fine", and the reports then carried no network evidence at all without explaining why.
+            if (!_reportedNoPlausibleHost && remoteEndpoints.Count > 0)
+            {
+                _reportedNoPlausibleHost = true;
+                context.StatusSink.Report(
+                    StatusLevel.Info,
+                    Name,
+                    $"Ingen av FiveM:s {remoteEndpoints.Count} anslutningar ligger på en spelserverport "
+                    + $"({FiveMPortRangeStart}-{FiveMPortRangeEnd}), så probe-hosten kan inte härledas. Nätproberna är "
+                    + "avstängda tills ProbeHost sätts manuellt — hellre ingen mätning än RTT mot fel maskin.");
+            }
+
             return null;
         }
 
@@ -135,7 +167,7 @@ public sealed class NetworkTelemetryCollector : ITelemetryCollector, IDisposable
             _reportedAutoDetectedHost = true;
             var basis = candidate.RemotePort == FiveMDefaultPort
                 ? "FiveM:s standardport"
-                : $"en anslutning som varit stabil i {StableEndpointPolls} mätningar";
+                : $"en spelserverport som varit stabil i {StableEndpointPolls} mätningar";
             context.StatusSink.Report(
                 StatusLevel.Info,
                 Name,
@@ -153,12 +185,30 @@ public sealed class NetworkTelemetryCollector : ITelemetryCollector, IDisposable
         _candidateEndpointKey = null;
         _candidateObservations = 0;
         _latchedHostAbsentPolls = 0;
+        _reportedNoPlausibleHost = false;
     }
 
-    private static RemoteEndpointInfo? SelectCandidate(IReadOnlyList<RemoteEndpointInfo> remoteEndpoints)
+    /// <summary>
+    /// Picks the endpoint most likely to be the game server, or none at all.
+    /// </summary>
+    /// <remarks>
+    /// Returning "the first routable connection" as a last resort was the bug: FiveM's embedded browser
+    /// holds connections to CDNs, telemetry endpoints and the CitizenFX backend for the whole session,
+    /// and any of them could win that fallback. There is no last resort any more — an endpoint is either
+    /// on a plausible game server port or it is not a candidate.
+    /// </remarks>
+    internal static RemoteEndpointInfo? SelectCandidate(IReadOnlyList<RemoteEndpointInfo> remoteEndpoints)
     {
-        var routable = remoteEndpoints.Where(item => IsRoutableRemote(item.RemoteAddress)).ToArray();
-        return routable.FirstOrDefault(item => item.RemotePort == FiveMDefaultPort) ?? routable.FirstOrDefault();
+        var plausible = remoteEndpoints
+            .Where(item => IsRoutableRemote(item.RemoteAddress) && IsGameServerPort(item.RemotePort))
+            .ToArray();
+
+        return plausible.FirstOrDefault(item => item.RemotePort == FiveMDefaultPort) ?? plausible.FirstOrDefault();
+    }
+
+    internal static bool IsGameServerPort(int port)
+    {
+        return port is >= FiveMPortRangeStart and <= FiveMPortRangeEnd;
     }
 
     private static bool IsRoutableRemote(string address)

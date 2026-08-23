@@ -65,6 +65,25 @@ public sealed class WprProfileWriterTests : IDisposable
         Assert.Contains("<Buffers Value=\"512\" />", Write(settings), StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// The default has to reach the profile too, and it has to buy enough history to survive human
+    /// reaction time. A marker pressed six or seven seconds after a hitch — which is how long it takes to
+    /// feel one and reach the key — must still have the hitch in the buffer. The capture that prompted
+    /// this reached back 5.9 seconds and missed its own stall by 0.4.
+    /// </summary>
+    [Fact]
+    public void TheDefaultRingBufferOutlastsHumanReactionTime()
+    {
+        var settings = new DiagnosticsSettings();
+        settings.DeepCapture.Normalize();
+
+        Assert.Contains($"<Buffers Value=\"{settings.DeepCapture.RingBufferMegabytes}\" />", Write(settings), StringComparison.Ordinal);
+
+        // The tail keeps recording, so it comes out of the same buffer as the run-up.
+        var runUpSeconds = settings.DeepCapture.EstimatedRingBufferSeconds - settings.DeepCapture.PostMarkerTail.TotalSeconds;
+        Assert.True(runUpSeconds > 20, $"only {runUpSeconds:F0}s of run-up survives the tail");
+    }
+
     private string Write(DiagnosticsSettings settings)
     {
         settings.WorkingDirectory = _workingDirectory;
