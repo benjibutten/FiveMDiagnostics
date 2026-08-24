@@ -91,6 +91,11 @@ public sealed class SettingsStore
             changed = true;
         }
 
+        if (settings.DeepCapture.MigrateCaptureProfile())
+        {
+            changed = true;
+        }
+
         settings.DeepCapture.Normalize();
 
         if (settings.MaxRetainedIncidents is < 1 or > 1000)

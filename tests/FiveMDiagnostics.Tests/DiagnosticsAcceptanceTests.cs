@@ -12,6 +12,113 @@ public sealed class DiagnosticsAcceptanceTests
     private readonly FiveMCorrelationEngine _engine = new();
 
     [Fact]
+    public void CorrelationEngine_PrefersMeasuredGameThreadWaitAndIgnoresCaptureProcesses()
+    {
+        var baseTime = new DateTimeOffset(2026, 8, 24, 0, 0, 0, TimeSpan.Zero);
+        var events = new List<TelemetryEvent>();
+
+        for (var index = 0; index < 120; index++)
+        {
+            var slow = index == 60;
+            events.Add(new FrameTelemetrySample(
+                baseTime.AddMilliseconds(index * 16.7),
+                slow ? 1_990 : 16.7,
+                GpuBusyMs: slow ? 2 : 9,
+                DisplayLatencyMs: slow ? 1_990 : 17,
+                MsBetweenPresents: slow ? 1_990 : 16.7,
+                Dropped: false,
+                ProcessName: "FiveM_b3407_GTAProcess",
+                CpuBusyMs: slow ? 1_960 : 11));
+        }
+
+        events.Add(new ArtifactEvidence(
+            baseTime.AddSeconds(1),
+            ArtifactKind.EtlTrace,
+            "Schemaläggning: aktiv GTA-tråd låg av CPU:n.",
+            new Dictionary<string, double>
+            {
+                ["gameThreadWaitThreadId"] = 31484,
+                ["gameThreadLongWaitCount"] = 2,
+                ["gameThreadUserRequestWaitCount"] = 2,
+                ["gameThreadMaxWaitMs"] = 1_952.668,
+                ["gameThreadWaitIntervalCount"] = 1,
+                ["gameThreadWait0StartUnixMs"] = baseTime.AddMilliseconds(950).ToUnixTimeMilliseconds(),
+                ["gameThreadWait0EndUnixMs"] = baseTime.AddMilliseconds(2_902.668).ToUnixTimeMilliseconds(),
+                ["gameThreadWait0DurationMs"] = 1_952.668,
+                ["gameThreadWait0UserRequest"] = 1,
+            }));
+
+        events.Add(new GpuTelemetrySample(
+            baseTime,
+            true,
+            "NVIDIA GeForce RTX 3080",
+            99,
+            70,
+            9_900_000_000,
+            10_000_000_000,
+            0,
+            0,
+            70,
+            []));
+
+        events.Add(new SystemTelemetrySample(
+            baseTime,
+            35,
+            new Dictionary<string, double>(),
+            50,
+            8_000,
+            [new ProcessActivity("wpr.exe", 1234, 80, 0)],
+            []));
+
+        var analysis = _engine.Analyze(BuildIncident(baseTime, events, 60));
+
+        Assert.Equal(RootCauseCategory.FiveMThreadWait, analysis.Hypotheses[0].Category);
+        Assert.Contains(analysis.Hypotheses[0].Evidence, item => item.Contains("Wait/UserRequest", StringComparison.Ordinal));
+        Assert.DoesNotContain(analysis.Hypotheses, item => item.Category == RootCauseCategory.GpuVramPressure);
+        Assert.DoesNotContain(analysis.SuspectedProcesses, item => item.ProcessName.Contains("wpr", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void CorrelationEngine_DoesNotUseThreadWaitOutsideTheSlowFrame()
+    {
+        var baseTime = new DateTimeOffset(2026, 8, 24, 1, 0, 0, TimeSpan.Zero);
+        var events = new List<TelemetryEvent>();
+        for (var index = 0; index < 120; index++)
+        {
+            var slow = index == 60;
+            events.Add(new FrameTelemetrySample(
+                baseTime.AddMilliseconds(index * 16.7),
+                slow ? 500 : 16.7,
+                GpuBusyMs: slow ? 480 : 9,
+                DisplayLatencyMs: slow ? 500 : 17,
+                MsBetweenPresents: slow ? 500 : 16.7,
+                Dropped: false,
+                ProcessName: "FiveM_b3407_GTAProcess",
+                CpuBusyMs: slow ? 5 : 11));
+        }
+
+        events.Add(new ArtifactEvidence(
+            baseTime,
+            ArtifactKind.EtlTrace,
+            "En äldre väntan fanns i ringbufferten.",
+            new Dictionary<string, double>
+            {
+                ["gameThreadWaitThreadId"] = 31484,
+                ["gameThreadWaitIntervalCount"] = 1,
+                ["gameThreadWait0StartUnixMs"] = baseTime.AddSeconds(-10).ToUnixTimeMilliseconds(),
+                ["gameThreadWait0EndUnixMs"] = baseTime.AddSeconds(-8).ToUnixTimeMilliseconds(),
+                ["gameThreadWait0DurationMs"] = 2_000,
+                ["gameThreadWait0UserRequest"] = 1,
+            }));
+
+        var analysis = _engine.Analyze(BuildIncident(baseTime, events, 60));
+
+        Assert.DoesNotContain(analysis.Hypotheses, item => item.Category == RootCauseCategory.FiveMThreadWait);
+        var gpu = Assert.Single(analysis.Hypotheses, item => item.Category == RootCauseCategory.GpuFrametimeContention);
+        Assert.True(gpu.Confidence > 0.3, "an unrelated ETL wait must not cap the measured GPU hypothesis");
+    }
+
+    [Fact]
     public void IncidentMaterializer_CapturesThirtySecondsBeforeAndSixtySecondsAfterMarker()
     {
         var ringBuffer = new TimeWindowRingBuffer<TelemetryEvent>(TimeSpan.FromMinutes(3), item => item.Timestamp);

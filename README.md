@@ -192,11 +192,14 @@ Read a deep capture ETL:
 dotnet run --project src/FiveMDiagnostics.Tools.EtlAnalyzer -- <trace.etl> cpu
 dotnet run --project src/FiveMDiagnostics.Tools.EtlAnalyzer -- <trace.etl> thread --tid 24096
 dotnet run --project src/FiveMDiagnostics.Tools.EtlAnalyzer -- <trace.etl> io
+dotnet run --project src/FiveMDiagnostics.Tools.EtlAnalyzer -- <trace.etl> cpu --from-ms 20000 --to-ms 23000
 ```
 
 The app's own ETL parser answers whether a trace is usable and whether a driver held the CPU. The tool
 answers what comes next: which thread inside the game was the bottleneck, what code it was running,
 whether it was sharing a physical core, and whether the file system traffic ever reached the disk.
+`--from-ms` and `--to-ms` zoom any CPU or thread report into offsets from the first retained CPU sample,
+which keeps a multi-second wait from being averaged away by the rest of the ring buffer.
 Rates are reported in *cores*, so a thread at 0.89 cores is spending 19.6 ms of CPU inside a 22 ms
 frame — which is the number that explains a frame rate.
 
@@ -319,11 +322,10 @@ traces rather than one every couple of minutes.
   history to an ETL, and starts a fresh one. Starting at the marker meant the trace began after the
   interesting part was already over — by the time a human presses the key or the detector classifies a
   hitch, the frames that caused it are seconds in the past.
-- **DeepCapture.RingBufferMegabytes** (768) decides how much run-up a marker can save. Measured rather
-  than estimated: a 256 MB capture retained 13.3 seconds of samples, about 19 MB/s, so the default buys
-  roughly forty seconds. That size is chosen to outlast human reaction time — the capture that prompted it
-  reached back 5.9 seconds and missed its own stall by 0.4, because noticing a hitch and reaching the
-  marker takes six or seven seconds. **DeepCapture.PostMarkerTail** (2 s) is how long the marker waits
+- **DeepCapture.RingBufferMegabytes** (768) decides how much run-up a marker can save. With scheduler
+  stacks enabled, a 256 MB test retained about seven seconds (roughly 36.6 MB/s), so the default buys
+  about 21 seconds. Automatic capture normally stops it at the hitch, and that size still outlasts a
+  manual reaction. **DeepCapture.PostMarkerTail** (2 s) is how long the marker waits
   before stopping, so the recovery is in the trace too; it is short because the session keeps recording
   throughout it, and every second of tail displaces a second of run-up from the far end of the ring.
 - Triggered automatically on `Mark Severe`; optionally by a normal manual marker when explicitly enabled
@@ -334,12 +336,16 @@ traces rather than one every couple of minutes.
 - **Records through a generated `.wprp`, not `GeneralProfile`.** The built-in profile enables syscall
   enter/exit tracing: 88 of 132 million events and about 5 GB of a 6.9 GB trace, none of it attributable
   to a thread. The generated profile asks for context switches, ready threads, sampled profiles, DPC/ISR,
-  disk and file I/O, hard faults and resident set — and stacks only for the events whose stacks get read.
+  disk and file I/O, hard faults and resident set. CSwitch and ReadyThread stacks are on by default so a
+  long `Wait/UserRequest` interval retains the call chain that initiated it; file-open stacks remain off.
   It is rewritten to the working directory each session so the buffer size follows the setting; point
   `DeepCapture.CustomProfilePath` at your own file to override it. If WPR rejects the generated profile
   the built-in `DeepCapture.Profiles` stack takes over and the status entry says so.
 - ETL analysis reports DPC/ISR **durations**, not event counts: ten thousand short DPCs are normal, a
   single 8 ms one blocks the scheduler and stalls every thread at once
+- ETL analysis reconstructs long off-CPU intervals for active GTA threads and reports their wait state,
+  reason and duration. This prevents PresentMon `MsCPUBusy` from being mistaken for CPU execution when
+  the thread actually spent most of the frame blocked in `Wait/UserRequest`.
 - ETL analysis also reports **per-stream coverage**. Context switches and stacks have been observed
   stopping at 23 of 54 seconds while `EventsLost` stayed at 0 — that counts events the consumer failed to
   drain, not a provider that went silent because another ETW session took the keyword. A trace with full
@@ -347,6 +353,15 @@ traces rather than one every couple of minutes.
   when each stream was actually producing and warns when one ends early.
 - Only one capture runs at a time. WPR records into a single machine-wide session, so a severe marker
   raised while a capture is in flight is recorded as an incident but does not start a second trace
+
+For the next session there is no separate “collect CSwitch stack” procedure. Install/run the updated
+build **as administrator**, start diagnostics before FiveM, and play normally. Keep the lowered distance
+scaling/population density and paused OneDrive unchanged so the session is comparable. Use **Mark Normal**
+whenever lag is perceived: that human annotation is valuable even if the frame stays below the automatic
+threshold. Use **Mark Severe** for an obvious freeze or major hitch. Hitches above the automatic 300 ms
+threshold save the relevant ETL by themselves, but automatic detection does not replace perceived-lag
+markers. At session start the status log should say
+`CSwitch-stackar aktiva`. Older saved 256 MB/5 s defaults are migrated once to 768 MB/2 s automatically.
 
 All setup fields are optional. The app can start a session with the default paths and no network hints configured.
 

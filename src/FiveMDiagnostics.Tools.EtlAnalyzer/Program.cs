@@ -72,13 +72,15 @@ internal static class Program
 
         trace.Process();
 
-        var window = TraceWindow.From(cpuSampling.Result.Samples);
+        var window = TraceWindow.From(cpuSampling.Result.Samples)
+            .Slice(IntOf(args, "--from-ms"), IntOf(args, "--to-ms"));
         Console.WriteLine(window.Header(path));
         Console.WriteLine($"  trace {metadata.StartTime:HH:mm:ss}–{metadata.StopTime:HH:mm:ss} "
             + $"({(metadata.StopTime - metadata.StartTime).TotalSeconds:F0}s on disk), "
             + $"{metadata.ProcessorCount} logical processors, {metadata.LostEventCount} events lost");
 
-        if (window.IsEmpty && command is not "io")
+        var requestedSlice = IntOf(args, "--from-ms") is not null || IntOf(args, "--to-ms") is not null;
+        if (window.IsEmpty && (command is not "io" || requestedSlice))
         {
             Console.WriteLine();
             Console.WriteLine("No CPU samples were retained. For a ring buffer capture this means the buffer");
@@ -158,6 +160,8 @@ internal static class Program
               --threads <n>       threads to list in the cpu report (default: 12)
               --bucket <ms>       timeline bucket size (default: 200)
               --tid <id>          thread id for the thread and smt commands
+              --from-ms <ms>      start offset from the first retained CPU sample
+              --to-ms <ms>        end offset from the first retained CPU sample
 
             Rates are reported in cores: 1.00 cores is one logical processor held busy for the whole
             sampled window, so a thread at 0.89 cores spends 19.6 ms of CPU inside a 22 ms frame.

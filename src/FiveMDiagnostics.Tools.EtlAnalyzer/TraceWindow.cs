@@ -41,6 +41,21 @@ internal sealed class TraceWindow
 
     public bool IsEmpty => Samples.Count == 0 || DurationSeconds <= 0;
 
+    public decimal StartRelativeMilliseconds => Samples.Count > 0
+        ? Samples[0].Timestamp.RelativeTimestamp.TotalMilliseconds
+        : 0;
+
+    public decimal EndRelativeMilliseconds => Samples.Count > 0
+        ? Samples[^1].Timestamp.RelativeTimestamp.TotalMilliseconds
+        : 0;
+
+    public bool Contains(decimal relativeMilliseconds)
+    {
+        return !IsEmpty
+            && relativeMilliseconds >= StartRelativeMilliseconds
+            && relativeMilliseconds <= EndRelativeMilliseconds;
+    }
+
     public static TraceWindow From(IReadOnlyList<ICpuSample> samples)
     {
         if (samples.Count == 0)
@@ -61,6 +76,30 @@ internal sealed class TraceWindow
         var intervalMs = weights.Length > 0 ? weights[weights.Length / 2] : 1d;
 
         return new TraceWindow(samples, span, 1000d / intervalMs);
+    }
+
+    /// <summary>
+    /// Restricts the retained sample window to offsets measured from its first CPU sample.
+    /// </summary>
+    public TraceWindow Slice(int? fromMilliseconds, int? toMilliseconds)
+    {
+        if (IsEmpty || (fromMilliseconds is null && toMilliseconds is null))
+        {
+            return this;
+        }
+
+        var origin = Samples[0].Timestamp.RelativeTimestamp.TotalMilliseconds;
+        var from = fromMilliseconds ?? 0;
+        var to = toMilliseconds is { } end ? (decimal)end : decimal.MaxValue;
+        var sliced = Samples
+            .Where(sample =>
+            {
+                var offset = sample.Timestamp.RelativeTimestamp.TotalMilliseconds - origin;
+                return offset >= from && offset < to;
+            })
+            .ToArray();
+
+        return From(sliced);
     }
 
     /// <summary>Sample count expressed as the number of CPU cores that many samples represent.</summary>

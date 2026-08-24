@@ -182,8 +182,8 @@ public sealed class AutoDeepCaptureBudgetTests
         Assert.Equal(6, options.MaxAutoCapturesPerSession);
         Assert.Equal(300, options.AutoCaptureFrameTimeMs);
 
-        // 768 MB at the measured fill rate is roughly forty seconds, which has to clear the six or seven
-        // seconds a human needs to notice a hitch and reach the marker.
-        Assert.True(options.EstimatedRingBufferSeconds > 30, $"ring buffer holds only {options.EstimatedRingBufferSeconds:F0}s");
+        // Scheduler stacks cost retention but locate the blocking call chain. The 768 MB default still
+        // clears a manual reaction comfortably, while automatic capture stops at the hitch itself.
+        Assert.True(options.EstimatedRingBufferSeconds > 15, $"ring buffer holds only {options.EstimatedRingBufferSeconds:F0}s");
     }
 }

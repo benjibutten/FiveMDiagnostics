@@ -20,6 +20,7 @@ public enum RootCauseCategory
     OsOrDriverLatency,
     PossibleCacheOrResourceCorruption,
     InsufficientEvidence,
+    FiveMThreadWait,
 }
 
 public enum ArtifactKind
@@ -109,6 +110,20 @@ public sealed record ObsOptions
 
 public sealed record DeepCaptureOptions
 {
+    public const int CurrentCaptureProfileRevision = 1;
+
+    /// <summary>
+    /// Version of the generated capture profile defaults. Zero means settings written before profile
+    /// migrations were introduced; it is deliberately not initialised here so JSON that lacks the
+    /// property can be distinguished from newly created defaults.
+    /// </summary>
+    public int CaptureProfileRevision { get; set; }
+
+    public static DeepCaptureOptions CreateDefault() => new()
+    {
+        CaptureProfileRevision = CurrentCaptureProfileRevision,
+    };
+
     public bool Enabled { get; set; } = true;
     public string WprExecutablePath { get; set; } = "wpr.exe";
 
@@ -151,22 +166,20 @@ public sealed record DeepCaptureOptions
     /// history a marker can save — the part of the timeline where the cause of a stall actually is.
     /// </summary>
     /// <remarks>
-    /// Now measured rather than guessed. A 256 MB capture from a live session retained 13.3 seconds of
-    /// samples once context switch stacks stopped being walked, which is about 19 MB per second. That is
-    /// not enough: a human needs six to seven seconds to feel a hitch and reach the marker, and the
-    /// capture that prompted this change reached back 5.9 seconds and missed its own stall by 0.4. The
-    /// default buys roughly forty seconds at the measured rate, so the run-up survives the reaction
-    /// time. It is non-paged pool held for the whole session, which is why it is not larger still.
+    /// Now measured rather than guessed. With scheduler stacks enabled, a 256 MB capture retained about
+    /// seven seconds, roughly 36.6 MB per second. The 768 MB default therefore buys about 21 seconds;
+    /// automatic capture normally stops it at the hitch, while still leaving enough room for a manual
+    /// reaction. It is non-paged pool held for the whole session, which is why it is not larger still.
     /// </remarks>
     public int RingBufferMegabytes { get; set; } = 768;
 
     /// <summary>Bytes per second of ring buffer the generated profile was measured to produce.</summary>
     /// <remarks>
-    /// From a 256 MB capture that retained 13.26 s of CPU samples. Used only to tell the user how many
+    /// From a 256 MB capture with scheduler stacks that retained about 7 s. Used only to tell the user how many
     /// seconds of history their buffer size buys, which is the number that actually matters and is
     /// otherwise invisible until the ETL is opened.
     /// </remarks>
-    public const double MeasuredRingBufferBytesPerSecond = 19.3 * 1024 * 1024;
+    public const double MeasuredRingBufferBytesPerSecond = 36.6 * 1024 * 1024;
 
     /// <summary>Rough seconds of history the configured buffer holds, at the measured fill rate.</summary>
     public double EstimatedRingBufferSeconds =>
@@ -185,6 +198,18 @@ public sealed record DeepCaptureOptions
     /// specifically "which module is opening this file".
     /// </remarks>
     public bool CollectFileStacks { get; set; }
+
+    /// <summary>
+    /// Saves the kernel stacks attached to context switches and ready-thread events. These turn a long
+    /// <c>Wait/UserRequest</c> interval from "the game was asleep" into "this call chain put it to
+    /// sleep", which is the missing evidence in the August 24 traces.
+    /// </summary>
+    /// <remarks>
+    /// This costs ring-buffer history, so the same profile revision also upgrades the old 256 MB/5 s
+    /// defaults to 768 MB/2 s. Automatic incident capture stops the buffer at the hitch; the player
+    /// does not have to press a key or run a separate CSwitch tool.
+    /// </remarks>
+    public bool CollectContextSwitchStacks { get; set; } = true;
 
     /// <summary>
     /// How long a marker waits before stopping the ring buffer, so the recovery after the hitch is in
@@ -255,6 +280,28 @@ public sealed record DeepCaptureOptions
     /// nearly empty anyway.
     /// </summary>
     public TimeSpan AutoCaptureCooldown { get; set; } = TimeSpan.FromMinutes(10);
+
+    /// <summary>Applies one-time changes to settings saved by builds before capture-profile revisions.</summary>
+    public bool MigrateCaptureProfile()
+    {
+        if (CaptureProfileRevision >= CurrentCaptureProfileRevision)
+        {
+            return false;
+        }
+
+        // These were the exact persisted defaults in the affected build. Preserve genuinely custom
+        // buffer/tail combinations, while ensuring installations on those defaults get enough room for
+        // the newly useful scheduler stacks.
+        if (RingBufferMegabytes == 256 && PostMarkerTail == TimeSpan.FromSeconds(5))
+        {
+            RingBufferMegabytes = 768;
+            PostMarkerTail = TimeSpan.FromSeconds(2);
+        }
+
+        CollectContextSwitchStacks = true;
+        CaptureProfileRevision = CurrentCaptureProfileRevision;
+        return true;
+    }
 
     /// <summary>Clamps hand-edited values that would otherwise make the ring buffer useless or ruinous.</summary>
     public void Normalize()
@@ -518,7 +565,7 @@ public sealed record DiagnosticsSettings
     public PresentMonOptions PresentMon { get; set; } = new();
     public GpuOptions Gpu { get; set; } = new();
     public ObsOptions Obs { get; set; } = new();
-    public DeepCaptureOptions DeepCapture { get; set; } = new();
+    public DeepCaptureOptions DeepCapture { get; set; } = DeepCaptureOptions.CreateDefault();
     public AutoDetectOptions AutoDetect { get; set; } = new();
     public FramePacingOptions FramePacing { get; set; } = new();
     public PrivacyOptions Privacy { get; set; } = new();

@@ -22,13 +22,16 @@ internal static class IoReports
         IFileActivityDataSource fileActivity,
         string targetProcess)
     {
-        HardFaults(hardFaults, targetProcess);
-        Disk(diskActivity, targetProcess);
+        HardFaults(window, hardFaults, targetProcess);
+        Disk(window, diskActivity, targetProcess);
         Files(window, fileActivity, targetProcess);
     }
 
-    private static void HardFaults(IReadOnlyList<IHardFault> faults, string targetProcess)
+    private static void HardFaults(TraceWindow window, IReadOnlyList<IHardFault> faults, string targetProcess)
     {
+        faults = faults
+            .Where(fault => window.IsEmpty || window.Contains(fault.Timestamp.RelativeTimestamp.TotalMilliseconds))
+            .ToArray();
         var target = faults.Count(fault => Matches(fault.FaultingProcess?.ImageName, targetProcess));
         Console.WriteLine();
         Console.WriteLine($"  hard faults: {faults.Count} total, {target} in {targetProcess}");
@@ -41,8 +44,11 @@ internal static class IoReports
         }
     }
 
-    private static void Disk(IReadOnlyList<IDiskActivity> activity, string targetProcess)
+    private static void Disk(TraceWindow window, IReadOnlyList<IDiskActivity> activity, string targetProcess)
     {
+        activity = activity
+            .Where(entry => window.IsEmpty || window.Contains(entry.InitializeTime.RelativeTimestamp.TotalMilliseconds))
+            .ToArray();
         Console.WriteLine();
         Console.WriteLine($"  disk operations: {activity.Count} total");
         foreach (var group in activity
@@ -91,8 +97,13 @@ internal static class IoReports
         Collect(operations, "FsControl", source.FileSystemControlActivity);
 
         var target = operations
+            .Where(entry => window.IsEmpty || window.Contains(entry.Activity.StartTime.RelativeTimestamp.TotalMilliseconds))
             .Where(entry => Matches(entry.Activity.IssuingProcess?.ImageName, targetProcess))
             .ToArray();
+
+        operations = operations
+            .Where(entry => window.IsEmpty || window.Contains(entry.Activity.StartTime.RelativeTimestamp.TotalMilliseconds))
+            .ToList();
 
         var perSecond = window.DurationSeconds > 0 ? target.Length / window.DurationSeconds : 0;
         Console.WriteLine();

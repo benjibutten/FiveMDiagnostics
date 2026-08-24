@@ -25,19 +25,49 @@ public sealed class WprProfileWriterTests : IDisposable
     }
 
     /// <summary>
-    /// Context switch stacks are walked on every scheduling decision on every processor, which is what
-    /// reduced a 256 MB ring buffer to seven seconds of history. The events stay; only their stacks go.
+    /// The new capture is specifically meant to explain who put the game thread into a long wait, so
+    /// scheduler events and the call stacks that initiated them both have to be present.
     /// </summary>
     [Fact]
-    public void ProfileKeepsContextSwitchEventsButNotTheirStacks()
+    public void ProfileCollectsContextSwitchEventsAndStacksByDefault()
     {
         var profile = Write(new DiagnosticsSettings());
 
         Assert.Contains("<Keyword Value=\"CSwitch\" />", profile, StringComparison.Ordinal);
         Assert.Contains("<Keyword Value=\"ReadyThread\" />", profile, StringComparison.Ordinal);
+        Assert.Contains("<Stack Value=\"CSwitch\" />", profile, StringComparison.Ordinal);
+        Assert.Contains("<Stack Value=\"ReadyThread\" />", profile, StringComparison.Ordinal);
+        Assert.Contains("<Stack Value=\"SampledProfile\" />", profile, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ContextSwitchStacksCanBeDisabledWhenRetentionIsMoreImportant()
+    {
+        var settings = new DiagnosticsSettings();
+        settings.DeepCapture.CollectContextSwitchStacks = false;
+
+        var profile = Write(settings);
+
+        Assert.Contains("<Keyword Value=\"CSwitch\" />", profile, StringComparison.Ordinal);
         Assert.DoesNotContain("<Stack Value=\"CSwitch\" />", profile, StringComparison.Ordinal);
         Assert.DoesNotContain("<Stack Value=\"ReadyThread\" />", profile, StringComparison.Ordinal);
-        Assert.Contains("<Stack Value=\"SampledProfile\" />", profile, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void LegacyCaptureDefaultsAreUpgradedOnce()
+    {
+        var options = new DeepCaptureOptions
+        {
+            RingBufferMegabytes = 256,
+            PostMarkerTail = TimeSpan.FromSeconds(5),
+            CollectContextSwitchStacks = false,
+        };
+
+        Assert.True(options.MigrateCaptureProfile());
+        Assert.Equal(768, options.RingBufferMegabytes);
+        Assert.Equal(TimeSpan.FromSeconds(2), options.PostMarkerTail);
+        Assert.True(options.CollectContextSwitchStacks);
+        Assert.False(options.MigrateCaptureProfile());
     }
 
     /// <summary>
@@ -81,7 +111,7 @@ public sealed class WprProfileWriterTests : IDisposable
 
         // The tail keeps recording, so it comes out of the same buffer as the run-up.
         var runUpSeconds = settings.DeepCapture.EstimatedRingBufferSeconds - settings.DeepCapture.PostMarkerTail.TotalSeconds;
-        Assert.True(runUpSeconds > 20, $"only {runUpSeconds:F0}s of run-up survives the tail");
+        Assert.True(runUpSeconds > 15, $"only {runUpSeconds:F0}s of run-up survives the tail");
     }
 
     private string Write(DiagnosticsSettings settings)

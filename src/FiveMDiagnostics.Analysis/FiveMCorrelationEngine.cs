@@ -81,10 +81,12 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         var cores = BuildCoreMetrics(systemSamples);
         var suspectedProcesses = AnalyzeSuspiciousProcesses(systemSamples);
         var hypotheses = new List<HypothesisScore>();
+        var correlatedThreadWait = FindCorrelatedThreadWait(artifacts, frameSamples, metrics);
 
-        AddVramHypothesis(hypotheses, metrics, gpu);
+        AddThreadWaitHypothesis(hypotheses, correlatedThreadWait);
+        AddVramHypothesis(hypotheses, metrics, gpu, correlatedThreadWait);
         AddObsHypothesis(hypotheses, metrics, obsSamples, gpu);
-        AddGpuHypothesis(hypotheses, metrics, obsSamples, systemSamples, gpu);
+        AddGpuHypothesis(hypotheses, metrics, obsSamples, systemSamples, gpu, correlatedThreadWait);
         AddResourceHypothesis(hypotheses, metrics, processSamples, artifacts, obsSamples, systemSamples, cores);
         AddNetworkHypothesis(hypotheses, metrics, networkProbes, networkEndpoints, artifacts, systemSamples, obsSamples);
         AddDiskHypothesis(hypotheses, metrics, processSamples, systemSamples, artifacts);
@@ -357,9 +359,20 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
     /// NVML reports the whole adapter rather than this process. It only becomes a root cause when the
     /// frame data shows the stalls that eviction produces, so occupancy alone never raises a hypothesis.
     /// </summary>
-    private static void AddVramHypothesis(List<HypothesisScore> hypotheses, FrameMetrics metrics, GpuMetrics gpu)
+    private static void AddVramHypothesis(
+        List<HypothesisScore> hypotheses,
+        FrameMetrics metrics,
+        GpuMetrics gpu,
+        CorrelatedThreadWait? correlatedThreadWait)
     {
         if (!gpu.HasData || gpu.PeakVramPercent < VramPressurePercent || metrics.SpikeCount == 0)
+        {
+            return;
+        }
+
+        // A measured off-CPU wait is direct evidence for where the missing time went. High occupancy
+        // cannot override it: VRAM is adapter-wide and full VRAM is normal until an eviction is seen.
+        if (correlatedThreadWait is not null)
         {
             return;
         }
@@ -473,7 +486,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         FrameMetrics metrics,
         IReadOnlyList<ObsTelemetrySample> obsSamples,
         IReadOnlyList<SystemTelemetrySample> systemSamples,
-        GpuMetrics gpu)
+        GpuMetrics gpu,
+        CorrelatedThreadWait? correlatedThreadWait)
     {
         var evidence = new List<string>();
         double confidence = 0;
@@ -520,8 +534,39 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
 
         if (confidence > 0)
         {
+            if (correlatedThreadWait is not null)
+            {
+                confidence = Math.Min(confidence, ContradictedConfidenceCeiling);
+                evidence.Add("ETL-spåret visar samtidigt att en aktiv GTA-tråd låg av CPU:n i en lång väntan; GPU-belastning förklarar därför inte den fångade pausen.");
+            }
+
             hypotheses.Add(new HypothesisScore(RootCauseCategory.GpuFrametimeContention, Math.Min(confidence, 0.9), evidence));
         }
+    }
+
+    private static void AddThreadWaitHypothesis(
+        List<HypothesisScore> hypotheses,
+        CorrelatedThreadWait? wait)
+    {
+        if (wait is null)
+        {
+            return;
+        }
+
+        var evidence = new List<string>
+        {
+            $"ETL-schemaläggningen visar att aktiv GTA-tråd tid {wait.ThreadId:F0} var i Waiting-tillstånd i {wait.DurationMs:F1} ms under den långsamma framen.",
+            "Den tiden var väntetid, inte schemalagd CPU-exekvering; PresentMon MsCPUBusy får därför inte tolkas som att tråden arbetade hela den långsamma framen.",
+        };
+
+        var confidence = 0.9;
+        if (wait.IsUserRequest)
+        {
+            confidence = 0.98;
+            evidence.Add("Den överlappande väntan klassades som Wait/UserRequest, vilket pekar på synkronisering, en signal eller I/O-svar inne i spelprocessen snarare än CPU- eller GPU-mättnad.");
+        }
+
+        hypotheses.Add(new HypothesisScore(RootCauseCategory.FiveMThreadWait, confidence, evidence));
     }
 
     private static void AddResourceHypothesis(
@@ -1151,12 +1196,67 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
 
     private static bool IsRelevantExternalProcess(string processName)
     {
+        var baseName = Path.GetFileNameWithoutExtension(processName);
         return !processName.Contains("FiveM", StringComparison.OrdinalIgnoreCase)
             && !processName.Contains("GTA", StringComparison.OrdinalIgnoreCase)
             && !processName.Contains("obs", StringComparison.OrdinalIgnoreCase)
             && !processName.Contains("FiveMDiagnostics", StringComparison.OrdinalIgnoreCase)
+            && !baseName.Equals("wpr", StringComparison.OrdinalIgnoreCase)
+            && !baseName.Equals("wprui", StringComparison.OrdinalIgnoreCase)
+            && !baseName.Equals("PresentMon", StringComparison.OrdinalIgnoreCase)
             && !processName.Equals("Idle", StringComparison.OrdinalIgnoreCase)
             && !processName.Equals("System", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static CorrelatedThreadWait? FindCorrelatedThreadWait(
+        IReadOnlyList<ArtifactEvidence> artifacts,
+        IReadOnlyList<FrameTelemetrySample> frameSamples,
+        FrameMetrics metrics)
+    {
+        var slowFrames = frameSamples
+            .Where(frame => frame.FrameTimeMs >= Math.Max(100, metrics.SpikeThresholdMs))
+            .ToArray();
+        if (slowFrames.Length == 0)
+        {
+            return null;
+        }
+
+        var matches = new List<CorrelatedThreadWait>();
+        foreach (var trace in artifacts.Where(item => item.Kind == ArtifactKind.EtlTrace))
+        {
+            var count = (int)trace.Metrics.GetValueOrDefault("gameThreadWaitIntervalCount");
+            var threadId = trace.Metrics.GetValueOrDefault("gameThreadWaitThreadId");
+            for (var index = 0; index < count; index++)
+            {
+                var start = trace.Metrics.GetValueOrDefault($"gameThreadWait{index}StartUnixMs");
+                var end = trace.Metrics.GetValueOrDefault($"gameThreadWait{index}EndUnixMs");
+                var duration = trace.Metrics.GetValueOrDefault($"gameThreadWait{index}DurationMs");
+                if (start <= 0 || end <= start || duration < 100)
+                {
+                    continue;
+                }
+
+                // PresentMon timestamps the beginning of the frame-side work. Fifty milliseconds of
+                // clock/anchor tolerance is enough for batching without allowing an unrelated wait
+                // several seconds earlier in the retained ETL to become the incident's explanation.
+                var overlapsSlowFrame = slowFrames.Any(frame =>
+                {
+                    var frameStart = frame.Timestamp.ToUnixTimeMilliseconds() - 50;
+                    var frameEnd = frame.Timestamp.ToUnixTimeMilliseconds() + frame.FrameTimeMs + 50;
+                    return start <= frameEnd && end >= frameStart;
+                });
+
+                if (overlapsSlowFrame)
+                {
+                    matches.Add(new CorrelatedThreadWait(
+                        threadId,
+                        duration,
+                        trace.Metrics.GetValueOrDefault($"gameThreadWait{index}UserRequest") >= 0.5));
+                }
+            }
+        }
+
+        return matches.OrderByDescending(wait => wait.DurationMs).FirstOrDefault();
     }
 
     private static bool IsKnownOverlayOrHook(string processName)
@@ -1238,6 +1338,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             RootCauseCategory.GpuFrametimeContention => "GPU/frametime contention",
             RootCauseCategory.GpuVramPressure => "GPU VRAM pressure (texture eviction)",
             RootCauseCategory.ObsRenderOutputContention => "OBS/render/output contention",
+            RootCauseCategory.FiveMThreadWait => "FiveM-tråd blockerad i Waiting",
             RootCauseCategory.FiveMResourceSpike => "FiveM resource/script spike",
             RootCauseCategory.NetworkJitterOrPacketLoss => "Network jitter/packet loss/routing issue",
             RootCauseCategory.StreamingOrDiskStall => "Streaming/disk stall",
@@ -1292,6 +1393,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         /// </summary>
         public double? CpuBoundTimeShare => TotalSpikeMs > 0 ? CpuBoundSpikeMs / TotalSpikeMs : null;
     }
+
+    private sealed record CorrelatedThreadWait(double ThreadId, double DurationMs, bool IsUserRequest);
 
     private sealed record PresentModeMetrics(
         bool HasData,

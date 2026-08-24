@@ -80,6 +80,42 @@ internal sealed class CpuSampleAttribution
         ? Math.Max((last - first).TotalSeconds, 0)
         : 0;
 
+    public DateTime? FirstSampleTimestamp => _firstSample;
+
+    public DateTime? LastSampleTimestamp => _lastSample;
+
+    /// <summary>Samples make a sleeping background thread distinguishable from an active game loop.</summary>
+    public int SampleCountForThread(int threadId)
+    {
+        return _samples.Count(sample => sample.ThreadId == threadId);
+    }
+
+    public bool IsGameThread(int threadId)
+    {
+        return _processByThread.TryGetValue(threadId, out var processId) && IsGameProcess(Name(processId));
+    }
+
+    public bool IsGameProcess(int processId) => IsGameProcess(Name(processId));
+
+    public int ProcessIdForThread(int threadId) => _processByThread.GetValueOrDefault(threadId, -1);
+
+    /// <summary>
+    /// Main/render game threads spend a material share in the GTA executable. Requiring that share
+    /// excludes dormant helpers and, crucially, a reused thread id whose later owner was the game.
+    /// </summary>
+    public double GameExecutableSampleShareForThread(int threadId, int processId)
+    {
+        var samples = _samples.Where(sample => sample.ThreadId == threadId).ToArray();
+        if (samples.Length == 0)
+        {
+            return 0;
+        }
+
+        var gameSamples = samples.Count(sample =>
+            Resolve(processId, sample.InstructionPointer).Contains("GTAProcess", StringComparison.OrdinalIgnoreCase));
+        return (double)gameSamples / samples.Length;
+    }
+
     /// <summary>Records an image load. Kernel images are kept in one shared range list.</summary>
     public void OnImageLoad(ImageLoadTraceData data)
     {

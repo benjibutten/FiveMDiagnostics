@@ -401,7 +401,12 @@ public sealed class WprDeepCaptureService : IDeepCaptureService, IDisposable
             return (BuildFallbackArguments(settings.DeepCapture), false, $", inbyggda profiler — egen profil kunde inte skrivas: {error}");
         }
 
-        return ($"-start \"{profilePath}!{WprProfileWriter.ProfileName}\"", true, string.Empty);
+        var schedulerNote = !string.IsNullOrWhiteSpace(settings.DeepCapture.CustomProfilePath)
+            ? ", anpassad profil – CSwitch-stackar ej verifierade"
+            : settings.DeepCapture.CollectContextSwitchStacks
+                ? ", CSwitch-stackar aktiva"
+                : ", CSwitch-stackar avstängda";
+        return ($"-start \"{profilePath}!{WprProfileWriter.ProfileName}\"", true, schedulerNote);
     }
 
     private static string BuildFileModeArguments(DiagnosticsSettings settings)
@@ -556,6 +561,7 @@ public sealed class EtlArtifactParser : IArtifactParser
             var contextSwitches = new CoverageTracker();
             var stacks = new CoverageTracker();
             var cpu = new CpuSampleAttribution();
+            var threadWaits = new ThreadWaitAttribution();
             var samples = new CoverageTracker();
             long eventCount = 0;
             DateTime? firstTimestamp = null;
@@ -579,6 +585,7 @@ public sealed class EtlArtifactParser : IArtifactParser
             {
                 contextSwitches.Add(data.TimeStamp);
                 cpu.OnContextSwitch(data);
+                threadWaits.OnContextSwitch(data);
             };
             kernel.StackWalkStack += data => stacks.Add(data.TimeStamp);
 
@@ -624,6 +631,7 @@ public sealed class EtlArtifactParser : IArtifactParser
             // wrong as a denominator for a ring buffer that holds seconds of samples inside an ETL
             // spanning hours.
             var attribution = cpu.Summarize();
+            var threadWait = threadWaits.Summarize(cpu);
 
             var metrics = new Dictionary<string, double>
             {
@@ -662,8 +670,29 @@ public sealed class EtlArtifactParser : IArtifactParser
                 }
             }
 
+            if (threadWait is not null)
+            {
+                metrics["gameThreadWaitThreadId"] = threadWait.ThreadId;
+                metrics["gameThreadLongWaitCount"] = threadWait.LongWaitCount;
+                metrics["gameThreadUserRequestWaitCount"] = threadWait.UserRequestWaitCount;
+                metrics["gameThreadMaxWaitMs"] = Math.Round(threadWait.MaxWaitMs, 3);
+                metrics["gameThreadTotalLongWaitMs"] = Math.Round(threadWait.TotalWaitMs, 3);
+                metrics["gameThreadCpuSampleCount"] = threadWait.CpuSampleCount;
+                metrics["gameThreadWaitIntervalCount"] = threadWait.Intervals.Count;
+
+                for (var index = 0; index < threadWait.Intervals.Count; index++)
+                {
+                    var interval = threadWait.Intervals[index];
+                    metrics[$"gameThreadWait{index}StartUnixMs"] = interval.StartUnixMs;
+                    metrics[$"gameThreadWait{index}EndUnixMs"] = interval.EndUnixMs;
+                    metrics[$"gameThreadWait{index}DurationMs"] = Math.Round(interval.DurationMs, 3);
+                    metrics[$"gameThreadWait{index}UserRequest"] = interval.IsUserRequest ? 1 : 0;
+                }
+            }
+
             var summary = BuildSummary(dpc, isr, durationSeconds, eventCount)
                 + (attribution is not null ? " " + attribution.Describe() : string.Empty)
+                + (threadWait is not null ? " " + threadWait.Describe() : string.Empty)
                 + BuildCoverageSummary(contextSwitches, stacks, firstTimestamp, durationSeconds, source.EventsLost);
 
             return new ArtifactParseResult(
