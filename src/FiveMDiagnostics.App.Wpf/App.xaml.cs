@@ -50,6 +50,7 @@ public partial class App : System.Windows.Application
 				new NetworkTelemetryCollector(),
 				new PresentMonTelemetryCollector(),
 				new NvmlGpuTelemetryCollector(),
+				new GpuProcessMemoryCollector(),
 				new ObsTelemetryCollector(),
 			],
 			artifactParsers:

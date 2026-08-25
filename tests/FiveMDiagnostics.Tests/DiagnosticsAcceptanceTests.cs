@@ -565,6 +565,90 @@ public sealed class DiagnosticsAcceptanceTests
         Assert.True(network.Confidence >= 0.6);
     }
 
+    /// <summary>
+    /// A VRAM verdict has to name the processes holding the memory.
+    /// </summary>
+    /// <remarks>
+    /// Four sessions of reports said "VRAM peaked at 96 %" and then, in the same breath, that VRAM is
+    /// measured per card so the number cannot be attributed. That is a true statement and a useless
+    /// report: the action differs entirely depending on whether the game, the capture software or a
+    /// browser owns the last gigabyte.
+    /// </remarks>
+    [Fact]
+    public void VramPressureNamesTheProcessesHoldingTheMemory()
+    {
+        var baseTime = new DateTimeOffset(2026, 8, 25, 22, 6, 34, TimeSpan.Zero);
+        var events = new List<TelemetryEvent>();
+
+        for (var index = 0; index < 120; index++)
+        {
+            var slow = index is 60 or 61;
+            events.Add(new FrameTelemetrySample(
+                baseTime.AddMilliseconds(index * 16.7),
+                slow ? 606 : 16.7,
+                GpuBusyMs: slow ? 3 : 8,
+                DisplayLatencyMs: slow ? 606 : 17,
+                MsBetweenPresents: slow ? 606 : 16.7,
+                Dropped: false,
+                ProcessName: "FiveM_b3407_GTAProcess",
+
+                // Neither engine working is the signature of waiting on a memory move.
+                CpuBusyMs: slow ? 4 : 8));
+        }
+
+        events.Add(new GpuTelemetrySample(
+            baseTime,
+            IsAvailable: true,
+            "NVIDIA GeForce RTX 3080",
+            UtilizationPercent: 3,
+            MemoryBandwidthUtilizationPercent: 20,
+            UsedVramBytes: (ulong)(10UL * 1024 * 1024 * 1024 * 0.96),
+            TotalVramBytes: 10UL * 1024 * 1024 * 1024,
+            EncoderUtilizationPercent: 30,
+            DecoderUtilizationPercent: 0,
+            TemperatureCelsius: 76,
+            ThrottleReasons: []));
+
+        // Two samples, so the report has to pick the one describing the pressure rather than the last
+        // one it happens to see.
+        events.Add(new GpuProcessMemorySample(
+            baseTime.AddSeconds(20),
+            IsAvailable: true,
+            [new GpuProcessMemoryUsage(100, "FiveM_b3407_GTAProcess", 3_000_000_000, 0)]));
+        events.Add(new GpuProcessMemorySample(
+            baseTime,
+            IsAvailable: true,
+            [
+                new GpuProcessMemoryUsage(100, "FiveM_b3407_GTAProcess", 6_800_000_000, 900_000_000),
+                new GpuProcessMemoryUsage(200, "obs64", 520_000_000, 0),
+                new GpuProcessMemoryUsage(300, "dwm", 90_000_000, 0),
+            ]));
+
+        var analysis = _engine.Analyze(BuildIncident(baseTime, events, 120));
+
+        // Formatted the way the report does, so the assertion holds on a Swedish machine too — the
+        // decimal separator is the user's, and gigabytes are the binary ones Task Manager shows.
+        var game = $"FiveM_b3407_GTAProcess {6_800_000_000 / 1024d / 1024 / 1024:F1} GB";
+        var capture = $"obs64 {520_000_000 / 1024d / 1024 / 1024:F1} GB";
+
+        var vram = Assert.Single(analysis.Hypotheses, item => item.Category == RootCauseCategory.GpuVramPressure);
+        Assert.Contains(vram.Evidence, text => text.Contains(game, StringComparison.Ordinal));
+        Assert.Contains(vram.Evidence, text => text.Contains(capture, StringComparison.Ordinal));
+        Assert.DoesNotContain(vram.Evidence, text => text.Contains("inte per process", StringComparison.Ordinal));
+
+        // dwm is inside the top three but holds 0.08 GB. Listing it turns the line that answers "what
+        // do I close" into noise.
+        Assert.DoesNotContain(vram.Evidence, text => text.Contains("dwm", StringComparison.Ordinal));
+
+        var highlight = Assert.Single(analysis.TimelineHighlights, item => item.Category == "VRAM per process");
+        Assert.Contains(game, highlight.Summary, StringComparison.Ordinal);
+
+        // The one-line summary is what a reader sees first, so the owner belongs there and not only in
+        // the evidence list behind the verdict.
+        Assert.Contains("FiveM_b3407_GTAProcess", analysis.Summary, StringComparison.Ordinal);
+        Assert.Contains($"{6_800_000_000 / 1024d / 1024 / 1024:F1} GB", analysis.Summary, StringComparison.Ordinal);
+    }
+
     private IncidentRecord BuildIncident(DateTimeOffset baseTime, IReadOnlyList<TelemetryEvent> events, double refreshRateHz)
     {
         return new IncidentRecord(

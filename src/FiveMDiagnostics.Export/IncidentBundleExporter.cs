@@ -271,6 +271,16 @@ public sealed class IncidentBundleExporter : IIncidentExporter
                 ("temperatureCelsius", gpu.TemperatureCelsius?.ToString(CultureInfo.InvariantCulture) ?? string.Empty),
                 ("throttleReasons", string.Join(';', gpu.ThrottleReasons)),
             ],
+            GpuProcessMemorySample gpuProcesses =>
+            [
+                ("isAvailable", gpuProcesses.IsAvailable.ToString()),
+                ("dedicatedTotalBytes", gpuProcesses.TotalDedicatedBytes.ToString(CultureInfo.InvariantCulture)),
+
+                // Flattened into one field rather than a row per process: the bundle's telemetry table is
+                // one row per sample, and a reader wants the ranking, not a join.
+                ("processes", string.Join(';', gpuProcesses.Processes.Select(item =>
+                    $"{item.ProcessName}={item.DedicatedBytes.ToString(CultureInfo.InvariantCulture)}"))),
+            ],
             SystemTelemetrySample system => FlattenSystem(system),
             ProcessTelemetrySample process =>
             [

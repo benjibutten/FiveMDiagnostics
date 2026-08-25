@@ -1,5 +1,7 @@
 namespace FiveMDiagnostics.Tools.EtlAnalyzer;
 
+using System.Runtime.InteropServices;
+
 using Microsoft.Windows.EventTracing;
 
 /// <summary>
@@ -43,6 +45,13 @@ internal static class Program
 
         try
         {
+            // The wait report reads the file itself, with a different library — see WaitReports.
+            if (command is "wait")
+            {
+                RunWait(path, target, args);
+                return 0;
+            }
+
             return Run(path, command, target, args);
         }
         catch (InvalidTraceDataException ex)
@@ -52,6 +61,16 @@ internal static class Program
             // other commands on the same file usually still work.
             Console.Error.WriteLine($"The trace contains a stream that could not be parsed: {ex.Message}");
             Console.Error.WriteLine("Other commands on the same file may still work.");
+            return 2;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or COMException)
+        {
+            // A path that exists but is not a trace lands here, and both libraries report it badly:
+            // TraceEvent says "could not find file" about a file it is looking straight at, because it
+            // only accepts .etl, and TraceProcessing surfaces a COM "catastrophic failure". Say what is
+            // actually wrong instead of printing either.
+            Console.Error.WriteLine($"{path} could not be read as an ETL trace: {ex.Message}");
+            Console.Error.WriteLine("This tool reads .etl files recorded by the app's deep capture.");
             return 2;
         }
     }
@@ -111,6 +130,7 @@ internal static class Program
                 break;
 
             case "all":
+                RunWait(path, target, args);
                 CpuReports.Cpu(window, target, IntOf(args, "--threads") ?? 12);
                 CpuReports.Timeline(window, IntOf(args, "--bucket") ?? 200);
                 IoReports.Report(window, hardFaults!.Result.Faults, diskIo!.Result.Activity, fileIo!.Result, target);
@@ -123,6 +143,18 @@ internal static class Program
         }
 
         return 0;
+    }
+
+    private static void RunWait(string path, string target, string[] args)
+    {
+        WaitReports.Wait(
+            path,
+            target,
+            IntOf(args, "--tid"),
+            DoubleOf(args, "--min-ms") ?? 100,
+            IntOf(args, "--top") ?? 15,
+            IntOf(args, "--from-ms"),
+            IntOf(args, "--to-ms"));
     }
 
     private static int RequiredThreadId(string[] args)
@@ -142,6 +174,13 @@ internal static class Program
         return int.TryParse(ValueOf(args, name), out var value) ? value : null;
     }
 
+    private static double? DoubleOf(string[] args, string name)
+    {
+        return double.TryParse(ValueOf(args, name), System.Globalization.CultureInfo.InvariantCulture, out var value)
+            ? value
+            : null;
+    }
+
     private static void PrintUsage()
     {
         Console.WriteLine("""
@@ -153,13 +192,17 @@ internal static class Program
               smt    --tid <id>   how often that thread shared a physical core, and with what
               timeline            per-bucket CPU for the busiest processes
               io                  hard faults, disk operations and file system traffic
-              all                 cpu + timeline + io
+              wait                off-CPU intervals on the game thread, and the thread that released it
+              all                 cpu + timeline + wait + io
 
             Options
               --process <name>    substring of the process to focus on (default: GTAProcess)
               --threads <n>       threads to list in the cpu report (default: 12)
               --bucket <ms>       timeline bucket size (default: 200)
-              --tid <id>          thread id for the thread and smt commands
+              --tid <id>          thread id for the thread, smt and wait commands
+                                  (wait defaults to the busiest thread of the target process)
+              --min-ms <ms>       shortest wait the wait command reports (default: 100)
+              --top <n>           waits to detail in the wait report (default: 15)
               --from-ms <ms>      start offset from the first retained CPU sample
               --to-ms <ms>        end offset from the first retained CPU sample
 

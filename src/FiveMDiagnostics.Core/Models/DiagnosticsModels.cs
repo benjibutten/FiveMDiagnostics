@@ -99,6 +99,22 @@ public sealed record GpuOptions
 {
     public bool Enabled { get; set; } = true;
     public TimeSpan PollingInterval { get; set; } = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>Per-process VRAM accounting from the Windows <c>GPU Process Memory</c> counters.</summary>
+    public bool ProcessMemoryEnabled { get; set; } = true;
+
+    /// <summary>
+    /// How often the per-process breakdown is sampled. Far slower than the adapter poll on purpose:
+    /// a wildcard counter query walks every process holding a GPU allocation, and what it measures —
+    /// who owns the memory — moves on the scale of loading a scene, not of a frame.
+    /// </summary>
+    public TimeSpan ProcessMemoryInterval { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Processes retained per sample, largest first. The tail of the list is dozens of processes holding
+    /// a few megabytes of desktop composition each, which is noise in both the log and the report.
+    /// </summary>
+    public int ProcessMemoryTopCount { get; set; } = 10;
 }
 
 public sealed record ObsOptions
@@ -642,6 +658,7 @@ public sealed record DiagnosticStatusEntry(DateTimeOffset Timestamp, StatusLevel
 [JsonPolymorphic(TypeDiscriminatorPropertyName = "$type")]
 [JsonDerivedType(typeof(FrameTelemetrySample), "frame")]
 [JsonDerivedType(typeof(GpuTelemetrySample), "gpu")]
+[JsonDerivedType(typeof(GpuProcessMemorySample), "gpu-process-memory")]
 [JsonDerivedType(typeof(SystemTelemetrySample), "system")]
 [JsonDerivedType(typeof(ProcessTelemetrySample), "process")]
 [JsonDerivedType(typeof(ObsTelemetrySample), "obs")]
@@ -701,6 +718,61 @@ public sealed record GpuTelemetrySample(
     public double? VramUsagePercent => TotalVramBytes is > 0 && UsedVramBytes is not null
         ? (double)UsedVramBytes.Value / TotalVramBytes.Value * 100
         : null;
+}
+
+/// <summary>
+/// One process's share of the adapter's memory, as Windows accounts it.
+/// </summary>
+/// <param name="DedicatedBytes">
+/// Memory resident in VRAM. This is the number that has to fit in the card, and the one Task Manager
+/// shows as "Dedicated GPU memory".
+/// </param>
+/// <param name="SharedBytes">
+/// Memory the process has in system RAM that the GPU can reach over PCIe. It grows when allocations no
+/// longer fit in VRAM, so a process whose shared usage climbs while dedicated stalls is being evicted.
+/// </param>
+public sealed record GpuProcessMemoryUsage(
+    int ProcessId,
+    string ProcessName,
+    ulong DedicatedBytes,
+    ulong SharedBytes)
+{
+    public double DedicatedGigabytes => DedicatedBytes / 1024d / 1024 / 1024;
+
+    public double SharedGigabytes => SharedBytes / 1024d / 1024 / 1024;
+}
+
+/// <summary>
+/// Which processes hold the adapter's memory, so "VRAM is at 95 %" can be answered with "and here is
+/// what is holding it".
+/// </summary>
+/// <remarks>
+/// NVML reports occupancy for the whole card, which was enough to find that stalls cluster above a
+/// VRAM threshold but not to act on it: the fix differs entirely depending on whether the game, the
+/// capture software or a browser owns the last gigabyte. The numbers come from the Windows
+/// <c>GPU Process Memory</c> counter set — the same source as Task Manager's per-process column — so
+/// they are vendor neutral and cover processes NVML never reports in WDDM mode.
+/// </remarks>
+public sealed record GpuProcessMemorySample(
+    DateTimeOffset Timestamp,
+    bool IsAvailable,
+    IReadOnlyList<GpuProcessMemoryUsage> Processes,
+    string? UnavailableReason = null) : TelemetryEvent(Timestamp, "GpuProcessMemory")
+{
+    /// <summary>
+    /// Dedicated bytes over every process that reported any.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately not expected to match the adapter total NVML reports. The counter set covers
+    /// processes, and VRAM also holds the display's own framebuffers plus allocations belonging to
+    /// nothing that is still running; the gap between this sum and NVML's figure is itself readable.
+    /// </remarks>
+    public ulong TotalDedicatedBytes => Processes.Aggregate(0UL, (total, process) => total + process.DedicatedBytes);
+
+    public IEnumerable<GpuProcessMemoryUsage> Top(int count)
+    {
+        return Processes.OrderByDescending(process => process.DedicatedBytes).Take(count);
+    }
 }
 
 public sealed record SystemTelemetrySample(

@@ -192,12 +192,17 @@ Read a deep capture ETL:
 dotnet run --project src/FiveMDiagnostics.Tools.EtlAnalyzer -- <trace.etl> cpu
 dotnet run --project src/FiveMDiagnostics.Tools.EtlAnalyzer -- <trace.etl> thread --tid 24096
 dotnet run --project src/FiveMDiagnostics.Tools.EtlAnalyzer -- <trace.etl> io
+dotnet run --project src/FiveMDiagnostics.Tools.EtlAnalyzer -- <trace.etl> wait --min-ms 100
 dotnet run --project src/FiveMDiagnostics.Tools.EtlAnalyzer -- <trace.etl> cpu --from-ms 20000 --to-ms 23000
 ```
 
 The app's own ETL parser answers whether a trace is usable and whether a driver held the CPU. The tool
 answers what comes next: which thread inside the game was the bottleneck, what code it was running,
 whether it was sharing a physical core, and whether the file system traffic ever reached the disk.
+`wait` answers the question a CPU report cannot: when the game thread is asleep for most of a long
+frame, which thread released it, and which module it was blocked in. It needs a capture recorded with
+`CSwitch` and `ReadyThread` stacks, and it reads the trace with TraceEvent because TraceProcessing
+rejects the context switch stream in these ring buffer captures.
 `--from-ms` and `--to-ms` zoom any CPU or thread report into offsets from the first retained CPU sample,
 which keeps a multi-second wait from being averaged away by the rest of the ring buffer.
 Rates are reported in *cores*, so a thread at 0.89 cores is spending 19.6 ms of CPU inside a 22 ms
@@ -298,6 +303,23 @@ frame data should be treated as incomplete.
 GPU sampling uses `nvml.dll`, which ships with the NVIDIA display driver and needs no separate install.
 On a non-NVIDIA machine the collector reports once that NVML is unavailable and then emits samples marked
 unavailable, leaving every other collector untouched.
+
+### Per-process VRAM
+
+NVML reports occupancy for the whole adapter, which is enough to find that stalls cluster above a VRAM
+threshold and not enough to act on it: the fix differs entirely depending on whether the game, the
+capture software or a browser owns the last gigabyte. A second collector therefore samples the Windows
+`GPU Process Memory` counters — the same source as Task Manager's per-process column — every five
+seconds, and the incident report names the top holders instead of carrying the old caveat that VRAM
+cannot be attributed.
+
+Read through PDH rather than `System.Diagnostics.PerformanceCounter`, because a wildcard instance set
+has to be expanded into one counter object per process otherwise, and via `PdhAddEnglishCounter` so the
+paths resolve on a non-English Windows. NVML is not an option here at all: its per-process memory
+queries return "not supported" for graphics processes on a WDDM driver, which is every consumer machine.
+
+Turn it off with `Gpu.ProcessMemoryEnabled`; `Gpu.ProcessMemoryInterval` and `Gpu.ProcessMemoryTopCount`
+set the cadence and how many processes each sample keeps.
 
 ## Capture depth
 
@@ -429,6 +451,16 @@ GPU telemetry otherwise survives only inside incident windows, and whatever the 
 into a timeline string was gone: reconstructing how VRAM behaved across an evening meant taking 42
 separate timeline strings apart by hand. At the default 500 ms cadence a whole stream costs a few
 megabytes. Flushed per row for the same reason the journal is, bounded at 64 MB, and written unredacted.
+
+The per-process breakdown is written next to it, one row per process per sample:
+
+```text
+%LocalAppData%\FiveMDiagnostics\Sessions\gpuprocs_<yyyyMMdd_HHmmss>.csv
+```
+
+Columns are timestamp, process id, process name, dedicated bytes and shared bytes. Long format rather
+than a column per process, because the set of processes holding GPU memory changes during a session and
+a wide file would have to fix its columns when the header is written.
 
 ## Export bundle
 

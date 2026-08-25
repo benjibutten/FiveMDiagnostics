@@ -55,6 +55,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         var processSamples = incident.GetEvents<ProcessTelemetrySample>();
         var obsSamples = incident.GetEvents<ObsTelemetrySample>();
         var gpuSamples = incident.GetEvents<GpuTelemetrySample>();
+        var gpuProcessMemory = PeakGpuProcessMemory(incident.GetEvents<GpuProcessMemorySample>());
         var networkProbes = incident.GetEvents<NetworkProbeSample>();
         var networkEndpoints = incident.GetEvents<NetworkEndpointSample>();
         var artifacts = incident.GetEvents<ArtifactEvidence>();
@@ -84,7 +85,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         var correlatedThreadWait = FindCorrelatedThreadWait(artifacts, frameSamples, metrics);
 
         AddThreadWaitHypothesis(hypotheses, correlatedThreadWait);
-        AddVramHypothesis(hypotheses, metrics, gpu, correlatedThreadWait);
+        AddVramHypothesis(hypotheses, metrics, gpu, correlatedThreadWait, gpuProcessMemory);
         AddObsHypothesis(hypotheses, metrics, obsSamples, gpu);
         AddGpuHypothesis(hypotheses, metrics, obsSamples, systemSamples, gpu, correlatedThreadWait);
         AddResourceHypothesis(hypotheses, metrics, processSamples, artifacts, obsSamples, systemSamples, cores);
@@ -106,9 +107,9 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                 ["Det fanns inte tillräckligt med samstämmig telemetry för en säker klassificering."]));
         }
 
-        var highlights = BuildHighlights(incident, metrics, hypotheses.First(), artifacts, obsSamples, gpu, networkProbes, suspectedProcesses);
+        var highlights = BuildHighlights(incident, metrics, hypotheses.First(), artifacts, obsSamples, gpu, networkProbes, suspectedProcesses, gpuProcessMemory);
         var top = hypotheses[0];
-        var summary = BuildSummary(top, metrics, obsSamples, gpu, artifacts, networkProbes, suspectedProcesses);
+        var summary = BuildSummary(top, metrics, obsSamples, gpu, artifacts, networkProbes, suspectedProcesses, gpuProcessMemory);
 
         return new IncidentAnalysis(
             hypotheses,
@@ -322,6 +323,46 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
     }
 
     /// <summary>
+    /// The window's fullest moment, which is the one worth reporting.
+    /// </summary>
+    /// <remarks>
+    /// The per-process breakdown is sampled every few seconds while an incident window spans minutes,
+    /// so an arbitrary sample can land after the game released the memory it was holding. Picking the
+    /// sample with the largest total keeps the table describing the pressure the incident is about.
+    /// </remarks>
+    private static GpuProcessMemorySample? PeakGpuProcessMemory(IReadOnlyList<GpuProcessMemorySample> samples)
+    {
+        return samples
+            .Where(sample => sample.IsAvailable && sample.Processes.Count > 0)
+            .OrderByDescending(sample => sample.TotalDedicatedBytes)
+            .FirstOrDefault();
+    }
+
+    /// <summary>
+    /// The largest holders of VRAM as one sentence, or null when the breakdown was not collected.
+    /// </summary>
+    /// <remarks>
+    /// Three entries, and only those holding at least a tenth of a gigabyte. The tail is a dozen
+    /// processes with a few megabytes of desktop composition each, and listing them turns the one line
+    /// that answers "what do I close" into something nobody reads.
+    /// </remarks>
+    private static string? DescribeGpuProcessMemory(GpuProcessMemorySample? sample)
+    {
+        if (sample is null)
+        {
+            return null;
+        }
+
+        var owners = sample
+            .Top(3)
+            .Where(process => process.DedicatedGigabytes >= 0.1)
+            .Select(process => $"{process.ProcessName} {process.DedicatedGigabytes:F1} GB")
+            .ToArray();
+
+        return owners.Length > 0 ? string.Join(", ", owners) + "." : null;
+    }
+
+    /// <summary>
     /// FiveM's main thread is the practical bottleneck for script work, so one core pinned while the
     /// machine as a whole is idle is much stronger evidence of a resource spike than total CPU load.
     /// </summary>
@@ -363,7 +404,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         List<HypothesisScore> hypotheses,
         FrameMetrics metrics,
         GpuMetrics gpu,
-        CorrelatedThreadWait? correlatedThreadWait)
+        CorrelatedThreadWait? correlatedThreadWait,
+        GpuProcessMemorySample? gpuProcessMemory)
     {
         if (!gpu.HasData || gpu.PeakVramPercent < VramPressurePercent || metrics.SpikeCount == 0)
         {
@@ -421,7 +463,9 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             evidence.Add($"NVENC låg på {gpu.PeakEncoderPercent:F0}%, så encodern konkurrerade om samma GPU-minne.");
         }
 
-        evidence.Add("Obs: VRAM mäts per grafikkort, inte per process, så andra program bidrar till siffran.");
+        evidence.Add(DescribeGpuProcessMemory(gpuProcessMemory) is { } owners
+            ? $"Fördelningen vid trycket: {owners}"
+            : "Obs: VRAM mäts per grafikkort, inte per process, så andra program bidrar till siffran.");
         hypotheses.Add(new HypothesisScore(RootCauseCategory.GpuVramPressure, Math.Min(confidence, 0.95), evidence));
     }
 
@@ -976,7 +1020,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         IReadOnlyList<ObsTelemetrySample> obsSamples,
         GpuMetrics gpu,
         IReadOnlyList<NetworkProbeSample> probes,
-        IReadOnlyList<SuspectedProcessImpact> suspectedProcesses)
+        IReadOnlyList<SuspectedProcessImpact> suspectedProcesses,
+        GpuProcessMemorySample? gpuProcessMemory)
     {
         var highlights = new List<TimelineHighlight>
         {
@@ -1024,6 +1069,11 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                 $"{gpu.AdapterName ?? "GPU"}: peak {gpu.PeakUtilizationPercent:F0}% util, VRAM {gpu.PeakVramUsedGb:F1}/{gpu.TotalVramGb:F1} GB ({gpu.PeakVramPercent:F0}%), NVENC {gpu.PeakEncoderPercent:F0}%."));
         }
 
+        if (DescribeGpuProcessMemory(gpuProcessMemory) is { } vramOwners)
+        {
+            highlights.Add(new(gpuProcessMemory!.Timestamp, "VRAM per process", vramOwners));
+        }
+
         var obs = obsSamples.LastOrDefault();
         if (obs is not null)
         {
@@ -1063,7 +1113,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         GpuMetrics gpu,
         IReadOnlyList<ArtifactEvidence> artifacts,
         IReadOnlyList<NetworkProbeSample> probes,
-        IReadOnlyList<SuspectedProcessImpact> suspectedProcesses)
+        IReadOnlyList<SuspectedProcessImpact> suspectedProcesses,
+        GpuProcessMemorySample? gpuProcessMemory)
     {
         // Both are observations rather than conclusions, so they belong in the summary whether or not
         // the engine managed to classify anything. An unclassified window is precisely where "every
@@ -1114,8 +1165,13 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         var attribution = metrics.HasCpuGpuBreakdown && metrics.SpikeCount > 0
             ? $" Av {metrics.SpikeCount} spikes var {metrics.CpuBoundSpikes} CPU-bundna, {metrics.GpuBoundSpikes} GPU-bundna och {metrics.PresentBoundSpikes} present/display-bundna."
             : string.Empty;
+        // The adapter figure says how full the card was; the top holder says whose memory it was. Four
+        // sessions of reports carried the first without the second, and the reader could only guess.
+        var vramOwnerHint = gpuProcessMemory?.Top(1).FirstOrDefault() is { } largest
+            ? $" Störst i VRAM: {largest.ProcessName} med {largest.DedicatedGigabytes:F1} GB."
+            : string.Empty;
         var vramHint = gpu.HasData
-            ? $" VRAM toppade på {gpu.PeakVramPercent:F0}% ({gpu.PeakVramUsedGb:F1}/{gpu.TotalVramGb:F1} GB)."
+            ? $" VRAM toppade på {gpu.PeakVramPercent:F0}% ({gpu.PeakVramUsedGb:F1}/{gpu.TotalVramGb:F1} GB).{vramOwnerHint}"
             : string.Empty;
         var artifactHint = artifacts.Count > 0 ? $" {artifacts.Count} importerade artifacts bidrog till bedömningen." : string.Empty;
         var suspectHint = suspectedProcesses.FirstOrDefault() is { } suspect

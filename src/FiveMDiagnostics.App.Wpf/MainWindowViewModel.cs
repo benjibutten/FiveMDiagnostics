@@ -47,6 +47,7 @@ public sealed class MainWindowViewModel : ObservableObject
     private string _liveCpuText = Strings.LiveStatsIdle;
     private string _liveMemoryText = Strings.LiveStatsIdle;
     private string _liveVramText = Strings.LiveStatsIdle;
+    private string _liveVramOwnersText = Strings.LiveStatsIdle;
     private string _pacingSaturatedText = Strings.PacingIdle;
     private string _pacingWorstText = string.Empty;
     private string _pacingCurrentText = string.Empty;
@@ -98,6 +99,7 @@ public sealed class MainWindowViewModel : ObservableObject
         _sessionManager.IncidentsEvicted += OnIncidentsEvicted;
         _sessionManager.SystemTelemetryUpdated += OnSystemTelemetryUpdated;
         _sessionManager.GpuTelemetryUpdated += OnGpuTelemetryUpdated;
+        _sessionManager.GpuProcessMemoryUpdated += OnGpuProcessMemoryUpdated;
         _sessionManager.CaptureHealthUpdated += OnCaptureHealthUpdated;
         _sessionManager.FramePacingWindowCompleted += OnFramePacingWindowCompleted;
 
@@ -198,6 +200,19 @@ public sealed class MainWindowViewModel : ObservableObject
     {
         get => _liveVramText;
         private set => SetProperty(ref _liveVramText, value);
+    }
+
+    /// <summary>
+    /// Who is holding the card's memory, largest first.
+    /// </summary>
+    /// <remarks>
+    /// Next to the adapter total on purpose. "VRAM: 9.6 of 10.0 GB (96%)" is the number that predicts a
+    /// stall, and the only useful question it raises — what should I close — is the one this answers.
+    /// </remarks>
+    public string LiveVramOwnersText
+    {
+        get => _liveVramOwnersText;
+        private set => SetProperty(ref _liveVramOwnersText, value);
     }
 
     /// <summary>
@@ -511,6 +526,21 @@ public sealed class MainWindowViewModel : ObservableObject
         _ = _dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() => LiveVramText = text));
     }
 
+    private void OnGpuProcessMemoryUpdated(object? sender, GpuProcessMemorySample sample)
+    {
+        // Two entries, not the ten the sample carries: this is one line in a header bar, and the third
+        // largest holder of VRAM has never been what someone acts on.
+        var owners = sample.IsAvailable
+            ? sample.Top(2)
+                .Where(process => process.DedicatedGigabytes >= 0.1)
+                .Select(process => $"{process.ProcessName} {process.DedicatedGigabytes:F1} GB")
+                .ToArray()
+            : [];
+
+        var text = owners.Length > 0 ? string.Join(" · ", owners) : Strings.LiveVramOwnersUnavailable;
+        _ = _dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() => LiveVramOwnersText = text));
+    }
+
     private void OnCaptureHealthUpdated(object? sender, CaptureHealthTelemetrySample sample)
     {
         var ready = sample.CaptureProcessRunning
@@ -674,6 +704,7 @@ public sealed class MainWindowViewModel : ObservableObject
             LiveCpuText = Strings.LiveStatsIdle;
             LiveMemoryText = Strings.LiveStatsIdle;
             LiveVramText = Strings.LiveStatsIdle;
+            LiveVramOwnersText = Strings.LiveStatsIdle;
 
             // Pacing figures belong to the session that produced them. The session manager builds a fresh
             // FramePacingMonitor on every start, but the view model keeps whatever it was last told —

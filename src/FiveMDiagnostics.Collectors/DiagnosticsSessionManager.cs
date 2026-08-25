@@ -97,6 +97,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
     public event EventHandler<GpuTelemetrySample>? GpuTelemetryUpdated;
 
+    public event EventHandler<GpuProcessMemorySample>? GpuProcessMemoryUpdated;
+
     public event EventHandler<CaptureHealthTelemetrySample>? CaptureHealthUpdated;
 
     /// <summary>Raised once per classified frame pacing window, healthy ones included.</summary>
@@ -930,6 +932,10 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 else if (telemetryEvent is GpuTelemetrySample gpuSample)
                 {
                     GpuTelemetryUpdated?.Invoke(this, gpuSample);
+                }
+                else if (telemetryEvent is GpuProcessMemorySample gpuProcessSample)
+                {
+                    GpuProcessMemoryUpdated?.Invoke(this, gpuProcessSample);
                 }
                 else if (telemetryEvent is CaptureHealthTelemetrySample healthSample)
                 {
