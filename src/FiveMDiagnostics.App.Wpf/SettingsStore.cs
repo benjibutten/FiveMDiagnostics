@@ -96,7 +96,13 @@ public sealed class SettingsStore
             changed = true;
         }
 
+        if (settings.Gpu.MigrateProcessMemoryTopCount())
+        {
+            changed = true;
+        }
+
         settings.DeepCapture.Normalize();
+        settings.Gpu.Normalize();
 
         if (settings.MaxRetainedIncidents is < 1 or > 1000)
         {
@@ -113,6 +119,7 @@ public sealed class SettingsStore
         // only on the way in.
         settings.AutoDetect.Normalize();
         settings.DeepCapture.Normalize();
+        settings.Gpu.Normalize();
         settings.MaxRetainedIncidents = Math.Clamp(settings.MaxRetainedIncidents, 1, 1000);
 
         Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);

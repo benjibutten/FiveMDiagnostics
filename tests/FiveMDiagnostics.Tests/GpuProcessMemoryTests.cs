@@ -29,6 +29,148 @@ public sealed class GpuProcessMemoryTests
         Assert.Equal(expected, GpuProcessMemoryAggregator.ParseProcessId(instance));
     }
 
+    [Theory]
+    [InlineData("pid_29268_luid_0x00000000_0x0000c42a_phys_0", "luid_0x00000000_0x0000c42a")]
+    [InlineData("pid_29268_luid_0x00000000_0x0000c42a_phys_3", "luid_0x00000000_0x0000c42a")]
+
+    // Segments of the same card are the same card, so the key must not carry the segment.
+    [InlineData("pid_1_luid_0x0_0x1", "luid_0x0_0x1")]
+    [InlineData("pid_29268", null)]
+    [InlineData("", null)]
+    public void AdapterNamesAreReadWithoutTheMemorySegment(string instance, string? expected)
+    {
+        Assert.Equal(expected, GpuProcessMemoryAggregator.ParseAdapter(instance));
+    }
+
+    /// <summary>
+    /// The reading that made this necessary: obs64 reported 213 GB of dedicated memory on a 10 GB card,
+    /// climbing all evening, and stood as "largest VRAM holder" in all 145 incident reports of the
+    /// session. Every other row was right — the same samples with obs64 removed tracked the adapter's
+    /// own figure to within a quarter of a gigabyte for five hours.
+    /// </summary>
+    /// <remarks>
+    /// Note which process anchors the table. Picking the adapter with the largest total would hand the
+    /// answer straight to the runaway sum; the game's adapter is the one the table is about.
+    /// </remarks>
+    [Fact]
+    public void MemoryOnAdaptersTheGameIsNotUsingIsLeftOut()
+    {
+        var usage = GpuProcessMemoryAggregator.Aggregate(
+            [
+                Reading("pid_28140_luid_0x00000000_0x0000c42a_phys_0", 7_173_000_000),
+                Reading("pid_1100_luid_0x00000000_0x0000c42a_phys_0", 889_000_000),
+                Reading("pid_17324_luid_0x00000000_0x0000c42a_phys_0", 611_000_000),
+
+                // The same capture process, hooked into other processes and accumulating instances on an
+                // adapter the game never touches.
+                Reading("pid_17324_luid_0x00000000_0x0000f001_phys_0", 106_000_000_000),
+                Reading("pid_17324_luid_0x00000000_0x0000f002_phys_0", 107_000_000_000),
+            ],
+            [],
+            new Dictionary<int, string> { [28140] = "FiveM_b3407_GTAProcess", [1100] = "dwm", [17324] = "obs64" },
+            topCount: 25,
+            anchorProcessId: 28140);
+
+        Assert.Equal(
+            ["FiveM_b3407_GTAProcess", "dwm", "obs64"],
+            usage.Select(item => item.ProcessName));
+
+        var capture = Assert.Single(usage, item => item.ProcessName == "obs64");
+        Assert.Equal(611_000_000UL, capture.DedicatedBytes);
+        Assert.Equal(1, capture.InstanceCount);
+    }
+
+    /// <summary>
+    /// Instance counts exist so the next reading that goes wrong is diagnosable from the log rather than
+    /// from reading the aggregator a week later.
+    /// </summary>
+    [Fact]
+    public void TheNumberOfCounterInstancesBehindAFigureIsReported()
+    {
+        var usage = GpuProcessMemoryAggregator.Aggregate(
+            [
+                Reading("pid_100_luid_0x0_0x1_phys_0", 4_000_000_000),
+                Reading("pid_100_luid_0x0_0x1_phys_1", 2_000_000_000),
+                Reading("pid_200_luid_0x0_0x1_phys_0", 500_000_000),
+            ],
+            [],
+            new Dictionary<int, string>(),
+            topCount: 10,
+            anchorProcessId: 100);
+
+        Assert.Equal(2, Assert.Single(usage, item => item.ProcessId == 100).InstanceCount);
+        Assert.Equal(1, Assert.Single(usage, item => item.ProcessId == 200).InstanceCount);
+    }
+
+    /// <summary>
+    /// A session that starts before the game has allocated anything still has to produce a table, and so
+    /// does a counter set that stops naming adapters at all.
+    /// </summary>
+    [Fact]
+    public void WithoutAnAnchorTheLargestAdapterIsUsedAndUnnamedAdaptersAreKept()
+    {
+        var usage = GpuProcessMemoryAggregator.Aggregate(
+            [
+                Reading("pid_1_luid_0x0_0x1_phys_0", 900),
+                Reading("pid_2_luid_0x0_0x2_phys_0", 100),
+                Reading("pid_3", 400),
+            ],
+            [],
+            new Dictionary<int, string>(),
+            topCount: 10,
+            anchorProcessId: 4242);
+
+        // Adapter 0x1 wins on total; the instance with no adapter in its name is not something to throw
+        // away over a naming convention.
+        Assert.Equal([1, 3], usage.Select(item => item.ProcessId).Order());
+    }
+
+    /// <summary>
+    /// A figure no adapter this runs on could hold is a counter fault. It stays in the log, where it can
+    /// be diagnosed, and out of the reports, where it was wrong about the one thing they are for.
+    /// </summary>
+    [Fact]
+    public void ImpossibleReadingsAreKeptInTheSampleAndOutOfTheTopList()
+    {
+        var sample = new GpuProcessMemorySample(
+            Now,
+            IsAvailable: true,
+            [
+                new GpuProcessMemoryUsage(17324, "obs64", 213_900_000_000, 0, InstanceCount: 4821),
+                new GpuProcessMemoryUsage(28140, "FiveM_b3407_GTAProcess", 7_173_000_000, 0, InstanceCount: 1),
+                new GpuProcessMemoryUsage(1100, "dwm", 889_000_000, 0, InstanceCount: 1),
+            ]);
+
+        Assert.Equal("FiveM_b3407_GTAProcess", sample.Top(1).Single().ProcessName);
+        Assert.Equal("obs64", Assert.Single(sample.ImplausibleProcesses).ProcessName);
+        Assert.Equal(3, sample.Processes.Count);
+
+        // And out of the total. The correlation engine picks an incident's peak sample by this figure,
+        // so a runaway reading climbing all evening would silently turn "the fullest moment" into "the
+        // newest sample in the window".
+        Assert.Equal(8_062_000_000UL, sample.TotalDedicatedBytes);
+    }
+
+    /// <summary>
+    /// A process can hold shared memory without holding any dedicated. Choosing the adapter on dedicated
+    /// alone then sends the game to whichever adapter something else was busiest on — and filters the
+    /// game's own memory out of the game's own table.
+    /// </summary>
+    [Fact]
+    public void TheGameFindsItsAdapterEvenWhenItHoldsOnlySharedMemory()
+    {
+        var usage = GpuProcessMemoryAggregator.Aggregate(
+            [Reading("pid_900_luid_0x0_0x2_phys_0", 4_000_000_000)],
+            [Reading("pid_28140_luid_0x0_0x1_phys_0", 150_000_000)],
+            new Dictionary<int, string> { [28140] = "FiveM_b3407_GTAProcess", [900] = "chrome" },
+            topCount: 25,
+            anchorProcessId: 28140);
+
+        var game = Assert.Single(usage, item => item.ProcessId == 28140);
+        Assert.Equal(150_000_000UL, game.SharedBytes);
+        Assert.DoesNotContain(usage, item => item.ProcessId == 900);
+    }
+
     /// <summary>
     /// One process has an instance per adapter and per memory segment. Reporting the first one found
     /// would show a laptop's integrated share and omit the discrete card's — the same number, wrong by
@@ -156,6 +298,58 @@ public sealed class GpuProcessMemoryTests
         // And that the ids in the instance names are real ones. A parser that read the wrong digits
         // would still produce a plausible table, just one where nothing could be named.
         Assert.Contains(usage, item => !item.ProcessName.StartsWith("pid ", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The list has to be long enough that the transient holders can arrive without pushing the resident
+    /// ones off the end. Nine processes held GPU memory for a whole measured session and four more came
+    /// and went; at ten places the non-game total was a floor rather than a figure.
+    /// </summary>
+    [Fact]
+    public void TheDefaultKeepsEnoughProcessesToAccountForTheCard()
+    {
+        Assert.True(
+            new GpuOptions().ProcessMemoryTopCount >= 20,
+            "the list has to outlast a browser and a chat client opening at once");
+    }
+
+    /// <summary>
+    /// A raised default reaches new installations only, and the machine being measured is never a new
+    /// installation. The same gap left one recording with a 256 MB ring buffer for a week after the
+    /// default became 768.
+    /// </summary>
+    [Fact]
+    public void APersistedSettingsFileOnTheOldDefaultIsBroughtForward()
+    {
+        var options = new GpuOptions { ProcessMemoryTopCount = GpuOptions.SupersededProcessMemoryTopCount };
+
+        Assert.True(options.MigrateProcessMemoryTopCount());
+        Assert.Equal(new GpuOptions().ProcessMemoryTopCount, options.ProcessMemoryTopCount);
+
+        // Once only: a second load must not keep rewriting a file that is already current.
+        Assert.False(options.MigrateProcessMemoryTopCount());
+    }
+
+    /// <summary>A number someone chose is theirs, including one that happens to equal an old default.</summary>
+    [Fact]
+    public void AChosenProcessCountSurvivesMigrationAndClamping()
+    {
+        var options = new GpuOptions { ProcessMemoryTopCount = 40 };
+
+        Assert.False(options.MigrateProcessMemoryTopCount());
+        options.Normalize();
+
+        Assert.Equal(40, options.ProcessMemoryTopCount);
+    }
+
+    [Fact]
+    public void DegenerateProcessCountsAreClamped()
+    {
+        var options = new GpuOptions { ProcessMemoryTopCount = 0, ProcessMemoryInterval = TimeSpan.Zero };
+        options.Normalize();
+
+        Assert.Equal(1, options.ProcessMemoryTopCount);
+        Assert.Equal(TimeSpan.FromSeconds(1), options.ProcessMemoryInterval);
     }
 
     /// <summary>

@@ -114,7 +114,56 @@ public sealed record GpuOptions
     /// Processes retained per sample, largest first. The tail of the list is dozens of processes holding
     /// a few megabytes of desktop composition each, which is noise in both the log and the report.
     /// </summary>
-    public int ProcessMemoryTopCount { get; set; } = 10;
+    /// <remarks>
+    /// Raised from ten after the first session that used this table. The question it exists to answer is
+    /// "what holds the gigabyte the game does not", and ten places was not enough to answer it: the
+    /// non-game total of 1 941 MB was a floor rather than a figure, because every process past the tenth
+    /// dropped out of the sample whenever a browser or a chat client opened a window. Nine holders were
+    /// resident for the whole session and four more came and went, so the list has to be long enough for
+    /// the transient ones to arrive without pushing the resident ones off the end.
+    /// </remarks>
+    public int ProcessMemoryTopCount { get; set; } = 25;
+
+    /// <summary>
+    /// The default this setting shipped with before <see cref="ProcessMemoryTopCount"/> was raised.
+    /// Persisted settings files carry it, and a file that still says exactly this was never chosen by
+    /// anyone — it is the old default, and it is migrated rather than left to silently truncate.
+    /// </summary>
+    public const int SupersededProcessMemoryTopCount = 10;
+
+    /// <summary>
+    /// Brings a settings file written before the list was lengthened up to the current default.
+    /// </summary>
+    /// <remarks>
+    /// Raising a default in code reaches new installations only, and that gap has cost a session before:
+    /// one kept recording with a 256 MB ring buffer for a week after the default became 768, because the
+    /// value was already persisted. Only the exact superseded default is rewritten, so a number someone
+    /// actually chose — including a deliberate ten — survives being written twice.
+    /// </remarks>
+    public bool MigrateProcessMemoryTopCount()
+    {
+        if (ProcessMemoryTopCount != SupersededProcessMemoryTopCount)
+        {
+            return false;
+        }
+
+        ProcessMemoryTopCount = new GpuOptions().ProcessMemoryTopCount;
+        return true;
+    }
+
+    /// <summary>Clamps hand-edited values that would make the table useless or ruinously long.</summary>
+    public void Normalize()
+    {
+        // One process is a table that can only ever name the game, and the counter query already walks
+        // every process regardless of how many are kept, so a large ceiling costs only log size.
+        ProcessMemoryTopCount = Math.Clamp(ProcessMemoryTopCount, 1, 200);
+
+        ProcessMemoryInterval = ProcessMemoryInterval < TimeSpan.FromSeconds(1)
+            ? TimeSpan.FromSeconds(1)
+            : ProcessMemoryInterval > TimeSpan.FromMinutes(5)
+                ? TimeSpan.FromMinutes(5)
+                : ProcessMemoryInterval;
+    }
 }
 
 public sealed record ObsOptions
@@ -297,6 +346,40 @@ public sealed record DeepCaptureOptions
     /// </summary>
     public TimeSpan AutoCaptureCooldown { get; set; } = TimeSpan.FromMinutes(10);
 
+    /// <summary>
+    /// Frame time at which a hitch may break the cooldown instead of being refused by it, provided the
+    /// session still has budget left.
+    /// </summary>
+    /// <remarks>
+    /// The cooldown is sized for bursts, and it is right about bursts. It was wrong about the two frames
+    /// that mattered most in the session of 25 August: a 518 ms frame refused with seven minutes of
+    /// cooldown left and a 779 ms frame refused with ten, both while the session still had a capture in
+    /// the budget it never spent. They are the third and fourth largest frames of that evening and
+    /// neither exists in any trace. The ceiling is the constraint this feature was sized around — six
+    /// captures across an evening — so a frame far beyond the ordinary threshold should be spending that
+    /// ceiling rather than being turned away by spacing meant to collapse a burst.
+    /// </remarks>
+    public double AutoCaptureOverrideFrameTimeMs { get; set; } = 500;
+
+    /// <summary>
+    /// Spacing an overriding frame still has to clear. The cooldown may be broken; this may not.
+    /// </summary>
+    /// <remarks>
+    /// A capture is not free the instant it is triggered. Measured across the five captures of 25
+    /// August, the trigger to "capture saved" latency was 28–32 seconds, and the ring buffer then needs
+    /// about <see cref="EstimatedRingBufferSeconds"/> — some 21 s at the 768 MB default — to refill. A
+    /// capture started before that lands on a buffer holding a few seconds of history, which is the
+    /// failure this whole gate exists to avoid. Sixty seconds clears both at the default buffer size,
+    /// and it is what correctly refuses the 1 327 ms frame six seconds after a capture: that frame was
+    /// already inside the trace the previous trigger produced.
+    /// <para>
+    /// A larger buffer refills more slowly, so this is raised to match it rather than trusted as a
+    /// constant — <see cref="Normalize"/> floors it at the buffer's own refill time plus the tail and
+    /// the drain. Sixty is the default, not the minimum.
+    /// </para>
+    /// </remarks>
+    public TimeSpan AutoCaptureOverrideCooldown { get; set; } = TimeSpan.FromSeconds(60);
+
     /// <summary>Applies one-time changes to settings saved by builds before capture-profile revisions.</summary>
     public bool MigrateCaptureProfile()
     {
@@ -348,6 +431,51 @@ public sealed record DeepCaptureOptions
             : AutoCaptureCooldown > TimeSpan.FromHours(6)
                 ? TimeSpan.FromHours(6)
                 : AutoCaptureCooldown;
+
+        // Clamped no lower than the ordinary threshold, where it means "off" rather than "always" —
+        // see OverridesCooldownFor, which is where equality is given that meaning.
+        AutoCaptureOverrideFrameTimeMs = double.IsNaN(AutoCaptureOverrideFrameTimeMs)
+            ? Math.Max(500, AutoCaptureFrameTimeMs)
+            : Math.Clamp(AutoCaptureOverrideFrameTimeMs, AutoCaptureFrameTimeMs, 60_000);
+
+        // Never longer than the cooldown it overrides — that would make it dead code rather than a
+        // shorter path — and never shorter than a capture takes to finish and the ring to refill.
+        AutoCaptureOverrideCooldown = AutoCaptureOverrideCooldown < MinimumOverrideCooldown
+            ? MinimumOverrideCooldown
+            : AutoCaptureOverrideCooldown > AutoCaptureCooldown
+                ? AutoCaptureCooldown
+                : AutoCaptureOverrideCooldown;
+    }
+
+    /// <summary>
+    /// Shortest override spacing this configuration can support, derived from the buffer rather than
+    /// fixed.
+    /// </summary>
+    /// <remarks>
+    /// A larger ring buffer takes proportionally longer to refill, so a constant would be right at one
+    /// setting and wrong at the rest: at the 2 048 MB ceiling the refill alone is about 56 s, and a
+    /// 60 s override would approve a capture while the previous one was still draining. The terms are
+    /// the tail the previous capture recorded, the time its buffer needs to fill again, and thirty
+    /// seconds for <c>wpr -stop</c> to write the file — measured at 28–32 s across five captures.
+    /// </remarks>
+    private TimeSpan MinimumOverrideCooldown => PostMarkerTail
+        + TimeSpan.FromSeconds(EstimatedRingBufferSeconds)
+        + TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Whether a frame is catastrophic enough to spend budget the ordinary cooldown would have withheld.
+    /// </summary>
+    /// <remarks>
+    /// An override threshold equal to the ordinary one disables the override rather than firing it for
+    /// every capture-worthy frame. Equality is what <see cref="Normalize"/> produces from any value set
+    /// below the ordinary threshold, and the alternative reading of it is the worst of both: every frame
+    /// that clears 300 ms would bypass the ten minute spacing, which is precisely the burst behaviour
+    /// the spacing exists to collapse.
+    /// </remarks>
+    public bool OverridesCooldownFor(double frameTimeMs)
+    {
+        return AutoCaptureOverrideFrameTimeMs > AutoCaptureFrameTimeMs
+            && frameTimeMs >= AutoCaptureOverrideFrameTimeMs;
     }
 }
 
@@ -731,12 +859,32 @@ public sealed record GpuTelemetrySample(
 /// Memory the process has in system RAM that the GPU can reach over PCIe. It grows when allocations no
 /// longer fit in VRAM, so a process whose shared usage climbs while dedicated stalls is being evicted.
 /// </param>
+/// <param name="InstanceCount">
+/// Counter instances the figure was summed from, kept so a reading that goes wrong can be diagnosed
+/// from the log rather than by reading the aggregator's source a week later. Defaulted because most
+/// callers constructing one of these by hand are tests and reports that never saw a counter.
+/// </param>
 public sealed record GpuProcessMemoryUsage(
     int ProcessId,
     string ProcessName,
     ulong DedicatedBytes,
-    ulong SharedBytes)
+    ulong SharedBytes,
+    int InstanceCount = 0)
 {
+    /// <summary>
+    /// Above this, a per-process dedicated figure is a counter fault rather than a measurement.
+    /// </summary>
+    /// <remarks>
+    /// No consumer adapter has this much local memory, so nothing on a machine this app runs on can
+    /// legitimately reach it. The bound exists because a runaway instance sum already happened once and
+    /// went out in 145 reports as the largest VRAM holder; naming a reading as impossible is cheap and
+    /// the alternative is a plausible-looking table that is wrong about the one thing it is for.
+    /// </remarks>
+    public const ulong ImplausibleDedicatedBytes = 64UL * 1024 * 1024 * 1024;
+
+    /// <summary>Whether the reading is large enough to be impossible on any adapter this runs on.</summary>
+    public bool IsImplausible => DedicatedBytes > ImplausibleDedicatedBytes;
+
     public double DedicatedGigabytes => DedicatedBytes / 1024d / 1024 / 1024;
 
     public double SharedGigabytes => SharedBytes / 1024d / 1024 / 1024;
@@ -766,12 +914,36 @@ public sealed record GpuProcessMemorySample(
     /// Deliberately not expected to match the adapter total NVML reports. The counter set covers
     /// processes, and VRAM also holds the display's own framebuffers plus allocations belonging to
     /// nothing that is still running; the gap between this sum and NVML's figure is itself readable.
+    /// <para>
+    /// Impossible readings are excluded for the same reason <see cref="Top"/> excludes them, and it
+    /// matters more here than it looks: the correlation engine picks an incident's peak sample by this
+    /// total. One runaway figure climbing all evening would make the newest sample in every window the
+    /// "fullest" one, quietly turning the peak into an arbitrary pick — and the export writes this
+    /// number out as the figure to compare against the adapter's own.
+    /// </para>
     /// </remarks>
-    public ulong TotalDedicatedBytes => Processes.Aggregate(0UL, (total, process) => total + process.DedicatedBytes);
+    public ulong TotalDedicatedBytes => Processes
+        .Where(process => !process.IsImplausible)
+        .Aggregate(0UL, (total, process) => total + process.DedicatedBytes);
 
+    /// <summary>Processes whose reading is impossible for the adapter, kept in the log and out of reports.</summary>
+    public IEnumerable<GpuProcessMemoryUsage> ImplausibleProcesses => Processes.Where(process => process.IsImplausible);
+
+    /// <summary>
+    /// The largest holders, for a report that has room to name a few.
+    /// </summary>
+    /// <remarks>
+    /// Impossible readings are skipped rather than dropped from <see cref="Processes"/>. A report that
+    /// says "largest in VRAM: obs64 with 213.9 GB" is worse than one that names the real second place,
+    /// but a log that quietly discards the row makes the fault itself unfindable — and the fault is what
+    /// tells us the aggregation is wrong.
+    /// </remarks>
     public IEnumerable<GpuProcessMemoryUsage> Top(int count)
     {
-        return Processes.OrderByDescending(process => process.DedicatedBytes).Take(count);
+        return Processes
+            .Where(process => !process.IsImplausible)
+            .OrderByDescending(process => process.DedicatedBytes)
+            .Take(count);
     }
 }
 

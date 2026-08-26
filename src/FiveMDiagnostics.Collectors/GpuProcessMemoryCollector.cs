@@ -18,6 +18,8 @@ public sealed class GpuProcessMemoryCollector : ITelemetryCollector
 {
     private readonly Func<(IGpuProcessMemoryProbe? Probe, string? Error)> _openProbe;
 
+    private readonly HashSet<int> _reportedImplausible = [];
+
     private bool _reportedLogFailure;
     private string? _lastReadError;
 
@@ -49,6 +51,7 @@ public sealed class GpuProcessMemoryCollector : ITelemetryCollector
         // failure that survived into a working session would disable the feature with no way to notice.
         _reportedLogFailure = false;
         _lastReadError = null;
+        _reportedImplausible.Clear();
 
         // Held as locals rather than fields: an early return then cannot leave a live counter query or
         // an open file behind, which is exactly what a "this session is unavailable" flag used to do.
@@ -62,12 +65,13 @@ public sealed class GpuProcessMemoryCollector : ITelemetryCollector
 
         while (!cancellationToken.IsCancellationRequested)
         {
-            if (context.ProcessResolver.TryGetTargetProcess() is not null)
+            if (context.ProcessResolver.TryGetTargetProcess() is { } target)
             {
-                var sample = Sample(context, probe);
+                var sample = Sample(context, probe, target.ProcessId);
 
                 csvLog?.Append(sample);
                 ReportLogFailureIfAny(context, csvLog);
+                ReportImplausibleReadingsIfAny(context, sample);
 
                 await context.Writer.WriteAsync(sample, cancellationToken).ConfigureAwait(false);
             }
@@ -125,7 +129,34 @@ public sealed class GpuProcessMemoryCollector : ITelemetryCollector
         context.StatusSink.Report(StatusLevel.Warning, Name, failure);
     }
 
-    private GpuProcessMemorySample Sample(CollectorContext context, IGpuProcessMemoryProbe probe)
+    /// <summary>
+    /// Names a process whose reading is impossible for the adapter, once per process per session.
+    /// </summary>
+    /// <remarks>
+    /// The reading that prompted this stood in 145 incident reports as the largest VRAM holder before
+    /// anyone noticed, because nothing in the app was surprised by 213 GB on a 10 GB card. One warning
+    /// naming the process and its instance count is what turns the next occurrence into a five minute
+    /// diagnosis instead of a session of arithmetic against the adapter figure.
+    /// </remarks>
+    private void ReportImplausibleReadingsIfAny(CollectorContext context, GpuProcessMemorySample sample)
+    {
+        foreach (var process in sample.ImplausibleProcesses)
+        {
+            if (!_reportedImplausible.Add(process.ProcessId))
+            {
+                continue;
+            }
+
+            context.StatusSink.Report(
+                StatusLevel.Warning,
+                Name,
+                $"VRAM-avläsningen för {process.ProcessName} är omöjlig: {process.DedicatedGigabytes:F0} GB "
+                + $"summerat över {process.InstanceCount} räknarinstanser. Raden loggas men utesluts ur "
+                + "rapporternas topplista. Övriga processer påverkas inte.");
+        }
+    }
+
+    private GpuProcessMemorySample Sample(CollectorContext context, IGpuProcessMemoryProbe probe, int anchorProcessId)
     {
         var timestamp = context.UtcNow();
 
@@ -147,7 +178,8 @@ public sealed class GpuProcessMemoryCollector : ITelemetryCollector
             dedicated,
             shared,
             ProcessNames(),
-            context.Settings.Gpu.ProcessMemoryTopCount);
+            context.Settings.Gpu.ProcessMemoryTopCount,
+            anchorProcessId);
 
         return new GpuProcessMemorySample(timestamp, IsAvailable: true, processes);
     }

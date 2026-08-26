@@ -19,6 +19,14 @@ namespace FiveMDiagnostics.Core;
 /// out so a burst spends one rather than twenty, and the session has a hard ceiling.
 /// </para>
 /// <para>
+/// The spacing gate has one way past it, added after it refused the wrong events. A frame beyond
+/// <see cref="DeepCaptureOptions.AutoCaptureOverrideFrameTimeMs"/> spends budget the ordinary cooldown
+/// would have withheld — the ceiling was always meant to be the binding constraint, and a session that
+/// turned away its third and fourth largest frames while holding an unspent capture had the two the
+/// wrong way round. What the override cannot skip is the ring buffer refilling, so it answers to a
+/// shorter spacing of its own rather than to none.
+/// </para>
+/// <para>
 /// Sized against real data. That session held 965 frames over 33 ms, 120 over 100 ms and 16 over
 /// 300 ms. At the default threshold the ceiling of six is the binding constraint rather than the
 /// threshold, which is the intended shape: the rare frames all qualify, and the budget decides how many
@@ -64,7 +72,11 @@ public sealed class AutoDeepCaptureBudget
             return false;
         }
 
-        return TryReserveCore(timestamp, $"en {frameTimeMs:F0} ms hitch", out refusal);
+        return TryReserveCore(
+            timestamp,
+            $"en {frameTimeMs:F0} ms hitch",
+            mayOverrideCooldown: _options.OverridesCooldownFor(frameTimeMs),
+            out refusal);
     }
 
     /// <summary>
@@ -80,10 +92,21 @@ public sealed class AutoDeepCaptureBudget
     /// </remarks>
     public bool TryReserveForSustainedSaturation(DateTimeOffset timestamp, out string? refusal)
     {
-        return TryReserveCore(timestamp, "en period där bildfrekvensen inte återhämtade sig", out refusal);
+        // No frame to be far beyond the threshold, so no override: saturation is by definition a stretch
+        // of unremarkable frames, and one stretch is one trace however long it lasts.
+        return TryReserveCore(
+            timestamp,
+            "en period där bildfrekvensen inte återhämtade sig",
+            mayOverrideCooldown: false,
+            out refusal);
     }
 
-    private bool TryReserveCore(DateTimeOffset timestamp, string description, out string? refusal)
+    /// <param name="mayOverrideCooldown">
+    /// Whether the frame is catastrophic enough to spend budget the ordinary cooldown would have
+    /// withheld. The shorter <see cref="DeepCaptureOptions.AutoCaptureOverrideCooldown"/> still applies:
+    /// it is what keeps the override from capturing a ring buffer that has not refilled yet.
+    /// </param>
+    private bool TryReserveCore(DateTimeOffset timestamp, string description, bool mayOverrideCooldown, out string? refusal)
     {
         if (!_options.Enabled || !_options.CaptureAutoIncidents)
         {
@@ -99,12 +122,22 @@ public sealed class AutoDeepCaptureBudget
             return false;
         }
 
-        if (_lastCaptureAt is { } last && timestamp - last < _options.AutoCaptureCooldown)
+        if (_lastCaptureAt is { } last)
         {
-            var remaining = _options.AutoCaptureCooldown - (timestamp - last);
-            refusal = $"Deep capture hoppades över för {description}: {remaining.TotalMinutes:F0} min "
-                + "kvar av cooldown efter föregående capture, och ringbufferten har ännu inte fyllts på.";
-            return false;
+            var elapsed = timestamp - last;
+            var cooldown = mayOverrideCooldown ? _options.AutoCaptureOverrideCooldown : _options.AutoCaptureCooldown;
+
+            if (elapsed < cooldown)
+            {
+                var remaining = cooldown - elapsed;
+                refusal = mayOverrideCooldown
+                    ? $"Deep capture hoppades över för {description}: {remaining.TotalSeconds:F0} s kvar innan "
+                        + "ringbufferten hunnit fyllas på efter föregående capture. Frametimen räckte för att "
+                        + "bryta cooldownen, men inte för att kringgå påfyllningen."
+                    : $"Deep capture hoppades över för {description}: {remaining.TotalMinutes:F0} min "
+                        + "kvar av cooldown efter föregående capture, och ringbufferten har ännu inte fyllts på.";
+                return false;
+            }
         }
 
         _spent++;

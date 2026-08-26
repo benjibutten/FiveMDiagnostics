@@ -113,6 +113,16 @@ to reach **DeepCapture.AutoCaptureFrameTimeMs** (300 ms), captures are spaced by
 **DeepCapture.MaxAutoCapturesPerSession** (6) is a hard ceiling. Set `DeepCapture.CaptureAutoIncidents`
 to `false` for the old behaviour.
 
+The spacing gate has one way past it. A frame beyond **DeepCapture.AutoCaptureOverrideFrameTimeMs**
+(500 ms) spends budget the cooldown would have withheld, because the ceiling was always meant to be the
+binding constraint and a session that turned away its third and fourth largest frames while holding an
+unspent capture had those the wrong way round. What the override cannot skip is the ring buffer
+refilling: **DeepCapture.AutoCaptureOverrideCooldown** (60 s) covers the 28-32 s a capture takes to
+finish writing plus the ~21 s the buffer needs to refill, so an override never records a nearly empty
+ring. It is raised automatically for a larger `RingBufferMegabytes`, which refills proportionally more
+slowly — at the 2 048 MB ceiling the refill alone is about 56 s. Setting the override threshold to the
+ordinary one turns the override off.
+
 A sustained saturation window can spend a capture too, even with no remarkable frame in it — that is the
 condition a frame time threshold structurally cannot see, and it was 104 of 391 minutes in one session.
 Manual `Severe` markers still trigger a capture outside the budget.
@@ -318,8 +328,18 @@ has to be expanded into one counter object per process otherwise, and via `PdhAd
 paths resolve on a non-English Windows. NVML is not an option here at all: its per-process memory
 queries return "not supported" for graphics processes on a WDDM driver, which is every consumer machine.
 
+Figures are summed per process across the counter instances of **one adapter** — the one the game
+itself holds memory on. More than one adapter is the normal case rather than the laptop case: a
+single-GPU desktop enumerates two distinct adapter LUIDs, and summing across them produced a reading of
+213 GB on a 10 GB card that stood as "largest VRAM holder" in 145 incident reports before it was caught.
+A per-process figure that is still impossible for any adapter is kept in the log, named in a warning
+with its instance count, and left out of the reports' top list.
+
 Turn it off with `Gpu.ProcessMemoryEnabled`; `Gpu.ProcessMemoryInterval` and `Gpu.ProcessMemoryTopCount`
-set the cadence and how many processes each sample keeps.
+(25) set the cadence and how many processes each sample keeps. The list is long because the question is
+what holds the memory the game does not: nine processes held GPU memory for a whole measured session and
+four more came and went, and at the original ten places the non-game total was a floor rather than a
+figure.
 
 ## Capture depth
 
@@ -458,9 +478,10 @@ The per-process breakdown is written next to it, one row per process per sample:
 %LocalAppData%\FiveMDiagnostics\Sessions\gpuprocs_<yyyyMMdd_HHmmss>.csv
 ```
 
-Columns are timestamp, process id, process name, dedicated bytes and shared bytes. Long format rather
-than a column per process, because the set of processes holding GPU memory changes during a session and
-a wide file would have to fix its columns when the header is written.
+Columns are timestamp, process id, process name, dedicated bytes, shared bytes and the number of
+counter instances the figure was summed from. Long format rather than a column per process, because the
+set of processes holding GPU memory changes during a session and a wide file would have to fix its
+columns when the header is written.
 
 ## Export bundle
 
@@ -518,11 +539,15 @@ The tests assert that the rule engine distinguishes the OBS/GPU and FiveM resour
 - PresentMon CLI variants differ between releases, so the executable path and arguments may need adjustment
 - UDP remote endpoint ownership is not fully reconstructed without heavier tracing
 - GPU telemetry is NVIDIA-only; AMD and Intel GPUs report as unavailable
-- GPU samples cover the whole adapter, not per-process VRAM attribution, so the VRAM pressure hypothesis
-  requires corroborating present-bound frame spikes before it will fire at all
+- The VRAM pressure hypothesis still requires corroborating present-bound frame spikes before it will
+  fire at all, even though per-process attribution is now available
 - When no probe host is configured, the server address is inferred from FiveM's TCP connection: accepted
   immediately on port 30120, otherwise only after the endpoint has persisted across several polls. Set
   `ServerProfile.ProbeHost` explicitly if the inference picks the wrong host.
+- Probing is given up for the session after 30 consecutive failures against one host, with one status
+  line saying so. Most game servers do not answer ICMP at all, and continuing produced nothing but a
+  paragraph in every incident report explaining that there is no RTT measurement. A success resets the
+  count, and changing servers gets a fresh one.
 - FiveM artifact parsers are designed to accept common exports, but some community-specific file layouts will need richer parsing in v2
 
 ## Keeping the app's own overhead low

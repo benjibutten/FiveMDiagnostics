@@ -15,6 +15,7 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
     private ClientWebSocket? _socket;
     private int _requestId;
     private DateTimeOffset _lastConnectAttemptUtc = DateTimeOffset.MinValue;
+    private bool? _lastProcessRunning;
 
     public string Name => "OBS";
 
@@ -22,6 +23,10 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
     {
         var sessionStart = context.UtcNow();
         var everConnected = false;
+
+        // The manager reuses one collector across sessions, so a state remembered from the previous
+        // evening would swallow this evening's first transition.
+        _lastProcessRunning = null;
 
         try
         {
@@ -31,6 +36,7 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
                 {
                     var sample = await PollAsync(context.Settings.Obs, cancellationToken).ConfigureAwait(false);
                     everConnected |= sample.IsConnected;
+                    ReportProcessTransition(context, sample);
                     await context.Writer.WriteAsync(sample, cancellationToken).ConfigureAwait(false);
                 }
 
@@ -50,6 +56,43 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
 
             await ResetSocketAsync().ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// Writes a status line whenever OBS starts or stops during a session.
+    /// </summary>
+    /// <remarks>
+    /// OBS costs several hundred megabytes of VRAM and hooks itself into the game's present path, so a
+    /// session where it starts or stops is two experiments rather than one — and the only reason we know
+    /// that is a session where it happened to shut down mid-evening and the incidents in the log carried
+    /// its state by accident. The comparison it made possible was the most informative measurement of
+    /// that whole investigation. It should not depend on luck: a transition is a session event, and this
+    /// is the line that makes it one. Reported rather than sampled, because the journal is where the
+    /// timeline is reconstructed from afterwards.
+    /// </remarks>
+    private void ReportProcessTransition(CollectorContext context, ObsTelemetrySample sample)
+    {
+        var running = sample.IsProcessRunning;
+        if (_lastProcessRunning == running)
+        {
+            return;
+        }
+
+        var previous = _lastProcessRunning;
+        _lastProcessRunning = running;
+
+        context.StatusSink.Report(
+            StatusLevel.Info,
+            Name,
+            previous is null
+                ? running
+                    ? "OBS körde när sessionen startade."
+                    : "OBS körde inte när sessionen startade."
+                : running
+                    ? "OBS startade. Allt efter den här punkten mäts med OBS igång — VRAM-fotavtryck och "
+                        + "game capture-hooken i present-vägen tillkommer."
+                    : "OBS avslutades. Allt efter den här punkten mäts utan OBS, vilket gör perioderna "
+                        + "före och efter jämförbara som ett A/B-test.");
     }
 
     /// <summary>

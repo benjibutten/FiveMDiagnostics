@@ -15,7 +15,7 @@ using FiveMDiagnostics.Core;
 /// </remarks>
 public sealed class GpuProcessMemoryCsvLog : IDisposable
 {
-    private const string Header = "timestampUtc,processId,processName,dedicatedBytes,sharedBytes";
+    private const string Header = "timestampUtc,processId,processName,dedicatedBytes,sharedBytes,instanceCount";
 
     private readonly RollingCsvLog _log;
 
@@ -50,7 +50,8 @@ public sealed class GpuProcessMemoryCsvLog : IDisposable
                 process.ProcessId.ToString(CultureInfo.InvariantCulture),
                 RollingCsvLog.Escape(process.ProcessName),
                 process.DedicatedBytes.ToString(CultureInfo.InvariantCulture),
-                process.SharedBytes.ToString(CultureInfo.InvariantCulture));
+                process.SharedBytes.ToString(CultureInfo.InvariantCulture),
+                process.InstanceCount.ToString(CultureInfo.InvariantCulture));
         }
     }
 

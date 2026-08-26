@@ -46,11 +46,33 @@ public sealed class NetworkTelemetryCollector : ITelemetryCollector, IDisposable
     private int _candidateObservations;
     private int _latchedHostAbsentPolls;
     private bool _reportedNoPlausibleHost;
+    private string? _failingProbeHost;
+    private int _consecutiveProbeFailures;
+    private string? _suspendedProbeHost;
+
+    /// <summary>
+    /// Consecutive failures against one host before probing it is given up for the session.
+    /// </summary>
+    /// <remarks>
+    /// At the default poll interval this is over a minute of silence. A host that has not answered a
+    /// single ICMP echo in a minute does not answer ICMP — most game servers do not — and continuing
+    /// produces one thing only: a paragraph in every incident report explaining that there is no RTT
+    /// measurement. Six sessions carried it, 145 reports in the last one alone, and it never once turned
+    /// into evidence. Stopping keeps the explanation where it is useful, in the first report, and out of
+    /// the hundred after it.
+    /// </remarks>
+    private const int ConsecutiveFailuresBeforeSuspending = 30;
 
     public string Name => "NetworkTelemetry";
 
     public async Task RunAsync(CollectorContext context, CancellationToken cancellationToken)
     {
+        // One collector instance serves every session, so a host given up on last night has to get a
+        // fresh hearing tonight — the player may well have changed servers.
+        _failingProbeHost = null;
+        _consecutiveProbeFailures = 0;
+        _suspendedProbeHost = null;
+
         while (!cancellationToken.IsCancellationRequested)
         {
             var target = context.ProcessResolver.TryGetTargetProcess();
@@ -66,9 +88,11 @@ public sealed class NetworkTelemetryCollector : ITelemetryCollector, IDisposable
                     cancellationToken).ConfigureAwait(false);
 
                 var probeHost = ResolveProbeHost(context, target.ProcessId, remoteEndpoints);
-                if (!string.IsNullOrWhiteSpace(probeHost))
+                if (!string.IsNullOrWhiteSpace(probeHost)
+                    && !string.Equals(probeHost, _suspendedProbeHost, StringComparison.OrdinalIgnoreCase))
                 {
                     var probeSample = await ProbeAsync(probeHost, timestamp).ConfigureAwait(false);
+                    NoteProbeOutcome(context, probeHost, probeSample);
                     await context.Writer.WriteAsync(probeSample, cancellationToken).ConfigureAwait(false);
                 }
             }
@@ -236,6 +260,51 @@ public sealed class NetworkTelemetryCollector : ITelemetryCollector, IDisposable
     public void Dispose()
     {
         _ping.Dispose();
+    }
+
+    /// <summary>
+    /// Counts consecutive failures against one host and gives the host up once it is clear it will not
+    /// answer.
+    /// </summary>
+    /// <remarks>
+    /// Counted per host rather than globally: a player who changes servers mid-session gets a fresh
+    /// count, and one success resets it, so a server that answers but drops the occasional echo is never
+    /// given up on. Suspension is deliberately not silent — the report loses a section, and the reason
+    /// belongs in the journal rather than in the reader's inference.
+    /// </remarks>
+    private void NoteProbeOutcome(CollectorContext context, string host, NetworkProbeSample sample)
+    {
+        if (sample.Success)
+        {
+            _failingProbeHost = null;
+            _consecutiveProbeFailures = 0;
+            return;
+        }
+
+        if (!string.Equals(_failingProbeHost, host, StringComparison.OrdinalIgnoreCase))
+        {
+            _failingProbeHost = host;
+            _consecutiveProbeFailures = 0;
+        }
+
+        if (++_consecutiveProbeFailures < ConsecutiveFailuresBeforeSuspending)
+        {
+            return;
+        }
+
+        _suspendedProbeHost = host;
+        var configured = !string.IsNullOrWhiteSpace(context.Settings.ServerProfile.ProbeHost);
+
+        context.StatusSink.Report(
+            StatusLevel.Info,
+            Name,
+            $"Nätproberna mot {host} stängs av för den här sessionen: {_consecutiveProbeFailures} svar i rad "
+            + $"uteblev ({sample.FailureReason ?? "okänt fel"}). "
+            + (configured
+                ? "ProbeHost är satt manuellt, så kontrollera att adressen svarar på ICMP."
+                : "Hosten härleddes från spelets anslutning, och många spelservrar svarar inte på ICMP alls. "
+                    + "Sätt ServerProfile.ProbeHost till en adress som svarar om RTT ska mätas.")
+            + " Incidentrapporterna slutar därmed upprepa att RTT saknas.");
     }
 
     private async Task<NetworkProbeSample> ProbeAsync(string host, DateTimeOffset timestamp)
