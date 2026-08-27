@@ -152,8 +152,36 @@ public sealed class GpuProcessMemoryCollector : ITelemetryCollector
                 Name,
                 $"VRAM-avläsningen för {process.ProcessName} är omöjlig: {process.DedicatedGigabytes:F0} GB "
                 + $"summerat över {process.InstanceCount} räknarinstanser. Raden loggas men utesluts ur "
-                + "rapporternas topplista. Övriga processer påverkas inte.");
+                + $"rapporternas topplista. Övriga processer påverkas inte.{DescribeInstances(process)}");
         }
+    }
+
+    /// <summary>
+    /// Lists the counter instances behind an impossible reading, with the adapter each belongs to.
+    /// </summary>
+    /// <remarks>
+    /// The count alone was the previous answer and it turned out to be the wrong question: obs64
+    /// reported 209 GB with an instance count of one, all session. What a single instance leaves open is
+    /// which adapter it is on and whether shared memory is being counted as dedicated, and both are in
+    /// the instance name and its own pair of figures. Printed once per process per session, so the cost
+    /// is a line in the journal for a case that should never happen.
+    /// </remarks>
+    private static string DescribeInstances(GpuProcessMemoryUsage process)
+    {
+        if (process.Instances is not { Count: > 0 } instances)
+        {
+            return string.Empty;
+        }
+
+        var listed = instances
+            .Take(6)
+            .Select(instance =>
+                $"{instance.InstanceName} (adapter {instance.Adapter ?? "okänd"}, "
+                + $"dedikerat {instance.DedicatedBytes / 1024d / 1024:F0} MB, "
+                + $"delat {instance.SharedBytes / 1024d / 1024:F0} MB)");
+
+        var remaining = instances.Count > 6 ? $" och {instances.Count - 6} till" : string.Empty;
+        return $" Instanser: {string.Join("; ", listed)}{remaining}.";
     }
 
     private GpuProcessMemorySample Sample(CollectorContext context, IGpuProcessMemoryProbe probe, int anchorProcessId)
@@ -181,7 +209,17 @@ public sealed class GpuProcessMemoryCollector : ITelemetryCollector
             context.Settings.Gpu.ProcessMemoryTopCount,
             anchorProcessId);
 
-        return new GpuProcessMemorySample(timestamp, IsAvailable: true, processes);
+        // Computed from the same readings rather than from the table above, which is cut to the largest
+        // holders: the reconciliation against the adapter needs everything that is accounted for, not
+        // everything that fitted in the report.
+        var accounted = GpuProcessMemoryAggregator.TotalDedicatedBytes(dedicated, shared, anchorProcessId);
+
+        return new GpuProcessMemorySample(
+            timestamp,
+            IsAvailable: true,
+            processes,
+            UnavailableReason: null,
+            AllProcessesDedicatedBytes: accounted);
     }
 
     /// <summary>

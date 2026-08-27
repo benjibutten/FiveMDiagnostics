@@ -41,6 +41,7 @@ namespace FiveMDiagnostics.Core;
 public sealed class AutoDeepCaptureBudget
 {
     private readonly DeepCaptureOptions _options;
+    private readonly List<DateTimeOffset> _spentAt = [];
     private int _spent;
     private DateTimeOffset? _lastCaptureAt;
 
@@ -122,6 +123,23 @@ public sealed class AutoDeepCaptureBudget
             return false;
         }
 
+        // The window budget rations the ordinary frames so a bad opening hour cannot buy silence for the
+        // rest of the evening. A frame past the override threshold answers to the session ceiling only:
+        // that ceiling is what this feature was sized around, and turning away a catastrophic frame to
+        // preserve an allowance for ordinary ones has the two the wrong way round.
+        // Floored at one so an un-normalised options object cannot index past the end of the list below.
+        var perWindow = Math.Max(1, _options.MaxAutoCapturesPerWindow);
+        if (!mayOverrideCooldown && CountWithin(timestamp, _options.CaptureBudgetWindow) >= perWindow)
+        {
+            var window = _options.CaptureBudgetWindow;
+            var freesAt = _spentAt[^perWindow] + window;
+            refusal = $"Deep capture hoppades över för {description}: {perWindow} "
+                + $"capture(s) per {window.TotalMinutes:F0} min är redan tagna, nästa plats öppnar om "
+                + $"{Math.Max(0, (freesAt - timestamp).TotalMinutes):F0} min. En frame över "
+                + $"{_options.AutoCaptureOverrideFrameTimeMs:F0} ms hade gått förbi den här gränsen.";
+            return false;
+        }
+
         if (_lastCaptureAt is { } last)
         {
             var elapsed = timestamp - last;
@@ -142,7 +160,38 @@ public sealed class AutoDeepCaptureBudget
 
         _spent++;
         _lastCaptureAt = timestamp;
+
+        // Only ordinary captures are charged to the window. An override that took the hour's slot would
+        // let one catastrophic frame buy silence for the rest of it, which is the failure the window was
+        // introduced to prevent — arriving by the one path that is supposed to be exempt from it. The
+        // session ceiling and the refill spacing still bound the override, and they are what it is
+        // documented to answer to.
+        if (!mayOverrideCooldown)
+        {
+            _spentAt.Add(timestamp);
+        }
+
         refusal = null;
         return true;
+    }
+
+    /// <summary>
+    /// Captures spent inside the trailing <paramref name="window"/> ending at <paramref name="now"/>.
+    /// </summary>
+    /// <remarks>
+    /// Linear over the session's captures, which is at most
+    /// <see cref="DeepCaptureOptions.MaxAutoCapturesPerSession"/> entries — single digits by design, and
+    /// consulted once per capture-worthy frame rather than once per frame.
+    /// </remarks>
+    private int CountWithin(DateTimeOffset now, TimeSpan window)
+    {
+        var since = now - window;
+        var count = 0;
+        for (var i = _spentAt.Count - 1; i >= 0 && _spentAt[i] > since; i--)
+        {
+            count++;
+        }
+
+        return count;
     }
 }

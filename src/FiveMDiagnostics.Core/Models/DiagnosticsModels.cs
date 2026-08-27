@@ -175,7 +175,7 @@ public sealed record ObsOptions
 
 public sealed record DeepCaptureOptions
 {
-    public const int CurrentCaptureProfileRevision = 1;
+    public const int CurrentCaptureProfileRevision = 2;
 
     /// <summary>
     /// Version of the generated capture profile defaults. Zero means settings written before profile
@@ -329,14 +329,49 @@ public sealed record DeepCaptureOptions
     /// <see cref="FramePacingOptions"/> is: the multiplier moves with the damage, and a threshold meant
     /// to catch the rare catastrophic frame must not drift upwards during a bad patch.
     /// </summary>
-    public double AutoCaptureFrameTimeMs { get; set; } = 300;
+    /// <remarks>
+    /// Was 300 ms, which was right for the sessions it was calibrated against and went blind the moment
+    /// they improved. The session of 26 August ran seven hours and contained exactly one frame over
+    /// 300 ms — the game's own restart, not a hitch — so two captures were taken in the first ninety
+    /// minutes and none at all in the last three and a half hours. What remained to investigate that
+    /// evening lived at 100–170 ms: 67 frames, of which the three largest after the opening hour exist
+    /// in no trace. A threshold meant to catch the rare catastrophic frame has to be set against the
+    /// frames the machine actually produces, and 120 ms is two missed frames at 60 Hz.
+    /// </remarks>
+    public double AutoCaptureFrameTimeMs { get; set; } = 120;
 
     /// <summary>
     /// Captures the detector may spend in one session. Each one writes a multi hundred megabyte ETL and
     /// leaves the ring buffer empty until it refills, so this is the setting that keeps a bad evening
     /// from filling the disk.
     /// </summary>
-    public int MaxAutoCapturesPerSession { get; set; } = 6;
+    public int MaxAutoCapturesPerSession { get; set; } = 8;
+
+    /// <summary>
+    /// Ceiling on automatic captures inside <see cref="CaptureBudgetWindow"/>, rather than for a whole
+    /// session.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The same failure <see cref="AutoDetectOptions.MaxIncidentsPerWindow"/> was introduced to fix, one
+    /// layer down. A session-wide ceiling is spent by whichever hour is worst, and the worst hour is
+    /// routinely the opening one — a cache rebuilt after a settings change, a sync backlog, a level
+    /// still streaming in. Replayed against the frames of 26 August, a flat 120 ms threshold against a
+    /// session ceiling alone spends all six captures before 22:16 and four of them inside the warm-up
+    /// hour, then leaves the remaining five hours bare. One per hour against the same frames spends six
+    /// captures spread across the whole session and picks up the largest late-session frame, which is
+    /// the evidence the evening was actually short of.
+    /// </para>
+    /// <para>
+    /// A frame past <see cref="AutoCaptureOverrideFrameTimeMs"/> ignores this window, for the reason it
+    /// ignores the cooldown: the session ceiling is meant to be the binding constraint on a genuinely
+    /// catastrophic frame, and spacing meant to ration ordinary ones should not turn one away.
+    /// </para>
+    /// </remarks>
+    public int MaxAutoCapturesPerWindow { get; set; } = 1;
+
+    /// <summary>The window <see cref="MaxAutoCapturesPerWindow"/> is counted over.</summary>
+    public TimeSpan CaptureBudgetWindow { get; set; } = TimeSpan.FromHours(1);
 
     /// <summary>
     /// Minimum spacing between automatic captures. Hitches arrive in bursts — 41% of the ones measured
@@ -398,6 +433,21 @@ public sealed record DeepCaptureOptions
         }
 
         CollectContextSwitchStacks = true;
+
+        // Revision 2 lowers the automatic capture threshold and makes the budget time-windowed. Both
+        // were persisted defaults rather than choices, so an installation still carrying them gets the
+        // new ones; a hand-picked threshold or ceiling is left exactly as it is. Without this the
+        // change reaches only fresh installs, and the machine under investigation is not one.
+        if (AutoCaptureFrameTimeMs == 300)
+        {
+            AutoCaptureFrameTimeMs = 120;
+        }
+
+        if (MaxAutoCapturesPerSession == 6)
+        {
+            MaxAutoCapturesPerSession = 8;
+        }
+
         CaptureProfileRevision = CurrentCaptureProfileRevision;
         return true;
     }
@@ -419,10 +469,22 @@ public sealed record DeepCaptureOptions
         // A threshold at or below an ordinary spike would let a routine 40 ms frame spend a capture, and
         // the budget would be gone in the first minute. 100 ms is already three missed frames at 60 Hz.
         AutoCaptureFrameTimeMs = double.IsNaN(AutoCaptureFrameTimeMs) || AutoCaptureFrameTimeMs < 100
-            ? 300
+            ? 120
             : Math.Min(AutoCaptureFrameTimeMs, 60_000);
 
         MaxAutoCapturesPerSession = Math.Clamp(MaxAutoCapturesPerSession, 0, 100);
+
+        // Never more per window than the session allows in total, which would make the window budget
+        // dead code rather than the tighter of the two gates.
+        MaxAutoCapturesPerWindow = Math.Clamp(MaxAutoCapturesPerWindow, 1, Math.Max(MaxAutoCapturesPerSession, 1));
+
+        // A window shorter than the cooldown cannot hold more than one capture anyway, and one longer
+        // than a day is the session ceiling wearing a different name.
+        CaptureBudgetWindow = CaptureBudgetWindow < TimeSpan.FromMinutes(1)
+            ? TimeSpan.FromMinutes(1)
+            : CaptureBudgetWindow > TimeSpan.FromDays(1)
+                ? TimeSpan.FromDays(1)
+                : CaptureBudgetWindow;
 
         // Shorter than the post-marker tail plus the drain and the next capture starts against a ring
         // that holds almost nothing.
@@ -841,11 +903,25 @@ public sealed record GpuTelemetrySample(
     double? EncoderUtilizationPercent,
     double? DecoderUtilizationPercent,
     int? TemperatureCelsius,
-    IReadOnlyList<string> ThrottleReasons) : TelemetryEvent(Timestamp, "GPU")
+    IReadOnlyList<string> ThrottleReasons,
+    int? AdapterCount = null) : TelemetryEvent(Timestamp, "GPU")
 {
     public double? VramUsagePercent => TotalVramBytes is > 0 && UsedVramBytes is not null
         ? (double)UsedVramBytes.Value / TotalVramBytes.Value * 100
         : null;
+
+    /// <summary>
+    /// Whether this reading is certain to describe the same adapter the per-process table does.
+    /// </summary>
+    /// <remarks>
+    /// NVML opens device index 0 and reports that card for the whole session, while the per-process
+    /// counter table is anchored on whichever adapter the game holds memory on. With one NVIDIA device
+    /// present those are the same card and the two figures are comparable. With more than one they need
+    /// not be, and comparing them would produce a discrepancy that says nothing about either. Null means
+    /// the count was not recorded — samples from before it was carried, and fakes — and is treated the
+    /// same as unconfirmed rather than assumed safe.
+    /// </remarks>
+    public bool IsSingleAdapterMachine => AdapterCount == 1;
 }
 
 /// <summary>
@@ -869,7 +945,8 @@ public sealed record GpuProcessMemoryUsage(
     string ProcessName,
     ulong DedicatedBytes,
     ulong SharedBytes,
-    int InstanceCount = 0)
+    int InstanceCount = 0,
+    IReadOnlyList<GpuProcessMemoryInstance>? Instances = null)
 {
     /// <summary>
     /// Above this, a per-process dedicated figure is a counter fault rather than a measurement.
@@ -891,6 +968,20 @@ public sealed record GpuProcessMemoryUsage(
 }
 
 /// <summary>
+/// One raw counter instance behind a process's row, kept only for readings the aggregate says are
+/// impossible.
+/// </summary>
+/// <remarks>
+/// The instance count was added to prove that an impossible total came from summing many instances, and
+/// on its first outing it disproved it: obs64 reported 209 GB on a 10 GB card across a whole session
+/// with an instance count of one. A single number cannot say more than that, so the next question —
+/// which adapter that instance belongs to, and whether the figure is dedicated or shared memory being
+/// double counted — needs the instance itself. Kept for impossible rows only: the healthy case is
+/// twenty-odd instances every five seconds, and none of them are worth the disk.
+/// </remarks>
+public sealed record GpuProcessMemoryInstance(string InstanceName, string? Adapter, ulong DedicatedBytes, ulong SharedBytes);
+
+/// <summary>
 /// Which processes hold the adapter's memory, so "VRAM is at 95 %" can be answered with "and here is
 /// what is holding it".
 /// </summary>
@@ -905,8 +996,21 @@ public sealed record GpuProcessMemorySample(
     DateTimeOffset Timestamp,
     bool IsAvailable,
     IReadOnlyList<GpuProcessMemoryUsage> Processes,
-    string? UnavailableReason = null) : TelemetryEvent(Timestamp, "GpuProcessMemory")
+    string? UnavailableReason = null,
+    ulong? AllProcessesDedicatedBytes = null) : TelemetryEvent(Timestamp, "GpuProcessMemory")
 {
+    /// <summary>
+    /// Dedicated bytes across every process on the adapter, including those below the top-N cut.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Processes"/> holds the largest holders only, so <see cref="TotalDedicatedBytes"/>
+    /// answers "how much do the biggest hold" rather than "how much is accounted for". Reconciling the
+    /// table against the adapter's own figure needs the second question, because double counting in a
+    /// process that never reaches the list would be invisible to the first. Falls back to the top-N sum
+    /// for samples recorded before the untruncated figure was carried.
+    /// </remarks>
+    public ulong AccountedDedicatedBytes => AllProcessesDedicatedBytes ?? TotalDedicatedBytes;
+
     /// <summary>
     /// Dedicated bytes over every process that reported any.
     /// </summary>

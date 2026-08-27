@@ -48,6 +48,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private AutoIncidentDetector? _autoDetector;
     private AutoDeepCaptureBudget? _autoCaptureBudget;
     private FramePacingMonitor? _framePacing;
+    private VramAccountingMonitor? _vramAccounting;
     private volatile IReadOnlyList<ArtifactAttachment>? _attachmentsSnapshot;
 
     /// <summary>
@@ -193,6 +194,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _autoDetector = new AutoIncidentDetector(_settings.AutoDetect, Environment?.DisplayRefreshRateHz);
             _autoCaptureBudget = new AutoDeepCaptureBudget(_settings.DeepCapture);
             _framePacing = new FramePacingMonitor(_settings.FramePacing, Environment?.DisplayRefreshRateHz);
+            _vramAccounting = new VramAccountingMonitor();
             _channel = Channel.CreateBounded<TelemetryEvent>(new BoundedChannelOptions(32768)
             {
                 SingleReader = true,
@@ -917,6 +919,28 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         }
     }
 
+    /// <summary>
+    /// Writes the periodic reconciliation between the per-process VRAM table and the adapter's own
+    /// figure into the session journal.
+    /// </summary>
+    /// <remarks>
+    /// Info while the gap is the ordinary one, Warning once the sum exceeds what the card says is in
+    /// use — a state that is impossible rather than merely surprising, and that went unnoticed for a
+    /// whole session because every individual row still looked reasonable.
+    /// </remarks>
+    private void ReportVramAccounting(GpuProcessMemorySample sample)
+    {
+        if (_vramAccounting?.Observe(sample) is not { } report)
+        {
+            return;
+        }
+
+        Report(
+            report.IsImplausible ? StatusLevel.Warning : StatusLevel.Info,
+            "GpuProcessMemory",
+            report.Message);
+    }
+
     private async Task PumpAsync(ChannelReader<TelemetryEvent> reader, CancellationToken cancellationToken)
     {
         while (await reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
@@ -931,10 +955,12 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 }
                 else if (telemetryEvent is GpuTelemetrySample gpuSample)
                 {
+                    _vramAccounting?.Observe(gpuSample);
                     GpuTelemetryUpdated?.Invoke(this, gpuSample);
                 }
                 else if (telemetryEvent is GpuProcessMemorySample gpuProcessSample)
                 {
+                    ReportVramAccounting(gpuProcessSample);
                     GpuProcessMemoryUpdated?.Invoke(this, gpuProcessSample);
                 }
                 else if (telemetryEvent is CaptureHealthTelemetrySample healthSample)

@@ -88,10 +88,10 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         AddVramHypothesis(hypotheses, metrics, gpu, correlatedThreadWait, gpuProcessMemory);
         AddObsHypothesis(hypotheses, metrics, obsSamples, gpu);
         AddGpuHypothesis(hypotheses, metrics, obsSamples, systemSamples, gpu, correlatedThreadWait);
-        AddResourceHypothesis(hypotheses, metrics, processSamples, artifacts, obsSamples, systemSamples, cores);
+        AddResourceHypothesis(hypotheses, metrics, processSamples, artifacts, obsSamples, systemSamples, cores, correlatedThreadWait);
         AddNetworkHypothesis(hypotheses, metrics, networkProbes, networkEndpoints, artifacts, systemSamples, obsSamples);
-        AddDiskHypothesis(hypotheses, metrics, processSamples, systemSamples, artifacts);
-        AddExternalProcessHypothesis(hypotheses, suspectedProcesses);
+        AddDiskHypothesis(hypotheses, metrics, processSamples, systemSamples, artifacts, correlatedThreadWait);
+        AddExternalProcessHypothesis(hypotheses, suspectedProcesses, processSamples, systemSamples);
         AddOsLatencyHypothesis(hypotheses, metrics, artifacts, systemSamples, obsSamples);
         AddCorruptionHypothesis(hypotheses, artifacts);
 
@@ -620,7 +620,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         IReadOnlyList<ArtifactEvidence> artifacts,
         IReadOnlyList<ObsTelemetrySample> obsSamples,
         IReadOnlyList<SystemTelemetrySample> systemSamples,
-        CoreMetrics cores)
+        CoreMetrics cores,
+        CorrelatedThreadWait? correlatedThreadWait)
     {
         var evidence = new List<string>();
         double confidence = 0;
@@ -634,8 +635,26 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
 
         if (metrics.HasCpuGpuBreakdown && metrics.CpuBoundSpikes > 0)
         {
-            confidence += 0.35;
-            evidence.Add($"{metrics.CpuBoundSpikes} av {metrics.SpikeCount} frametime-spikes var CPU-bundna (CPU busy dominerade frametiden).");
+            // Not counted at all when the trace shows the thread was asleep. PresentMon derives MsCPUBusy
+            // from the gap between presents, so a main thread blocked on a lock reads exactly like one
+            // executing script — a 586 ms frame reported 585 ms of CPU busy for a thread that was off the
+            // processor for 569 of them. Adding confidence here and capping it afterwards was the earlier
+            // shape of this rule and it still ranked the hypothesis first; the reading is not weak
+            // evidence of script work, it is not evidence of it.
+            if (correlatedThreadWait?.Contradicts(metrics.CpuBoundSpikeMs) != true)
+            {
+                confidence += 0.35;
+                evidence.Add($"{metrics.CpuBoundSpikes} av {metrics.SpikeCount} frametime-spikes var CPU-bundna (CPU busy dominerade frametiden).");
+            }
+            else
+            {
+                evidence.Add(
+                    $"BORTSETT: {metrics.CpuBoundSpikes} av {metrics.SpikeCount} spikes ser CPU-bundna ut, men ETL-spåret visar "
+                    + $"att aktiv GTA-tråd tid {correlatedThreadWait.ThreadId:F0} låg av CPU:n i "
+                    + $"{correlatedThreadWait.OverlappingSlowFrameMs:F0} av spikarnas {metrics.CpuBoundSpikeMs:F0} CPU-bundna ms. "
+                    + "PresentMon räknar blockerad tid som CPU busy, så attributionen kan inte "
+                    + "skilja skriptarbete från väntan här och räknas därför inte som stöd.");
+            }
         }
 
         if (cores.HasData && cores.SaturatedCoreSamples > 0)
@@ -665,7 +684,23 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
 
         if (confidence > 0)
         {
-            hypotheses.Add(new HypothesisScore(RootCauseCategory.FiveMResourceSpike, Math.Min(confidence, 0.98), evidence));
+            var ceiling = 0.98;
+
+            // The same contradiction GpuFrametimeContention already answers to. A thread asleep for most
+            // of the frame is not running a script, and the remaining signals here — the game's process
+            // CPU peak, a quiet system, a count of spikes — are all consistent with a process that is
+            // blocked rather than working. They are worth a lead, not a verdict.
+            if (correlatedThreadWait?.Contradicts(metrics.CpuBoundSpikeMs) == true)
+            {
+                ceiling = ContradictedConfidenceCeiling;
+                evidence.Add(
+                    $"NEDVIKTAD: ETL-spåret visar en aktiv GTA-tråd av CPU:n i "
+                    + $"{correlatedThreadWait.OverlappingSlowFrameMs:F0} av fönstrets {metrics.CpuBoundSpikeMs:F0} "
+                    + $"CPU-bundna spike-ms, så konfidensen är takad till {ContradictedConfidenceCeiling:P0}. "
+                    + "En blockerad tråd utför inget skriptarbete, och resterande indicier skiljer inte de två fallen åt.");
+            }
+
+            hypotheses.Add(new HypothesisScore(RootCauseCategory.FiveMResourceSpike, Math.Min(confidence, ceiling), evidence));
         }
     }
 
@@ -768,7 +803,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         FrameMetrics metrics,
         IReadOnlyList<ProcessTelemetrySample> processSamples,
         IReadOnlyList<SystemTelemetrySample> systemSamples,
-        IReadOnlyList<ArtifactEvidence> artifacts)
+        IReadOnlyList<ArtifactEvidence> artifacts,
+        CorrelatedThreadWait? correlatedThreadWait)
     {
         var evidence = new List<string>();
         double confidence = 0;
@@ -891,7 +927,12 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             // windows without measured signals was the earlier version of this rule, and it left the
             // exact case it was written for untouched — the incident that scored 88% had both a latency
             // reading and a 1 258 ms frame whose CPU was busy for 1 242 ms of it.
-            if (metrics.HasCpuGpuBreakdown && metrics.SpikeCount > 0)
+            // The contradiction rests on MsCPUBusy meaning execution, and it does not when the trace
+            // shows the thread asleep. A thread blocked on a storage read is off the processor for the
+            // whole frame and PresentMon reports every millisecond of it as CPU busy, so applying the
+            // rule here would use a disk stall's own signature as proof that it was not one.
+            if (metrics.HasCpuGpuBreakdown && metrics.SpikeCount > 0
+                && correlatedThreadWait?.Contradicts(metrics.CpuBoundSpikeMs) != true)
             {
                 var cpuBoundShare = (double)metrics.CpuBoundSpikes / metrics.SpikeCount;
 
@@ -920,7 +961,28 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         }
     }
 
-    private static void AddExternalProcessHypothesis(List<HypothesisScore> hypotheses, IReadOnlyList<SuspectedProcessImpact> suspectedProcesses)
+    /// <summary>
+    /// Ranks background processes by how much of the machine they took, not merely by how many of them
+    /// were noticed.
+    /// </summary>
+    /// <remarks>
+    /// The count alone put a ceiling of 78% on this category and reached it the same way for a pair of
+    /// idle overlays as for the window that prompted this: OneDrive holding 3.68 of eight physical cores
+    /// — more CPU than the game itself — with 87% of every file operation on the machine and the game's
+    /// render thread sharing a physical core 86% of the time. That incident was ranked a FiveM script
+    /// spike at 60% with this category second at 51%.
+    /// <para>
+    /// Both figures are percent of the whole machine, from the same counter, so the game and its
+    /// neighbours are directly comparable. A background process that outweighs the game is the
+    /// observation that separates interference from an evening's ordinary background noise, and it is
+    /// the one the count could not make.
+    /// </para>
+    /// </remarks>
+    private static void AddExternalProcessHypothesis(
+        List<HypothesisScore> hypotheses,
+        IReadOnlyList<SuspectedProcessImpact> suspectedProcesses,
+        IReadOnlyList<ProcessTelemetrySample> processSamples,
+        IReadOnlyList<SystemTelemetrySample> systemSamples)
     {
         if (suspectedProcesses.Count == 0)
         {
@@ -930,12 +992,93 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         var evidence = suspectedProcesses
             .Take(3)
             .Select(item => $"{item.ProcessName} misstänks störa med {item.Reason.ToLowerInvariant()} (peak CPU {item.PeakCpuPercent:F0}%, disk {item.PeakIoMegabytesPerSecond:F1} MB/s).")
-            .ToArray();
+            .ToList();
+
+        var confidence = 0.45 + (suspectedProcesses.Count * 0.06);
+
+        var machinePeakCpu = systemSamples.Select(item => item.TotalCpuUsagePercent).DefaultIfEmpty().Max();
+
+        // The game's peak rather than its concurrent figure, deliberately. It is the reading most
+        // favourable to the game, so clearing it is the conservative version of the claim below.
+        var gamePeakCpu = processSamples.Select(item => item.CpuUsagePercent).DefaultIfEmpty().Max();
+
+        var suspectPeakCpu = ConcurrentSuspectCpu(suspectedProcesses, systemSamples);
+        var suspectPeakIo = suspectedProcesses.Select(item => item.PeakIoMegabytesPerSecond).DefaultIfEmpty().Max();
+
+        // A saturated machine is the precondition for interference to cost frames at all. With cores to
+        // spare the scheduler simply runs both, which is why a busy neighbour on an idle machine is not
+        // evidence of anything.
+        if (machinePeakCpu >= 85)
+        {
+            confidence += 0.15;
+            evidence.Add($"Maskinen var mättad: total CPU toppade på {machinePeakCpu:F0}%, så spelets trådar konkurrerade om kärnor snarare än att få egna.");
+        }
+
+        if (gamePeakCpu > 0 && suspectPeakCpu >= gamePeakCpu)
+        {
+            confidence += 0.2;
+            evidence.Add($"Bakgrundsprocesserna tog samtidigt mer CPU än spelet: {suspectPeakCpu:F0}% i samma mätpunkt mot FiveM:s {gamePeakCpu:F0}% som mest (båda som andel av hela maskinen).");
+        }
+
+        // Volume on its own is not latency, so this is a smaller term than the two above. It is here
+        // because a sync queue moving hundreds of megabytes a second is also thousands of file system
+        // operations a second, and that traffic is contended for in the kernel by everything else.
+        if (suspectPeakIo >= 200)
+        {
+            confidence += 0.1;
+            evidence.Add($"Disktrafiken från bakgrunden toppade på {suspectPeakIo:F0} MB/s.");
+        }
 
         hypotheses.Add(new HypothesisScore(
             RootCauseCategory.ExternalProcessInterference,
-            Math.Min(0.45 + (suspectedProcesses.Count * 0.06), 0.78),
+            Math.Min(confidence, 0.9),
             evidence));
+    }
+
+    /// <summary>
+    /// The most CPU the suspected processes held <em>at one instant</em>, as a percentage of the machine.
+    /// </summary>
+    /// <remarks>
+    /// Summing each suspect's own peak was the first version and it measures nothing real: the peaks are
+    /// maxima over a ninety second window and need never have happened together, so a sync service busy
+    /// at the start and a browser busy at the end would add up to a load the machine never carried. The
+    /// claim the sum is used for — that the background outweighed the game — is about a moment, so it has
+    /// to be measured in one.
+    /// <para>
+    /// Deduplicated by process within a sample, because a process busy on both CPU and disk appears in
+    /// both of the sample's lists and would otherwise be counted twice.
+    /// </para>
+    /// </remarks>
+    private static double ConcurrentSuspectCpu(
+        IReadOnlyList<SuspectedProcessImpact> suspectedProcesses,
+        IReadOnlyList<SystemTelemetrySample> systemSamples)
+    {
+        var suspects = suspectedProcesses
+            .Select(item => (item.ProcessName, item.ProcessId))
+            .ToHashSet();
+
+        var highest = 0d;
+        foreach (var sample in systemSamples)
+        {
+            var counted = new HashSet<(string, int)>();
+            var total = 0d;
+
+            foreach (var process in sample.TopCpuProcesses.Concat(sample.TopDiskProcesses))
+            {
+                var key = (process.ProcessName, process.ProcessId);
+                if (suspects.Contains(key) && counted.Add(key))
+                {
+                    total += process.CpuPercent;
+                }
+            }
+
+            if (total > highest)
+            {
+                highest = total;
+            }
+        }
+
+        return highest;
     }
 
     private static void AddOsLatencyHypothesis(
@@ -1295,24 +1438,49 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                 // PresentMon timestamps the beginning of the frame-side work. Fifty milliseconds of
                 // clock/anchor tolerance is enough for batching without allowing an unrelated wait
                 // several seconds earlier in the retained ETL to become the incident's explanation.
-                var overlapsSlowFrame = slowFrames.Any(frame =>
+                //
+                // How much of the slow frames the wait actually covers is kept, not just whether it
+                // touched one. A window is ninety seconds and can hold several unrelated causes; a wait
+                // that overlaps one frame by a millisecond is not a reason to discount the attribution
+                // for all of them, and treating it as one hid whatever else was in the window.
+                var overlapMs = 0d;
+                foreach (var frame in slowFrames)
                 {
                     var frameStart = frame.Timestamp.ToUnixTimeMilliseconds() - 50;
                     var frameEnd = frame.Timestamp.ToUnixTimeMilliseconds() + frame.FrameTimeMs + 50;
-                    return start <= frameEnd && end >= frameStart;
-                });
+                    var overlap = Math.Min(end, frameEnd) - Math.Max(start, frameStart);
+                    if (overlap > 0)
+                    {
+                        overlapMs += overlap;
+                    }
+                }
 
-                if (overlapsSlowFrame)
+                if (overlapMs > 0)
                 {
                     matches.Add(new CorrelatedThreadWait(
                         threadId,
                         duration,
-                        trace.Metrics.GetValueOrDefault($"gameThreadWait{index}UserRequest") >= 0.5));
+                        trace.Metrics.GetValueOrDefault($"gameThreadWait{index}UserRequest") >= 0.5,
+
+                        // Frames can overlap each other after the tolerance is applied, so the summed
+                        // overlap is clamped to the wait itself: a thread cannot be off the processor
+                        // for longer than it was off the processor.
+                        Math.Min(overlapMs, duration)));
                 }
             }
         }
 
-        return matches.OrderByDescending(wait => wait.DurationMs).FirstOrDefault();
+        if (matches.Count == 0)
+        {
+            return null;
+        }
+
+        // The longest wait names the incident, but every matched wait counts towards how much of the
+        // window's lost time is accounted for by waiting. Two 300 ms waits explain a 600 ms hole; the
+        // longest of them alone explains half of it.
+        return matches
+            .OrderByDescending(wait => wait.DurationMs)
+            .First() with { OverlappingSlowFrameMs = matches.Sum(wait => wait.OverlappingSlowFrameMs) };
     }
 
     private static bool IsKnownOverlayOrHook(string processName)
@@ -1450,7 +1618,35 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         public double? CpuBoundTimeShare => TotalSpikeMs > 0 ? CpuBoundSpikeMs / TotalSpikeMs : null;
     }
 
-    private sealed record CorrelatedThreadWait(double ThreadId, double DurationMs, bool IsUserRequest);
+    /// <summary>
+    /// A wait from the trace that lands on the window's slow frames.
+    /// </summary>
+    /// <param name="OverlappingSlowFrameMs">
+    /// How much of the slow frames this wait actually covers, summed across every matched wait. This is
+    /// what decides whether the wait contradicts the window's CPU attribution or merely coincides with
+    /// part of it — a ninety second window can hold more than one cause, and a wait that overlaps one
+    /// frame by a millisecond is not a reason to discount the attribution for all of them.
+    /// </param>
+    private sealed record CorrelatedThreadWait(
+        double ThreadId,
+        double DurationMs,
+        bool IsUserRequest,
+        double OverlappingSlowFrameMs)
+    {
+        /// <summary>
+        /// Whether waiting accounts for a decisive share of the CPU-bound time it would be used against.
+        /// </summary>
+        /// <remarks>
+        /// Zero CPU-bound time means there is nothing to contradict, and the answer is false rather than
+        /// vacuously true: the contradiction exists only to stop MsCPUBusy being read as execution, so
+        /// with no such reading in play it has no work to do.
+        /// </remarks>
+        public bool Contradicts(double cpuBoundSpikeMs)
+        {
+            return cpuBoundSpikeMs > 0
+                && OverlappingSlowFrameMs >= cpuBoundSpikeMs * DecisiveAttributionShare;
+        }
+    }
 
     private sealed record PresentModeMetrics(
         bool HasData,

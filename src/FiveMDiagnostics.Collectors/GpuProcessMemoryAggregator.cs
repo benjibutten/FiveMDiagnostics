@@ -116,12 +116,14 @@ public static class GpuProcessMemoryAggregator
 
         return dedicatedByProcess.Keys
             .Union(sharedByProcess.Keys)
-            .Select(processId => new GpuProcessMemoryUsage(
+            .Select(processId => Build(
                 processId,
                 processNames.TryGetValue(processId, out var name) ? name : $"pid {processId}",
                 dedicatedByProcess.GetValueOrDefault(processId),
                 sharedByProcess.GetValueOrDefault(processId),
-                instanceCounts.GetValueOrDefault(processId)))
+                instanceCounts.GetValueOrDefault(processId),
+                dedicatedReadings,
+                sharedReadings))
             .Where(usage => usage.DedicatedBytes > 0 || usage.SharedBytes > 0)
             .OrderByDescending(usage => usage.DedicatedBytes)
             .ThenByDescending(usage => usage.SharedBytes)
@@ -224,11 +226,80 @@ public static class GpuProcessMemoryAggregator
                 continue;
             }
 
-            parsed.Add(new Reading(processId, ParseAdapter(instance), (ulong)value));
+            parsed.Add(new Reading(processId, ParseAdapter(instance), (ulong)value, instance));
         }
 
         return parsed;
     }
 
-    private readonly record struct Reading(int ProcessId, string? Adapter, ulong Value);
+    /// <summary>
+    /// Dedicated bytes across <em>every</em> process on the table's adapter, before the top-N cut.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Aggregate"/> returns the largest holders only, so summing what it returns answers "how
+    /// much do the biggest twenty-five hold" and not "how much is accounted for". The difference matters
+    /// exactly where the reconciliation against the adapter's own figure does: double counting in a
+    /// process that never reaches the list would be invisible to a check summing the list.
+    /// <para>
+    /// Impossible readings are excluded here for the same reason they are excluded from the table — one
+    /// runaway row would swamp the comparison it is meant to inform.
+    /// </para>
+    /// </remarks>
+    public static ulong TotalDedicatedBytes(
+        IEnumerable<KeyValuePair<string, long>> dedicated,
+        IEnumerable<KeyValuePair<string, long>> shared,
+        int? anchorProcessId = null)
+    {
+        var dedicatedReadings = Parse(dedicated);
+        var sharedReadings = Parse(shared);
+        var adapter = SelectAdapter(dedicatedReadings, sharedReadings, anchorProcessId);
+
+        return SumByProcess(dedicatedReadings, adapter, out _)
+            .Values
+            .Where(bytes => bytes <= GpuProcessMemoryUsage.ImplausibleDedicatedBytes)
+            .Aggregate(0UL, (total, bytes) => total + bytes);
+    }
+
+    /// <summary>
+    /// Builds one process's row, attaching the raw instances behind it when the total is impossible.
+    /// </summary>
+    /// <remarks>
+    /// The instances are the diagnosis and they are only affordable on the rows that need one. Every
+    /// instance the process reported is attached, including the ones the adapter filter dropped: which
+    /// adapters it is spread across is exactly what the impossible row is being asked about, and a
+    /// listing that had already been filtered could not answer it.
+    /// </remarks>
+    private static GpuProcessMemoryUsage Build(
+        int processId,
+        string processName,
+        ulong dedicatedBytes,
+        ulong sharedBytes,
+        int instanceCount,
+        IReadOnlyList<Reading> dedicatedReadings,
+        IReadOnlyList<Reading> sharedReadings)
+    {
+        var usage = new GpuProcessMemoryUsage(processId, processName, dedicatedBytes, sharedBytes, instanceCount);
+        if (!usage.IsImplausible)
+        {
+            return usage;
+        }
+
+        var shared = sharedReadings
+            .Where(reading => reading.ProcessId == processId)
+            .ToDictionary(reading => reading.InstanceName, reading => reading.Value, StringComparer.OrdinalIgnoreCase);
+
+        var instances = dedicatedReadings
+            .Where(reading => reading.ProcessId == processId)
+            .Select(reading => new GpuProcessMemoryInstance(
+                reading.InstanceName,
+                reading.Adapter,
+                reading.Value,
+                shared.GetValueOrDefault(reading.InstanceName)))
+            .OrderByDescending(instance => instance.DedicatedBytes)
+            .ToArray();
+
+        return usage with { Instances = instances };
+    }
+
+    private readonly record struct Reading(int ProcessId, string? Adapter, ulong Value, string InstanceName);
 }

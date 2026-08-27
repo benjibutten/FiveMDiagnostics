@@ -35,6 +35,30 @@ The analysis engine ranks these categories:
 8. OS/driver latency
 9. Possible cache/resource corruption
 
+### External interference is ranked by how much of the machine it took
+
+Counting suspected processes said the same thing about two idle overlays as about a window where
+OneDrive held 3.68 of eight physical cores — more CPU than the game — with 87% of every file operation on
+the machine and the game's render thread sharing a physical core 86% of the time. That incident was
+ranked a FiveM script spike at 60%, with external interference second at 51%, because the category's score
+was a function of *how many* neighbours were noticed and never of how large they were.
+
+Three measured terms now weigh in, and all three are conditional on the state that makes interference cost
+frames at all. The machine has to be saturated — with cores to spare the scheduler simply runs both, so a
+busy neighbour on an idle machine is evidence of nothing. The suspects' CPU **at one instant** is compared
+against the game's peak, both as a percentage of the whole machine from the same counter, so "the
+background took more than the game" is a statement the engine can now make. Background disk throughput past
+200 MB/s adds a smaller term, because volume is not latency but a sync queue moving that much is also
+thousands of file system operations a second contended for in the kernel.
+
+The concurrency matters and the first version of this got it wrong. Each suspect's peak is a maximum over
+a ninety second window, so adding the peaks together measures a load the machine need never have carried —
+a sync service busy at the start and a browser busy at the end would sum to a figure that beats the game
+without the two ever having run together. The comparison is a claim about a moment, so it is measured in
+one: the busiest single sample, deduplicated across the sample's CPU and disk lists. The game is still
+represented by its *peak*, which is the reading most favourable to it and makes clearing the bar the
+conservative version of the claim.
+
 ### How a slow frame is attributed
 
 With PresentMon `--v2_metrics` every spike is classified using the per-frame CPU/GPU breakdown rather
@@ -45,6 +69,21 @@ than frame time alone:
 | `MsCPUBusy` dominates | FiveM script/resource work or CPU contention |
 | `MsGPUBusy` dominates | GPU contention, e.g. NVENC encoding against the game |
 | Neither is busy | Present/display path stalled — VRAM eviction, DPC/ISR latency or composition |
+
+**`MsCPUBusy` is not a measurement of execution, and a trace overrules it.** PresentMon derives the
+figure from the gap between presents, so a main thread blocked on a lock reads exactly like one running
+script: a 586 ms frame reported 585.2 ms of CPU busy for a thread the ETL shows off the processor for
+568.9 of them. Where a deep capture covers the frame and shows an active game thread waiting, the
+CPU-bound attribution is **not counted as evidence of script work at all** — not counted and then capped,
+which was the earlier shape of this rule and still ranked the hypothesis first in 190 of one session's
+198 incidents. The same reading is likewise barred from *ruling out* a storage stall, since a thread
+blocked on a disk read produces it too.
+
+The contradiction is **proportionate, not boolean**. An incident window is ninety seconds and can hold
+more than one cause, so how much of the window's CPU-bound spike time the waits actually cover is measured
+rather than whether one of them touched a slow frame. A 120 ms wait in a window that lost 1 750 ms to
+CPU-bound spikes explains 7% of it and discards nothing; the same rule discards the attribution when the
+waits cover most of that time. Treating any overlap as decisive would hide whatever else was in the window.
 
 PresentMon's `PresentMode` and `MsBetweenDisplayChange` are read alongside these and reported in the
 summary, the timeline and the exported metrics. The mode is the only column that says *how* a frame
@@ -108,10 +147,27 @@ Auto-marked incidents **may trigger deep capture, but only within a budget**. Sa
 writes a multi-hundred-megabyte ETL and empties the buffer, so this used to be refused outright — until a
 five and a half hour session raised eighteen severe incidents and produced no trace at all, leaving every
 one of its hitch clusters unexplained. Three gates now decide, and all three have to pass: the frame has
-to reach **DeepCapture.AutoCaptureFrameTimeMs** (300 ms), captures are spaced by
+to reach **DeepCapture.AutoCaptureFrameTimeMs** (120 ms), captures are spaced by
 **DeepCapture.AutoCaptureCooldown** (10 min) so a burst spends one rather than twenty, and
-**DeepCapture.MaxAutoCapturesPerSession** (6) is a hard ceiling. Set `DeepCapture.CaptureAutoIncidents`
+**DeepCapture.MaxAutoCapturesPerSession** (8) is a hard ceiling. Set `DeepCapture.CaptureAutoIncidents`
 to `false` for the old behaviour.
+
+The threshold was 300 ms, which was right for the sessions it was calibrated against and went blind the
+moment they improved. A seven hour session contained exactly one frame over 300 ms — the game's own
+restart, not a hitch — so two captures were taken in the first ninety minutes and none at all in the last
+three and a half hours, while the 67 frames that were the entire remaining problem sat at 100–170 ms.
+
+Lowering the threshold alone would have made the opposite mistake, and the fix is the same one
+`MaxIncidentsPerWindow` applies a level up. Against those real frames, a flat 120 ms threshold with only a
+session ceiling spends all its captures before the ninety minute mark — 43 of the 67 fell inside fourteen
+minutes of the opening hour, a cache rebuilt after a settings change with a sync backlog on top — and
+records nothing for the remaining five hours. **DeepCapture.MaxAutoCapturesPerWindow** (1) over
+**DeepCapture.CaptureBudgetWindow** (1 h) rations the ordinary frames instead, which against the same
+session spreads six captures across the whole evening and picks up its largest late frame. A frame past
+the override threshold below ignores the window budget, answering to the session ceiling and the ring
+buffer only — and does not spend the window's slot either, since charging it would let one catastrophic
+frame buy silence for the rest of the hour, which is the failure the window exists to prevent arriving by
+the one path that is exempt from it.
 
 The spacing gate has one way past it. A frame beyond **DeepCapture.AutoCaptureOverrideFrameTimeMs**
 (500 ms) spends budget the cooldown would have withheld, because the ceiling was always meant to be the
@@ -213,6 +269,31 @@ whether it was sharing a physical core, and whether the file system traffic ever
 frame, which thread released it, and which module it was blocked in. It needs a capture recorded with
 `CSwitch` and `ReadyThread` stacks, and it reads the trace with TraceEvent because TraceProcessing
 rejects the context switch stream in these ring buffer captures.
+
+`wait` follows the **release chain past the first link**, because the first link is rarely the answer.
+Across three sessions the thread that released the game's main thread was a near-idle synchronisation
+thread inside `gta-core-five.dll` — 0.03 cores, no work of its own — which was itself waiting on the
+render thread for the same interval:
+
+```text
+    release chain
+      tid 25872  (FiveM_b3407_GTAProcess.exe)  waited    568.9 ms
+      tid 20648  (FiveM_b3407_GTAProcess.exe)  waited    568.4 ms  ← blocked in FiveM_b3407_GTAProcess.exe
+      tid 13924  (FiveM_b3407_GTAProcess.exe)  did not wait — on the processor for all of it, this is where the chain ends
+```
+
+The walk stops at the first thread with no wait of its own covering the interval, which is the thread the
+report exists to name: it is on the processor while everything behind it is not. Reaching it used to be
+three manual invocations of this command, every session since 25 August. A link has to be off the
+processor for most of the wait it explains, so a thread that merely parked nearby does not join the chain,
+and a cycle, an unnameable waker or a depth of eight ends the walk.
+
+A **DPC** ends it too. The classic kernel `ReadyThread` event names no thread, and the thread the context
+switch stream shows on that processor is merely the one the interrupt suspended — so the chain says the
+wake came from a DPC on that CPU and stops, rather than stepping onto an uninvolved thread and continuing
+from there. Where a link was taken from the processor rather than from a recorded `ReadyThread` stack it
+is marked `(inferred from the processor)`, because that step holds for an ordinary user mode wake and is
+still an inference.
 `--from-ms` and `--to-ms` zoom any CPU or thread report into offsets from the first retained CPU sample,
 which keeps a multi-second wait from being averaged away by the rest of the ring buffer.
 Rates are reported in *cores*, so a thread at 0.89 cores is spending 19.6 ms of CPU inside a 22 ms
@@ -332,8 +413,28 @@ Figures are summed per process across the counter instances of **one adapter** �
 itself holds memory on. More than one adapter is the normal case rather than the laptop case: a
 single-GPU desktop enumerates two distinct adapter LUIDs, and summing across them produced a reading of
 213 GB on a 10 GB card that stood as "largest VRAM holder" in 145 incident reports before it was caught.
-A per-process figure that is still impossible for any adapter is kept in the log, named in a warning
-with its instance count, and left out of the reports' top list.
+A per-process figure that is still impossible for any adapter is kept in the log, named in a warning, and
+left out of the reports' top list. That warning now lists the counter instances behind the row — each
+one's adapter LUID, dedicated bytes and shared bytes — rather than only how many there were. The count
+was added to prove the total came from summing instances and on its first outing disproved it: obs64
+reported 209 GB for a whole session with an instance count of **one**, so the runaway sum was never the
+explanation and a single number could not say what was.
+
+The table is also reconciled against the adapter's own figure, once at session start and every thirty
+minutes after. The two come from different sources and are not expected to match exactly — VRAM holds
+framebuffers belonging to no running process, so the sum normally sits a little under NVML's figure — but
+a sum *above* what the card reports as used is impossible and means a row is double counting. It happened:
+across two consecutive sessions on one machine the gap went from +0.17 GB to +1.11 GB, every individual
+row still looked reasonable, and it was found by exporting both logs and doing the arithmetic by hand a
+session later. Beyond half a gigabyte of overshoot the line is logged as a warning.
+
+Two things the comparison has to be careful about. It sums **every** process on the adapter rather than the
+top-N the table reports, because double counting in a process below the cut would otherwise be invisible to
+a check that only ever looks at the biggest. And it only ever *accuses* on a single-GPU machine: NVML reads
+device index 0 for the whole session while the process table is anchored on whichever adapter the game
+holds memory on, so with a second NVIDIA device present those need not be the same card and their
+difference would be a fact about the hardware rather than about the accounting. The line is still written
+in that case, with the caveat, and never escalates to a warning.
 
 Turn it off with `Gpu.ProcessMemoryEnabled`; `Gpu.ProcessMemoryInterval` and `Gpu.ProcessMemoryTopCount`
 (25) set the cadence and how many processes each sample keeps. The list is long because the question is
@@ -400,7 +501,7 @@ For the next session there is no separate “collect CSwitch stack” procedure.
 build **as administrator**, start diagnostics before FiveM, and play normally. Keep the lowered distance
 scaling/population density and paused OneDrive unchanged so the session is comparable. Use **Mark Normal**
 whenever lag is perceived: that human annotation is valuable even if the frame stays below the automatic
-threshold. Use **Mark Severe** for an obvious freeze or major hitch. Hitches above the automatic 300 ms
+threshold. Use **Mark Severe** for an obvious freeze or major hitch. Hitches above the automatic 120 ms
 threshold save the relevant ETL by themselves, but automatic detection does not replace perceived-lag
 markers. At session start the status log should say
 `CSwitch-stackar aktiva`. Older saved 256 MB/5 s defaults are migrated once to 768 MB/2 s automatically.

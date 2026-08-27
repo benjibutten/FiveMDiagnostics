@@ -104,7 +104,125 @@ internal static class WaitReports
             Console.WriteLine($"    released by  {Waker(wait, scan, stacks)}");
             Console.WriteLine($"    waker stack  {Chain(WakingFrames(wait, stacks), WakerThreadId(wait, stacks), scan)}");
             Console.WriteLine($"    resumed into {Chain(stacks.Resumed.GetValueOrDefault((scan.ThreadId, wait.SwitchInQpc)), scan.ThreadId, scan)}");
+            PrintReleaseChain(wait, scan, stacks);
         }
+    }
+
+    /// <summary>
+    /// Follows the release chain past the first link, to the thread that was not itself waiting.
+    /// </summary>
+    /// <remarks>
+    /// The first link is rarely the answer. Across three sessions the thread that released the game's
+    /// main thread was a near-idle synchronisation thread inside <c>gta-core-five.dll</c> — 0.03 cores,
+    /// no work of its own — which was itself waiting on the render thread for the same interval. Naming
+    /// only the first link reports a thread that is doing nothing as the cause of the stall, and finding
+    /// the thread that actually is one was three manual invocations of this command every session since
+    /// 25 August.
+    /// <para>
+    /// The walk stops at the first thread with no wait of its own covering the interval. That thread is
+    /// the one the report exists to name: it is on the processor while everything behind it is not.
+    /// </para>
+    /// </remarks>
+    private static void PrintReleaseChain(ThreadWait wait, Scan scan, Stacks stacks)
+    {
+        // One link is what the two lines above already said; a chain worth printing is at least two.
+        var links = WalkChain(wait, scan, stacks);
+        if (links.Count == 0)
+        {
+            return;
+        }
+
+        Console.WriteLine("    release chain");
+        Console.WriteLine($"      {Describe(wait.ThreadId, scan)}  waited {wait.DurationMs,8:F1} ms");
+
+        foreach (var link in links)
+        {
+            // A link with no thread id is the chain ending on something that is not a thread — a DPC —
+            // so the ending text stands on its own.
+            var who = link.ThreadId < 0 ? "      " : $"      {Describe(link.ThreadId, scan)}  ";
+            var derivation = link.WakerInferred && link.ThreadId >= 0 ? "  (inferred from the processor)" : string.Empty;
+
+            if (link.Wait is { } blocked)
+            {
+                Console.WriteLine($"{who}waited {blocked.DurationMs,8:F1} ms"
+                    + $"  ← blocked in {BlockedIn(blocked, scan, stacks)}{derivation}");
+            }
+            else
+            {
+                Console.WriteLine($"{who}{link.Ending}{derivation}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Walks from a wait to the thread that released it, then to whatever released that, and so on.
+    /// </summary>
+    /// <remarks>
+    /// Bounded three ways: a thread already on the chain ends it, because a cycle means the attribution
+    /// is wrong rather than that the deadlock is real; a waker the trace cannot name ends it, because
+    /// there is nothing to step to; and a hard depth limit ends it, because neither of the first two is
+    /// a guarantee on a trace whose context switch stream wrapped mid-stall.
+    /// </remarks>
+    private static List<ChainLink> WalkChain(ThreadWait wait, Scan scan, Stacks stacks)
+    {
+        const int MaxDepth = 8;
+
+        var links = new List<ChainLink>();
+        var seen = new HashSet<int> { wait.ThreadId };
+        var current = wait;
+
+        for (var depth = 0; depth < MaxDepth; depth++)
+        {
+            if (!current.HasReadyEvent)
+            {
+                break;
+            }
+
+            // A DPC names no thread. The thread the context switch stream shows on that processor is
+            // merely the one the interrupt suspended, so stepping to it would attribute the wake to a
+            // thread that had nothing to do with it — and then keep walking from there. Waker() already
+            // refuses to name a thread here; the chain has to refuse for the same reason.
+            if (current.ReadiedFromDeferredProcedureCall)
+            {
+                links.Add(new ChainLink(-1, null, $"släpptes av en DPC på CPU {current.ReadyProcessor} — ingen tråd att följa vidare till"));
+                break;
+            }
+
+            var next = WakerThreadId(current, stacks);
+            if (next < 0 || !seen.Add(next))
+            {
+                break;
+            }
+
+            // Whether the waker is recorded or inferred decides how the link may be stated. Without the
+            // ReadyThread stack the only handle is which thread the switch stream had on that processor,
+            // which holds for an ordinary user mode wake and is still an inference.
+            var inferred = stacks.Waking.GetValueOrDefault((current.ReadyProcessor, current.ReadyQpc)) is null;
+
+            // The link's own wait has to cover the interval it is supposed to explain, or it is a
+            // different wait on the same thread that happens to be in the trace.
+            var blocking = scan.ChainWaits
+                .Where(candidate => candidate.ThreadId == next && Covers(candidate, current))
+                .OrderByDescending(candidate => candidate.DurationMs)
+                .FirstOrDefault();
+
+            if (blocking is null)
+            {
+                links.Add(new ChainLink(next, null, "did not wait — on the processor for all of it, this is where the chain ends", inferred));
+                break;
+            }
+
+            links.Add(new ChainLink(next, blocking, string.Empty, inferred));
+            current = blocking;
+        }
+
+        return links;
+    }
+
+    private static string Describe(int threadId, Scan scan)
+    {
+        var process = scan.ProcessNameFor(scan.ProcessByThread.GetValueOrDefault(threadId, -1));
+        return $"tid {threadId,-6} ({process})";
     }
 
     /// <summary>
@@ -266,9 +384,15 @@ internal static class WaitReports
             .Where(wait => wait.ThreadId == threadId && wait.End >= from && wait.End <= to)
             .ToArray();
 
+        // Everything the chain walker might step onto, fetched now because the stacks it needs are only
+        // available on the second read. Overlap rather than waker identity picks the set: which thread
+        // released which is exactly what the stacks are being fetched to establish, so selecting on it
+        // here would only retain the links the inference already agreed with.
+        var chainable = ChainCandidates(waits, selected);
+
         var wanted = new HashSet<(int ThreadId, long Qpc)>();
         var wantedReady = new HashSet<(int Processor, long Qpc)>();
-        foreach (var wait in selected)
+        foreach (var wait in selected.Concat(chainable))
         {
             wanted.Add((wait.ThreadId, wait.SwitchInQpc));
             if (wait.HasReadyEvent)
@@ -281,7 +405,68 @@ internal static class WaitReports
 
         var processId = processByThread.GetValueOrDefault(threadId.Value, -1);
         var processName = processNames.GetValueOrDefault(processId, $"pid {processId}");
-        return new Scan(threadId.Value, processName, selected, wanted, wantedReady, images, processNames, processByThread, readyEvents);
+        return new Scan(
+            threadId.Value,
+            processName,
+            selected,
+            chainable,
+            wanted,
+            wantedReady,
+            images,
+            processNames,
+            processByThread,
+            readyEvents);
+    }
+
+    /// <summary>
+    /// Waits on other threads that could be links in the release chain behind one of the selected waits.
+    /// </summary>
+    /// <remarks>
+    /// A link is a wait that spans essentially the same interval as the one it explains: in the captures
+    /// this was written from, the main thread, the synchronisation thread behind it and the render
+    /// thread behind that all went off the processor within a millisecond of each other and came back
+    /// together. Requiring most of the wait to overlap is what keeps an unrelated thread that happened to
+    /// park nearby out of the chain, and it is cheap — the candidate set is a handful of waits, not the
+    /// thousands the trace holds.
+    /// </remarks>
+    private static IReadOnlyList<ThreadWait> ChainCandidates(List<ThreadWait> all, IReadOnlyList<ThreadWait> selected)
+    {
+        if (selected.Count == 0)
+        {
+            return [];
+        }
+
+        var candidates = new List<ThreadWait>();
+        foreach (var wait in all)
+        {
+            if (wait.ThreadId == selected[0].ThreadId)
+            {
+                continue;
+            }
+
+            foreach (var anchor in selected)
+            {
+                if (Covers(wait, anchor))
+                {
+                    candidates.Add(wait);
+                    break;
+                }
+            }
+        }
+
+        return candidates;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="candidate"/> is off the processor for most of <paramref name="anchor"/>'s
+    /// wait, and so could be the reason for it.
+    /// </summary>
+    private static bool Covers(ThreadWait candidate, ThreadWait anchor)
+    {
+        var start = candidate.Start > anchor.Start ? candidate.Start : anchor.Start;
+        var end = candidate.End < anchor.End ? candidate.End : anchor.End;
+        var overlapMs = (end - start).TotalMilliseconds;
+        return overlapMs > 0 && overlapMs >= anchor.DurationMs * 0.5;
     }
 
     /// <summary>Collects the stacks the first pass asked for, and nothing else.</summary>
@@ -530,6 +715,15 @@ internal static class WaitReports
     /// <summary>The stack of the thread that did the readying, and which thread that turned out to be.</summary>
     private sealed record WakingStack(int ThreadId, ulong[] Frames);
 
+    /// <summary>
+    /// One step of the release chain. <paramref name="Wait"/> is null at the end of the chain, where
+    /// <paramref name="Ending"/> says why the walk stopped there, and <paramref name="ThreadId"/> is
+    /// negative when the chain ended on something that is not a thread. <paramref name="WakerInferred"/>
+    /// records that the step was taken on the processor the wake fired on rather than on a recorded
+    /// stack.
+    /// </summary>
+    private sealed record ChainLink(int ThreadId, ThreadWait? Wait, string Ending, bool WakerInferred = false);
+
     /// <summary>Where a wait resumed, and who released it, for the waits the first pass selected.</summary>
     private sealed class Stacks
     {
@@ -567,6 +761,7 @@ internal static class WaitReports
         int ThreadId,
         string ProcessName,
         IReadOnlyList<ThreadWait> Waits,
+        IReadOnlyList<ThreadWait> ChainWaits,
         HashSet<(int ThreadId, long Qpc)> WantedStacks,
         HashSet<(int Processor, long Qpc)> WantedReadyStacks,
         ImageMap Images,

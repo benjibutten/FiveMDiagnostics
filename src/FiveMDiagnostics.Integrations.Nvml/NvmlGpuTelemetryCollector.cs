@@ -22,6 +22,7 @@ public sealed class NvmlGpuTelemetryCollector : ITelemetryCollector, IDisposable
     private bool _reportedUnavailable;
     private IntPtr _device;
     private string? _adapterName;
+    private int? _adapterCount;
     private GpuTelemetryCsvLog? _csvLog;
     private bool _reportedLogFailure;
 
@@ -154,7 +155,8 @@ public sealed class NvmlGpuTelemetryCollector : ITelemetryCollector, IDisposable
                 encoderUtilization,
                 decoderUtilization,
                 temperature,
-                throttleReasons);
+                throttleReasons,
+                _adapterCount);
         }
         catch (DllNotFoundException)
         {
@@ -195,6 +197,12 @@ public sealed class NvmlGpuTelemetryCollector : ITelemetryCollector, IDisposable
                 MarkUnavailable(context, "NVML hittade ingen GPU.");
                 return false;
             }
+
+            // Carried on every sample because the device this collector opens is index 0, while the
+            // per-process VRAM table is anchored on whichever adapter the game holds memory on. Those are
+            // the same card when there is one, and need not be when there is more than one — so anything
+            // comparing the two figures has to be able to tell which case it is in.
+            _adapterCount = (int)count;
 
             if (NvmlInterop.GetDeviceHandleByIndex(0, out _device) != NvmlInterop.Success)
             {
