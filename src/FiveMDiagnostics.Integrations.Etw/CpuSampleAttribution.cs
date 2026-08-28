@@ -260,6 +260,7 @@ internal sealed class CpuSampleAttribution
         return new CpuAttributionSummary(
             ToCores(_samples.Count),
             Name(subject.Key),
+            IsGameProcess(Name(subject.Key)),
             ToCores(subject.Value),
             busiestThread.Key.ThreadId,
             ToCores(busiestThread.Value),
@@ -340,6 +341,7 @@ internal sealed record ModuleShare(string Module, double Share, double Cores);
 internal sealed record CpuAttributionSummary(
     double TotalCores,
     string SubjectProcess,
+    bool SubjectIsGame,
     double SubjectProcessCores,
     int BusiestThreadId,
     double BusiestThreadCores,

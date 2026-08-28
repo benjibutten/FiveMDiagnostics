@@ -62,7 +62,7 @@ public sealed class BlockedThreadOutranksCpuBusyTests
 
     /// <summary>
     /// The other direction, and the reason this is conditional on the trace: without one there is no
-    /// evidence of blocking, and a genuinely CPU-bound window must still reach a script verdict.
+    /// evidence of blocking, so the attribution still counts and is still reported as it stands.
     /// </summary>
     [Fact]
     public void WithoutATraceTheCpuAttributionStillCounts()
@@ -73,7 +73,122 @@ public sealed class BlockedThreadOutranksCpuBusyTests
         Assert.NotNull(resource);
         Assert.Contains(resource!.Evidence, item => item.Contains("var CPU-bundna", StringComparison.Ordinal));
         Assert.DoesNotContain(resource.Evidence, item => item.Contains("NEDVIKTAD", StringComparison.Ordinal));
-        Assert.True(resource.Confidence > 0.3, $"an uncontradicted script verdict was capped anyway ({resource.Confidence:P0})");
+        Assert.True(resource.Confidence > 0.3, $"an uncontradicted script verdict was discarded ({resource.Confidence:P0})");
+    }
+
+    /// <summary>
+    /// It still cannot be the answer. Nothing here says the thread was blocked, and nothing says it was
+    /// running either: <c>MsCPUBusy</c> reads identically for both, and every other signal in the window
+    /// is a once-a-second average that cannot resolve a single frame.
+    /// </summary>
+    /// <remarks>
+    /// The session of 27 August is the argument. All 67 of its frames over 100 ms reported
+    /// <c>MsCPUBusy</c> at 70% or more of frame time and 151 of its 154 incidents were ranked as script
+    /// spikes at 80% confidence — while the one freeze that had a trace shows the main thread off the
+    /// processor for 178.0 of its 178 ms. Below the 0.35 bar is where the same codebase already puts a
+    /// storage verdict resting on throughput instead of on the disk counters.
+    /// </remarks>
+    [Fact]
+    public void WithoutATraceTheCpuAttributionCannotReachAVerdict()
+    {
+        var analysis = _engine.Analyze(BuildIncident(withTrace: false));
+        var resource = analysis.Hypotheses.First(item => item.Category == RootCauseCategory.FiveMResourceSpike);
+
+        Assert.True(resource.Confidence <= 0.34, $"an unmeasured script verdict reached {resource.Confidence:P0}");
+        Assert.Contains(resource.Evidence, item => item.Contains("OBEKRÄFTAD", StringComparison.Ordinal));
+        Assert.Equal(RootCauseCategory.InsufficientEvidence, analysis.Hypotheses[0].Category);
+        Assert.True(analysis.InsufficientEvidence);
+    }
+
+    /// <summary>
+    /// Having a trace is not the same as having measured anything.
+    /// </summary>
+    /// <remarks>
+    /// A capture can come back carrying DPC and ISR durations and no sampled profiles at all — another
+    /// ETW session holding the keyword, a stream that died in the first seconds, a profile that never
+    /// asked for them. Such a file says exactly as much about whether the game's threads ran as no file
+    /// does, so it must not lift the ceiling on a claim that they ran script. It is still evidence for
+    /// everything else it holds.
+    /// </remarks>
+    [Fact]
+    public void ATraceThatSampledNoCpuDoesNotLiftTheCap()
+    {
+        var analysis = _engine.Analyze(BuildIncidentWithCoverageOnlyTrace());
+        var resource = analysis.Hypotheses.First(item => item.Category == RootCauseCategory.FiveMResourceSpike);
+
+        Assert.True(resource.Confidence <= 0.34, $"an ETL with no CPU samples lifted the cap to {resource.Confidence:P0}");
+        Assert.Contains(resource.Evidence, item => item.Contains("OBEKRÄFTAD", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// And the trace that did sample the game running lifts it, which is the whole point of taking one.
+    /// </summary>
+    [Fact]
+    public void ATraceThatSampledTheGameLiftsTheCap()
+    {
+        var analysis = _engine.Analyze(BuildIncidentWithCpuSampledTrace());
+        var resource = analysis.Hypotheses.First(item => item.Category == RootCauseCategory.FiveMResourceSpike);
+
+        Assert.True(resource.Confidence > 0.34, $"a trace that sampled the game left the cap on ({resource.Confidence:P0})");
+        Assert.DoesNotContain(resource.Evidence, item => item.Contains("OBEKRÄFTAD", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ATraceWhoseFallbackSubjectIsNotTheGameDoesNotLiftTheCap()
+    {
+        var analysis = _engine.Analyze(WithTraceMetrics(new Dictionary<string, double>
+        {
+            ["cpuSampleCount"] = 100_000,
+            ["cpuSubjectIsGame"] = 0,
+            ["cpuSubjectProcessCores"] = 3.2,
+        }));
+        var resource = analysis.Hypotheses.First(item => item.Category == RootCauseCategory.FiveMResourceSpike);
+
+        Assert.True(resource.Confidence <= 0.34);
+        Assert.Contains(resource.Evidence, item => item.Contains("OBEKRÄFTAD", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void GenericResmonEvidenceDoesNotLiftTheCap()
+    {
+        var incident = BuildIncident(withTrace: false);
+        var analysis = _engine.Analyze(incident with
+        {
+            Events = incident.Events.Concat([new ArtifactEvidence(
+                incident.Marker.MarkedAt,
+                ArtifactKind.ResmonSnapshot,
+                "resmon/export antyder resource-spike: inventory 11.4ms",
+                new Dictionary<string, double>())]).ToArray(),
+        });
+        var resource = analysis.Hypotheses.First(item => item.Category == RootCauseCategory.FiveMResourceSpike);
+
+        Assert.True(resource.Confidence <= 0.34);
+        Assert.DoesNotContain(resource.Evidence, item => item.Contains("resmon/export", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// A profiler measures execution, so a window that has one is not guessing and keeps its verdict.
+    /// The cap is about the instrument being absent, not about the conclusion being unwelcome.
+    /// </summary>
+    [Fact]
+    public void AProfilerLiftsTheCap()
+    {
+        var incident = BuildIncident(withTrace: false);
+        var withProfiler = incident with
+        {
+            Events = incident.Events
+                .Concat([new ArtifactEvidence(
+                    incident.Marker.MarkedAt,
+                    ArtifactKind.ProfilerJson,
+                    "Profiler JSON pekade ut resource 'inventory' med 240.0 ms.",
+                    new Dictionary<string, double> { ["topResourceMs"] = 240 })])
+                .ToArray(),
+        };
+
+        var analysis = _engine.Analyze(withProfiler);
+
+        Assert.Equal(RootCauseCategory.FiveMResourceSpike, analysis.Hypotheses[0].Category);
+        Assert.True(analysis.Hypotheses[0].Confidence > 0.34);
     }
 
     /// <summary>
@@ -126,6 +241,51 @@ public sealed class BlockedThreadOutranksCpuBusyTests
 
         Assert.NotNull(resource);
         Assert.Contains(resource!.Evidence, item => item.Contains("BORTSETT", StringComparison.Ordinal));
+    }
+
+    /// <summary>An incident whose trace holds latency and coverage figures and no CPU samples.</summary>
+    private static IncidentRecord BuildIncidentWithCoverageOnlyTrace()
+    {
+        return WithTraceMetrics(new Dictionary<string, double>
+        {
+            ["traceDurationSeconds"] = 39.4,
+            ["dpcMaxMs"] = 0.42,
+            ["isrMaxMs"] = 0.11,
+            ["cswitchCount"] = 412_004,
+            ["cpuSampleCount"] = 0,
+        });
+    }
+
+    /// <summary>The same trace with the sampled-profile stream present and attributed to the game.</summary>
+    private static IncidentRecord BuildIncidentWithCpuSampledTrace()
+    {
+        return WithTraceMetrics(new Dictionary<string, double>
+        {
+            ["traceDurationSeconds"] = 39.4,
+            ["dpcMaxMs"] = 0.42,
+            ["cpuSampleCount"] = 372_918,
+            ["cpuSubjectIsGame"] = 1,
+            ["cpuSampledSeconds"] = 38.9,
+            ["cpuTotalCores"] = 2.5,
+            ["cpuSubjectProcessCores"] = 1.78,
+            ["cpuBusiestThreadCores"] = 0.47,
+        });
+    }
+
+    private static IncidentRecord WithTraceMetrics(IReadOnlyDictionary<string, double> metrics)
+    {
+        var incident = BuildIncident(withTrace: false);
+
+        return incident with
+        {
+            Events = incident.Events
+                .Concat([new ArtifactEvidence(
+                    incident.Marker.MarkedAt,
+                    ArtifactKind.EtlTrace,
+                    "ETL-trace analyserad.",
+                    metrics)])
+                .ToArray(),
+        };
     }
 
     private static IncidentRecord BuildIncident(

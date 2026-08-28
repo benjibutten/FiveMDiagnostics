@@ -22,10 +22,10 @@ public sealed class AutoDeepCaptureBudgetTests
     /// Options with the window budget opened up, for the tests whose subject is the cooldown.
     /// </summary>
     /// <remarks>
-    /// The default window budget is one capture per hour, which refuses a second ordinary frame before
-    /// the cooldown ever gets to. That is the intended order — the window is the tighter gate — but it
-    /// makes the cooldown untestable at the default, and a test that cannot fail when the cooldown
-    /// breaks is not testing the cooldown.
+    /// The window budget refuses a fourth ordinary frame in an hour before the cooldown gets to it. That
+    /// is the intended order — the window is the tighter gate over an hour — but it makes the cooldown
+    /// awkward to test on its own, and a test that cannot fail when the cooldown breaks is not testing
+    /// the cooldown.
     /// </remarks>
     private static DeepCaptureOptions CooldownOnlyOptions(Action<DeepCaptureOptions>? configure = null)
     {
@@ -61,7 +61,21 @@ public sealed class AutoDeepCaptureBudgetTests
 
         Assert.Null(refusal);
         Assert.Equal(1, budget.Spent);
-        Assert.Equal(7, budget.Remaining);
+        Assert.Equal(11, budget.Remaining);
+    }
+
+    [Fact]
+    public void DroppedFrameRunSkipsOnlyTheFrameTimeGate()
+    {
+        var budget = new AutoDeepCaptureBudget(Options());
+
+        Assert.True(budget.TryReserveForDroppedFrameRun(Start, out var refusal));
+        Assert.Null(refusal);
+        Assert.Equal(1, budget.Spent);
+
+        Assert.False(budget.TryReserveForDroppedFrameRun(Start.AddSeconds(10), out refusal));
+        Assert.Contains("cooldown", refusal!, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(1, budget.Spent);
     }
 
     /// <summary>
@@ -96,13 +110,13 @@ public sealed class AutoDeepCaptureBudgetTests
         var options = CooldownOnlyOptions(item => item.AutoCaptureCooldown = TimeSpan.FromMinutes(10));
         var budget = new AutoDeepCaptureBudget(options);
 
-        // Below the override threshold, so this is the ordinary cooldown being tested rather than the
-        // way past it.
-        Assert.True(budget.TryReserve(Start, 350, out _));
-        Assert.False(budget.TryReserve(Start.AddMinutes(9), 350, out var refusal));
+        // Below the override threshold of 250 ms, so this is the ordinary cooldown being tested rather
+        // than the way past it.
+        Assert.True(budget.TryReserve(Start, 200, out _));
+        Assert.False(budget.TryReserve(Start.AddMinutes(9), 200, out var refusal));
         Assert.Contains("cooldown", refusal!, StringComparison.OrdinalIgnoreCase);
 
-        Assert.True(budget.TryReserve(Start.AddMinutes(11), 350, out _));
+        Assert.True(budget.TryReserve(Start.AddMinutes(11), 200, out _));
         Assert.Equal(2, budget.Spent);
     }
 
@@ -163,7 +177,7 @@ public sealed class AutoDeepCaptureBudgetTests
         }
 
         // Three and a bit minutes of unbroken 900 ms frames: one capture per override cooldown, not one
-        // per frame, and nowhere near the session ceiling of six.
+        // per frame, and nowhere near the session ceiling of twelve.
         Assert.Equal(4, budget.Spent);
     }
 
@@ -340,18 +354,24 @@ public sealed class AutoDeepCaptureBudgetTests
     }
 
     /// <summary>
-    /// The default has to be worth the disk it costs. Eight captures of a few hundred megabytes across
+    /// The default has to be worth the disk it costs. Twelve captures of a few hundred megabytes across
     /// an evening is the trade this feature was sized for.
     /// </summary>
+    /// <remarks>
+    /// Recalibrated after the session of 27 August, where one per hour refused twenty-four hitches and
+    /// the 500 ms exception missed the evening's second largest frame by 16 ms. Three an hour against
+    /// the ten minute cooldown cannot exceed three, so the cooldown still decides the volume.
+    /// </remarks>
     [Fact]
     public void TheDefaultBuysAHandfulOfCapturesNotAStream()
     {
         var options = Options();
 
         Assert.True(options.CaptureAutoIncidents);
-        Assert.Equal(8, options.MaxAutoCapturesPerSession);
+        Assert.Equal(12, options.MaxAutoCapturesPerSession);
         Assert.Equal(120, options.AutoCaptureFrameTimeMs);
-        Assert.Equal(1, options.MaxAutoCapturesPerWindow);
+        Assert.Equal(250, options.AutoCaptureOverrideFrameTimeMs);
+        Assert.Equal(3, options.MaxAutoCapturesPerWindow);
         Assert.Equal(TimeSpan.FromHours(1), options.CaptureBudgetWindow);
 
         // Scheduler stacks cost retention but locate the blocking call chain. The 768 MB default still
@@ -382,10 +402,12 @@ public sealed class AutoDeepCaptureBudgetTests
             timestamp = timestamp.AddSeconds(20);
         }
 
-        Assert.Equal(1, budget.Spent);
+        // Two rather than three: the hour's allowance is three, and the ten minute cooldown is what
+        // stops fourteen minutes of hitches from spending even that.
+        Assert.Equal(2, budget.Spent);
 
         // Five hours later the session still has almost all of its budget, which is the entire point.
-        Assert.Equal(7, budget.Remaining);
+        Assert.Equal(10, budget.Remaining);
         Assert.True(budget.TryReserve(Start.AddHours(5), frameTimeMs: 180, out _));
     }
 
@@ -398,15 +420,18 @@ public sealed class AutoDeepCaptureBudgetTests
     {
         var budget = new AutoDeepCaptureBudget(Options());
 
+        // The hour's three ordinary captures, spaced past the cooldown so the window is what fills.
         Assert.True(budget.TryReserve(Start, frameTimeMs: 122, out _));
+        Assert.True(budget.TryReserve(Start.AddMinutes(11), frameTimeMs: 130, out _));
+        Assert.True(budget.TryReserve(Start.AddMinutes(22), frameTimeMs: 140, out _));
 
         // Ordinary frames are refused for the rest of the hour, and told why.
-        Assert.False(budget.TryReserve(Start.AddMinutes(5), frameTimeMs: 200, out var refusal));
+        Assert.False(budget.TryReserve(Start.AddMinutes(33), frameTimeMs: 200, out var refusal));
         Assert.Contains("per 60 min", refusal!, StringComparison.OrdinalIgnoreCase);
 
         // The catastrophic one is not — it answers to the ring buffer and the session ceiling only.
-        Assert.True(budget.TryReserve(Start.AddMinutes(5), frameTimeMs: 586, out _));
-        Assert.Equal(2, budget.Spent);
+        Assert.True(budget.TryReserve(Start.AddMinutes(33), frameTimeMs: 586, out _));
+        Assert.Equal(4, budget.Spent);
     }
 
     /// <summary>
@@ -421,13 +446,17 @@ public sealed class AutoDeepCaptureBudgetTests
 
         Assert.True(budget.TryReserve(Start, frameTimeMs: 900, out _));
 
-        // Eleven minutes later: past the ordinary cooldown, still well inside the hour.
+        // Eleven minutes later: past the ordinary cooldown, still well inside the hour. The hour's three
+        // ordinary slots all remain, which is the claim — had the override charged one, the third of
+        // these would be refused.
         Assert.True(budget.TryReserve(Start.AddMinutes(11), frameTimeMs: 180, out var refusal));
         Assert.Null(refusal);
-        Assert.Equal(2, budget.Spent);
+        Assert.True(budget.TryReserve(Start.AddMinutes(22), frameTimeMs: 180, out _));
+        Assert.True(budget.TryReserve(Start.AddMinutes(33), frameTimeMs: 180, out _));
+        Assert.Equal(4, budget.Spent);
 
-        // And the ordinary capture did charge the window, so the next ordinary one waits.
-        Assert.False(budget.TryReserve(Start.AddMinutes(25), frameTimeMs: 180, out var second));
+        // And the ordinary captures did charge the window, so the next ordinary one waits.
+        Assert.False(budget.TryReserve(Start.AddMinutes(44), frameTimeMs: 180, out var second));
         Assert.Contains("per 60 min", second!, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -441,9 +470,14 @@ public sealed class AutoDeepCaptureBudgetTests
         var budget = new AutoDeepCaptureBudget(Options());
 
         Assert.True(budget.TryReserve(Start, frameTimeMs: 180, out _));
+        Assert.True(budget.TryReserve(Start.AddMinutes(11), frameTimeMs: 180, out _));
+        Assert.True(budget.TryReserve(Start.AddMinutes(22), frameTimeMs: 180, out _));
+
         Assert.False(budget.TryReserve(Start.AddMinutes(59), frameTimeMs: 180, out _));
+
+        // The first of the three has aged out by now, so the hour has a slot again.
         Assert.True(budget.TryReserve(Start.AddMinutes(61), frameTimeMs: 180, out _));
 
-        Assert.Equal(2, budget.Spent);
+        Assert.Equal(4, budget.Spent);
     }
 }

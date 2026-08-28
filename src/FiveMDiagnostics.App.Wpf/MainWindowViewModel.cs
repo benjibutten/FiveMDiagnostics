@@ -22,6 +22,22 @@ public sealed class MainWindowViewModel : ObservableObject
     private readonly Dispatcher _dispatcher;
     private readonly DispatcherTimer _uiRefreshTimer;
     private readonly ConcurrentQueue<DiagnosticStatusEntry> _pendingStatusEntries = new();
+
+    /// <summary>The latest warning from each source that has not been superseded by an ordinary line.</summary>
+    private readonly Dictionary<string, DiagnosticStatusEntry> _activeAlerts = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Warnings older than this belong to a session that has ended and are not shown in the banner.
+    /// </summary>
+    /// <remarks>
+    /// A timestamp rather than only clearing the dictionary, because status entries reach the view model
+    /// through a queue drained on a timer: a warning reported in the last second of a session can arrive
+    /// after the next one has started, and clearing alone would let it raise a banner about an evening
+    /// that is over. Left at <see cref="DateTimeOffset.MinValue"/> until a session starts here, so a
+    /// window reopened from the tray during a running session still shows what that session has to say.
+    /// </remarks>
+    private DateTimeOffset _alertsValidFrom = DateTimeOffset.MinValue;
+    private bool _acceptSessionAlerts;
     private readonly HashSet<Guid> _pendingIncidentIds = [];
 
     private IncidentRecord? _selectedIncident;
@@ -42,6 +58,8 @@ public sealed class MainWindowViewModel : ObservableObject
     private bool _stateRefreshPending;
     private string _selectedLanguage = string.Empty;
     private string _presentMonStatusText = string.Empty;
+    private string _sessionAlertsText = string.Empty;
+    private bool _hasSessionAlerts;
     private string _captureFeedbackText = string.Empty;
     private DateTimeOffset _lastStateRefreshUtc = DateTimeOffset.MinValue;
     private string _liveCpuText = Strings.LiveStatsIdle;
@@ -111,7 +129,10 @@ public sealed class MainWindowViewModel : ObservableObject
         foreach (var status in _sessionManager.GetStatusEntries().Reverse())
         {
             StatusEntries.Add(status);
+            TrackAlert(status);
         }
+
+        RefreshSessionAlerts();
 
         RefreshPresentMonStatus();
         CaptureFeedbackText = Strings.CaptureFeedbackHint;
@@ -176,6 +197,22 @@ public sealed class MainWindowViewModel : ObservableObject
     {
         get => _presentMonStatusText;
         private set => SetProperty(ref _presentMonStatusText, value);
+    }
+
+    /// <summary>
+    /// Conditions a collector is currently unhappy about, in the header rather than in the status list.
+    /// </summary>
+    public string SessionAlertsText
+    {
+        get => _sessionAlertsText;
+        private set => SetProperty(ref _sessionAlertsText, value);
+    }
+
+    /// <summary>False when every collector's latest word was an ordinary one, which hides the banner.</summary>
+    public bool HasSessionAlerts
+    {
+        get => _hasSessionAlerts;
+        private set => SetProperty(ref _hasSessionAlerts, value);
     }
 
     public string CaptureFeedbackText
@@ -427,7 +464,33 @@ public sealed class MainWindowViewModel : ObservableObject
     private async Task StartSessionAsync()
     {
         await Task.Yield();
-        await _sessionManager.StartSessionAsync().ConfigureAwait(false);
+
+        // Establish the new session boundary before collectors can report startup warnings. Doing this
+        // after StartSessionAsync returned discarded precisely those warnings as belonging to the old
+        // session.
+        await _dispatcher.InvokeAsync(() =>
+        {
+            _alertsValidFrom = DateTimeOffset.Now;
+            _acceptSessionAlerts = true;
+            _activeAlerts.Clear();
+            RefreshSessionAlerts();
+        });
+
+        try
+        {
+            await _sessionManager.StartSessionAsync().ConfigureAwait(false);
+        }
+        catch
+        {
+            await _dispatcher.InvokeAsync(() =>
+            {
+                _acceptSessionAlerts = false;
+                _activeAlerts.Clear();
+                RefreshSessionAlerts();
+            });
+            throw;
+        }
+
         await _dispatcher.InvokeAsync(RefreshState, DispatcherPriority.Background);
         CaptureFeedbackText = Strings.CaptureFeedbackSessionStarted;
     }
@@ -435,7 +498,13 @@ public sealed class MainWindowViewModel : ObservableObject
     private async Task StopSessionAsync()
     {
         await _sessionManager.StopSessionAsync().ConfigureAwait(false);
-        await _dispatcher.InvokeAsync(RefreshState, DispatcherPriority.Background);
+        await _dispatcher.InvokeAsync(() =>
+        {
+            // Stop messages remain in the status history, but queued warnings must not be able to
+            // resurrect a banner after the session boundary has closed.
+            _acceptSessionAlerts = false;
+            RefreshState();
+        }, DispatcherPriority.Background);
         _pendingIncidentIds.Clear();
         IsReadyForIncident = false;
         CaptureFeedbackText = Strings.CaptureFeedbackHint;
@@ -694,7 +763,20 @@ public sealed class MainWindowViewModel : ObservableObject
 
     private void RefreshState()
     {
+        var wasActive = IsSessionActive;
         IsSessionActive = _sessionManager.IsSessionActive;
+
+        // The banner describes the session that is running. A collector unhappy last evening has not
+        // said anything about this one yet, and the same reasoning as ResetPacing below applies: the
+        // session manager builds everything fresh on start while the view model keeps what it was last
+        // told.
+        if (!IsSessionActive && wasActive)
+        {
+            _acceptSessionAlerts = false;
+            _activeAlerts.Clear();
+            RefreshSessionAlerts();
+        }
+
         ActiveProcessText = _sessionManager.ActiveProcess is { } process
             ? $"{process.ProcessName} (PID {process.ProcessId})"
             : Strings.WaitingForProcess;
@@ -758,9 +840,11 @@ public sealed class MainWindowViewModel : ObservableObject
     private void FlushPendingStatusEntries()
     {
         var processed = 0;
+        var alertsChanged = false;
         while (processed < MaxStatusEntriesPerFlush && _pendingStatusEntries.TryDequeue(out var status))
         {
             StatusEntries.Insert(0, status);
+            alertsChanged |= TrackAlert(status);
             processed++;
         }
 
@@ -768,6 +852,56 @@ public sealed class MainWindowViewModel : ObservableObject
         {
             StatusEntries.RemoveAt(StatusEntries.Count - 1);
         }
+
+        if (alertsChanged)
+        {
+            RefreshSessionAlerts();
+        }
+    }
+
+    /// <summary>
+    /// Keeps the most recent line from each source, so a collector that is unhappy stays visible until
+    /// it says otherwise.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The status list already held everything this reads, and holding it was not enough. A session ran
+    /// 5 h 47 min with the OBS WebSocket down; the warning was written, scrolled past, and the missing
+    /// measurement was discovered the next day from the incident reports. A condition that can be fixed
+    /// in two clicks while the session runs has to be somewhere the user is not required to scroll.
+    /// </para>
+    /// <para>
+    /// Keyed by source and newest-wins, rather than a list that accumulates. A collector's latest line
+    /// is its current state: a warning raises the banner, and the next ordinary line from the same
+    /// collector — the OBS one that says the socket connected — takes it down again. Anything else needs
+    /// a vocabulary for clearing warnings that every collector would have to learn.
+    /// </para>
+    /// </remarks>
+    private bool TrackAlert(DiagnosticStatusEntry status)
+    {
+        if (!_acceptSessionAlerts || status.Timestamp < _alertsValidFrom)
+        {
+            return false;
+        }
+
+        if (status.Level is StatusLevel.Warning or StatusLevel.Error)
+        {
+            _activeAlerts[status.Source] = status;
+            return true;
+        }
+
+        return _activeAlerts.Remove(status.Source);
+    }
+
+    private void RefreshSessionAlerts()
+    {
+        var alerts = _activeAlerts.Values
+            .OrderByDescending(item => item.Timestamp)
+            .Select(item => $"{item.Source}: {item.Message}")
+            .ToArray();
+
+        SessionAlertsText = string.Join(Environment.NewLine + Environment.NewLine, alerts);
+        HasSessionAlerts = alerts.Length > 0;
     }
 
     private void RefreshPresentMonStatus()

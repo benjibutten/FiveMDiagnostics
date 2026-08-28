@@ -33,6 +33,14 @@ namespace FiveMDiagnostics.Core;
 /// of them are worth the disk.
 /// </para>
 /// <para>
+/// Both thresholds follow the session's own frames upwards. A constant threshold is right for the
+/// sessions it was calibrated against and goes wrong as soon as they change, which has now happened
+/// twice: 300 ms was lowered to 120 after an evening improved past it, and 500 ms to 250 after the next
+/// one did — each time discovered by counting frames by hand a session later. See
+/// <see cref="Observe"/>; the constants remain the floor, so the adaptation can only ever make the
+/// gates stricter on an evening that is producing large frames routinely.
+/// </para>
+/// <para>
 /// Reservations all come from the telemetry pump, which is single-reader, so the counters need no
 /// synchronisation. <see cref="Remaining"/> is also read from the UI thread, where a stale value is
 /// harmless — it is a status line, not a decision.
@@ -40,10 +48,44 @@ namespace FiveMDiagnostics.Core;
 /// </remarks>
 public sealed class AutoDeepCaptureBudget
 {
+    /// <summary>
+    /// Hours of session the adaptive thresholds are allowed to scale their sample count by.
+    /// </summary>
+    /// <remarks>
+    /// The retained sample is <c>rate × hours</c> frames, so an unbounded session would grow it without
+    /// limit — and a threshold derived from the twelfth hour of material is describing an evening nobody
+    /// is having any more. Twelve hours is longer than any session measured and bounds the list at a few
+    /// hundred doubles.
+    /// </remarks>
+    private const double MaxAdaptiveHours = 12;
+
+    /// <summary>
+    /// Frames the sample has to reach before it is allowed to move a threshold.
+    /// </summary>
+    /// <remarks>
+    /// At rank one the "level" is the single largest frame of the session, which is not an estimate of
+    /// anything — it is one event, and taking it as the bar means only a new session record may break
+    /// the cooldown. Replayed against the evening of 27 August that alone refused the 284 ms frame seven
+    /// minutes after the 484 ms one, for no better reason than that a 528 ms frame had happened earlier.
+    /// Three is the fewest frames that can describe a level rather than an incident, and until the
+    /// session has produced them the configured constant stands.
+    /// </remarks>
+    private const int MinimumAdaptiveRank = 3;
+
     private readonly DeepCaptureOptions _options;
     private readonly List<DateTimeOffset> _spentAt = [];
+
+    /// <summary>
+    /// The largest frame times of the session so far, descending. Bounded by
+    /// <see cref="AdaptiveSampleCapacity"/>, which is what the two rates need at the longest session
+    /// they are allowed to scale over.
+    /// </summary>
+    private readonly List<double> _largestFrames = [];
+
     private int _spent;
     private DateTimeOffset? _lastCaptureAt;
+    private DateTimeOffset? _firstFrameAt;
+    private DateTimeOffset? _lastFrameAt;
 
     public AutoDeepCaptureBudget(DeepCaptureOptions options)
     {
@@ -57,6 +99,91 @@ public sealed class AutoDeepCaptureBudget
     public int Remaining => Math.Max(0, _options.MaxAutoCapturesPerSession - _spent);
 
     /// <summary>
+    /// Frame time a hitch has to reach right now, which is the configured threshold until the session
+    /// produces enough large frames to raise it.
+    /// </summary>
+    public double EffectiveFrameTimeMs => Adapt(_options.AutoCaptureFrameTimeMs, _options.AdaptiveThresholdFramesPerHour);
+
+    /// <summary>Frame time that breaks the cooldown right now, adapted the same way.</summary>
+    /// <remarks>
+    /// <para>
+    /// Kept a fixed distance clear of <see cref="EffectiveFrameTimeMs"/>, and that floor is not a
+    /// refinement — without it the two thresholds can meet, and when they meet the exception swallows
+    /// the rule. Every frame that clears the ordinary threshold would then also clear the override, so
+    /// every capture-worthy frame would bypass both the cooldown and the hourly budget and the session
+    /// ceiling would be the only gate left. It is reachable: the two thresholds adapt at different rates
+    /// and therefore warm up at different times, so twenty minutes into a session with four frames over
+    /// 250 ms the ordinary threshold has moved to the fourth largest of them while the override is still
+    /// sitting on its constant. Setting <see cref="DeepCaptureOptions.AdaptiveOverrideFramesPerHour"/>
+    /// to zero produces the same collapse by pinning the override while the ordinary threshold climbs
+    /// past it.
+    /// </para>
+    /// <para>
+    /// The distance is the one that was configured — 130 ms at the defaults — because that is what the
+    /// two settings say an override is: a frame this much beyond an ordinary capture-worthy one. A
+    /// margin of zero is the disabled case, and <see cref="OverridesCooldownFor"/> refuses it there
+    /// rather than firing on everything.
+    /// </para>
+    /// </remarks>
+    public double EffectiveOverrideFrameTimeMs => Math.Max(
+        EffectiveFrameTimeMs + ConfiguredOverrideMarginMs,
+        Adapt(_options.AutoCaptureOverrideFrameTimeMs, _options.AdaptiveOverrideFramesPerHour));
+
+    /// <summary>
+    /// How far above the ordinary threshold the configuration puts the exception. Zero when the override
+    /// is configured off, which <see cref="DeepCaptureOptions.Normalize"/> produces from any value below
+    /// the ordinary one.
+    /// </summary>
+    private double ConfiguredOverrideMarginMs =>
+        Math.Max(0, _options.AutoCaptureOverrideFrameTimeMs - _options.AutoCaptureFrameTimeMs);
+
+    /// <summary>
+    /// Feeds one presented frame into the distribution the thresholds are derived from.
+    /// </summary>
+    /// <remarks>
+    /// Called for every frame, so the common path has to be free: a frame smaller than the smallest
+    /// retained one is compared once and dropped. The list only reaches its capacity on a session that
+    /// has genuinely produced that many large frames, and after that an insert is a memmove over a few
+    /// hundred doubles for a frame that arrives a handful of times an hour.
+    /// </remarks>
+    public void Observe(DateTimeOffset timestamp, double frameTimeMs)
+    {
+        if (double.IsNaN(frameTimeMs) || frameTimeMs <= 0)
+        {
+            return;
+        }
+
+        _firstFrameAt ??= timestamp;
+
+        // Frame timestamps are derived from PresentMon's trace anchor and can step backwards slightly
+        // when it converges, so the session's length is the furthest point reached rather than the last
+        // one seen — otherwise a re-anchored batch would shorten the session and lower both thresholds.
+        if (_lastFrameAt is not { } last || timestamp > last)
+        {
+            _lastFrameAt = timestamp;
+        }
+
+        var capacity = AdaptiveSampleCapacity;
+        if (capacity == 0)
+        {
+            return;
+        }
+
+        if (_largestFrames.Count == capacity && frameTimeMs <= _largestFrames[^1])
+        {
+            return;
+        }
+
+        var index = _largestFrames.BinarySearch(frameTimeMs, DescendingComparer.Instance);
+        _largestFrames.Insert(index < 0 ? ~index : index, frameTimeMs);
+
+        if (_largestFrames.Count > capacity)
+        {
+            _largestFrames.RemoveAt(_largestFrames.Count - 1);
+        }
+    }
+
+    /// <summary>
     /// Reserves a capture for a single catastrophic frame, returning false when any gate refuses.
     /// </summary>
     /// <remarks>
@@ -65,7 +192,7 @@ public sealed class AutoDeepCaptureBudget
     /// </remarks>
     public bool TryReserve(DateTimeOffset timestamp, double frameTimeMs, out string? refusal)
     {
-        if (frameTimeMs < _options.AutoCaptureFrameTimeMs)
+        if (frameTimeMs < EffectiveFrameTimeMs)
         {
             // Not a refusal worth reporting: the overwhelming majority of incidents land here, and
             // saying so every time would bury the two cases the user does need to know about.
@@ -76,8 +203,23 @@ public sealed class AutoDeepCaptureBudget
         return TryReserveCore(
             timestamp,
             $"en {frameTimeMs:F0} ms hitch",
-            mayOverrideCooldown: _options.OverridesCooldownFor(frameTimeMs),
+            mayOverrideCooldown: OverridesCooldownFor(frameTimeMs),
             out refusal);
+    }
+
+    /// <summary>
+    /// Whether a frame is catastrophic enough for this session to spend budget the cooldown would have
+    /// withheld, measured against the session's own material rather than the constant alone.
+    /// </summary>
+    /// <remarks>
+    /// The disabling case is <see cref="DeepCaptureOptions.OverridesCooldownFor"/>'s: an override
+    /// threshold set at or below the ordinary one means the exception is off, and no amount of
+    /// adaptation may turn it back on.
+    /// </remarks>
+    private bool OverridesCooldownFor(double frameTimeMs)
+    {
+        return _options.AutoCaptureOverrideFrameTimeMs > _options.AutoCaptureFrameTimeMs
+            && frameTimeMs >= EffectiveOverrideFrameTimeMs;
     }
 
     /// <summary>
@@ -98,6 +240,20 @@ public sealed class AutoDeepCaptureBudget
         return TryReserveCore(
             timestamp,
             "en period där bildfrekvensen inte återhämtade sig",
+            mayOverrideCooldown: false,
+            out refusal);
+    }
+
+    /// <summary>
+    /// Reserves for a consecutive run of frames that never reached the display. Its individual frame
+    /// times are normal by definition, so only the kind-aware caller can make it eligible; the ordinary
+    /// cooldown and both budgets still apply.
+    /// </summary>
+    public bool TryReserveForDroppedFrameRun(DateTimeOffset timestamp, out string? refusal)
+    {
+        return TryReserveCore(
+            timestamp,
+            "en sammanhängande följd av tappade frames",
             mayOverrideCooldown: false,
             out refusal);
     }
@@ -136,7 +292,7 @@ public sealed class AutoDeepCaptureBudget
             refusal = $"Deep capture hoppades över för {description}: {perWindow} "
                 + $"capture(s) per {window.TotalMinutes:F0} min är redan tagna, nästa plats öppnar om "
                 + $"{Math.Max(0, (freesAt - timestamp).TotalMinutes):F0} min. En frame över "
-                + $"{_options.AutoCaptureOverrideFrameTimeMs:F0} ms hade gått förbi den här gränsen.";
+                + $"{EffectiveOverrideFrameTimeMs:F0} ms hade gått förbi den här gränsen.";
             return false;
         }
 
@@ -176,6 +332,50 @@ public sealed class AutoDeepCaptureBudget
     }
 
     /// <summary>
+    /// Raises a configured threshold to where the session's own frames say it belongs, never below it.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="framesPerHour"/> frames an hour is a count, and a count over a session of known
+    /// length picks a frame out of the sorted sample: at three an hour after two hours, the sixth
+    /// largest frame is the level three an hour have reached. Below that many frames the session has not
+    /// produced the material to raise anything, and the configured constant stands — which is the whole
+    /// of the behaviour on an evening that is going well.
+    /// </remarks>
+    private double Adapt(double configuredMs, double framesPerHour)
+    {
+        if (framesPerHour <= 0 || _firstFrameAt is not { } first || _lastFrameAt is not { } last)
+        {
+            return configuredMs;
+        }
+
+        var hours = Math.Clamp((last - first).TotalHours, 0, MaxAdaptiveHours);
+        var rank = (int)Math.Floor(framesPerHour * hours);
+        if (rank < MinimumAdaptiveRank || _largestFrames.Count < rank)
+        {
+            return configuredMs;
+        }
+
+        return Math.Max(configuredMs, _largestFrames[rank - 1]);
+    }
+
+    /// <summary>
+    /// Largest frames worth retaining: what the faster of the two rates asks for over the longest
+    /// session it may scale across.
+    /// </summary>
+    /// <remarks>
+    /// Bounded again at 4 096 so a hand-edited rate cannot turn a per-frame path into an allocation. A
+    /// rate that large has left the behaviour this models long before the bound is reached.
+    /// </remarks>
+    private int AdaptiveSampleCapacity
+    {
+        get
+        {
+            var rate = Math.Max(_options.AdaptiveThresholdFramesPerHour, _options.AdaptiveOverrideFramesPerHour);
+            return rate <= 0 ? 0 : (int)Math.Min(4096, Math.Ceiling(rate * MaxAdaptiveHours));
+        }
+    }
+
+    /// <summary>
     /// Captures spent inside the trailing <paramref name="window"/> ending at <paramref name="now"/>.
     /// </summary>
     /// <remarks>
@@ -193,5 +393,13 @@ public sealed class AutoDeepCaptureBudget
         }
 
         return count;
+    }
+
+    /// <summary>Keeps <see cref="_largestFrames"/> sorted largest first, so rank <c>n</c> is index <c>n-1</c>.</summary>
+    private sealed class DescendingComparer : IComparer<double>
+    {
+        public static readonly DescendingComparer Instance = new();
+
+        public int Compare(double x, double y) => y.CompareTo(x);
     }
 }

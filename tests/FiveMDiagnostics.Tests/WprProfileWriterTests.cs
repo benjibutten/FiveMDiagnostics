@@ -70,6 +70,33 @@ public sealed class WprProfileWriterTests : IDisposable
         Assert.False(options.MigrateCaptureProfile());
     }
 
+    [Fact]
+    public void ManualEightCaptureBudgetFromBeforeRevisionTwoIsPreserved()
+    {
+        var options = new DeepCaptureOptions
+        {
+            CaptureProfileRevision = 1,
+            MaxAutoCapturesPerSession = 8,
+        };
+
+        Assert.True(options.MigrateCaptureProfile());
+        Assert.Equal(8, options.MaxAutoCapturesPerSession);
+        Assert.Equal(DeepCaptureOptions.CurrentCaptureProfileRevision, options.CaptureProfileRevision);
+    }
+
+    [Fact]
+    public void RevisionTwoDefaultEightCaptureBudgetIsUpgraded()
+    {
+        var options = new DeepCaptureOptions
+        {
+            CaptureProfileRevision = 2,
+            MaxAutoCapturesPerSession = 8,
+        };
+
+        Assert.True(options.MigrateCaptureProfile());
+        Assert.Equal(12, options.MaxAutoCapturesPerSession);
+    }
+
     /// <summary>
     /// File stacks are the measured 9% surcharge nothing in the app reads yet, so they must stay off
     /// until someone asks for them.

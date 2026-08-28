@@ -35,7 +35,37 @@ public sealed class VramAccountingMonitor
     /// </remarks>
     public const long ImplausibleOvershootBytes = 512L * 1024 * 1024;
 
+    /// <summary>
+    /// How close in time the two readings have to be for the comparison to be about the accounting
+    /// rather than about two clocks.
+    /// </summary>
+    /// <remarks>
+    /// Generous against a five second process interval and a sub-second adapter poll. A stale adapter
+    /// reading simply produces no comparison, which is the correct outcome when one cannot be made.
+    /// </remarks>
+    private static readonly TimeSpan AdapterFreshness = TimeSpan.FromSeconds(10);
+
     private readonly TimeSpan _interval;
+
+    /// <summary>
+    /// Processes proved to double count, kept for the session rather than re-decided per sample.
+    /// </summary>
+    /// <remarks>
+    /// The proof is one-sided and does not expire. A row above the adapter's own figure is impossible
+    /// once and stays impossible: the counter is adding memory that belongs to somebody else, and it
+    /// does not stop doing that because the card filled up enough to hide it. Deciding per sample would
+    /// have excluded <c>dwm</c> from the first incident of the session that prompted this and named it
+    /// largest holder in the other 153, since its flat 6.1 GB only exceeded the card's own figure while
+    /// the game was still filling its texture memory.
+    /// </remarks>
+    /// <remarks>
+    /// Keyed by process id and held against the name it had, because Windows reuses process ids. A row
+    /// proved impossible is a statement about a program's counter, not about a number, and letting the
+    /// verdict follow a recycled id would quietly exclude an unrelated process from every report for the
+    /// rest of the evening. A reused id arriving under a different name drops the entry; the same name
+    /// keeps it, which is the case that matters — the compositor restarting is still the compositor.
+    /// </remarks>
+    private readonly Dictionary<int, string> _doubleCounted = [];
 
     private GpuTelemetrySample? _lastAdapter;
     private DateTimeOffset? _lastReportAt;
@@ -60,6 +90,77 @@ public sealed class VramAccountingMonitor
     }
 
     /// <summary>
+    /// Marks the rows in a sample that cannot be believed, and names the ones proved this time.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The reconciliation below already measures the only thing that can settle this: a process table
+    /// whose sum exceeds what the card reports as used is counting something twice. The same comparison
+    /// applied one row at a time names <em>which</em> row, because a single process cannot hold more
+    /// memory than the whole card is using. That is not a refinement of the absolute 64 GB bound — it is
+    /// the case the absolute bound was always missing. <c>dwm</c> at 6.1 GB on a 10 GB card passed the
+    /// bound comfortably and was reported as the largest VRAM holder in all 154 incidents of one
+    /// session, which hid the process that was actually growing; the arithmetic that exposed it —
+    /// FiveM 5.9 GB plus dwm 6.1 GB on a card reporting 7.8 GB used — is exactly this comparison, done
+    /// by hand a session later.
+    /// </para>
+    /// <para>
+    /// It is expected of <c>dwm</c> specifically, and understood: in <c>Composed: Copy with GPU GDI</c>
+    /// the compositor holds a reference to every frame it composes and the counter does not distinguish
+    /// a shared allocation from an owned one. The rule is written against the arithmetic rather than
+    /// against the name, because the next compositor-shaped process will not be called dwm.
+    /// </para>
+    /// <para>
+    /// Silent on a machine with more than one GPU, for the same reason the reconciliation is: the two
+    /// figures may then describe different cards, and a difference between two cards is a fact about the
+    /// hardware rather than an accusation against a process.
+    /// </para>
+    /// </remarks>
+    public GpuProcessMemorySample Annotate(GpuProcessMemorySample sample, out IReadOnlyList<GpuProcessMemoryUsage> newlyProven)
+    {
+        newlyProven = [];
+
+        if (!sample.IsAvailable || sample.Processes.Count == 0)
+        {
+            return sample;
+        }
+
+        if (_lastAdapter is { UsedVramBytes: { } adapterBytes, IsSingleAdapterMachine: true } adapter
+            && (sample.Timestamp - adapter.Timestamp).Duration() <= AdapterFreshness)
+        {
+            var ceiling = adapterBytes + ImplausibleOvershootBytes;
+            List<GpuProcessMemoryUsage>? proven = null;
+
+            foreach (var process in sample.Processes)
+            {
+                if (_doubleCounted.TryGetValue(process.ProcessId, out var provenName)
+                    && !string.Equals(provenName, process.ProcessName, StringComparison.OrdinalIgnoreCase))
+                {
+                    // The id has been recycled to a different program, which inherits nothing.
+                    _doubleCounted.Remove(process.ProcessId);
+                }
+
+                if (process.DedicatedBytes <= ceiling || _doubleCounted.ContainsKey(process.ProcessId))
+                {
+                    continue;
+                }
+
+                _doubleCounted[process.ProcessId] = process.ProcessName;
+                (proven ??= []).Add(process);
+            }
+
+            if (proven is not null)
+            {
+                newlyProven = proven;
+            }
+        }
+
+        return _doubleCounted.Count == 0
+            ? sample
+            : sample with { DoubleCountedProcessIds = _doubleCounted.Keys.ToArray() };
+    }
+
+    /// <summary>
     /// Compares a process table against the last adapter reading, returning a line to log when one is
     /// due, and null otherwise.
     /// </summary>
@@ -81,7 +182,7 @@ public sealed class VramAccountingMonitor
             return null;
         }
 
-        if ((sample.Timestamp - adapter.Timestamp).Duration() > TimeSpan.FromSeconds(10))
+        if ((sample.Timestamp - adapter.Timestamp).Duration() > AdapterFreshness)
         {
             return null;
         }
@@ -113,6 +214,20 @@ public sealed class VramAccountingMonitor
             message +=
                 " Summan överstiger kortets egen siffra med mer än en halv gigabyte, vilket inte är möjligt: "
                 + "minst en processrad dubbelräknar. Jämför raderna mot föregående session innan tabellen används.";
+        }
+
+        // Named every time rather than once, because this line is also what explains why the reported
+        // sum stays above the adapter's figure after the row has been excluded from the reports.
+        if (_doubleCounted.Count > 0)
+        {
+            var names = sample.Processes
+                .Where(process => _doubleCounted.ContainsKey(process.ProcessId))
+                .Select(process => $"{process.ProcessName} ({process.DedicatedGigabytes:F1} GB)")
+                .DefaultIfEmpty($"{_doubleCounted.Count} process(er)")
+                .Distinct(StringComparer.OrdinalIgnoreCase);
+
+            message +=
+                $" Utesluten ur rapporternas topplistor som bevisat dubbelräknande: {string.Join(", ", names)}.";
         }
         else if (!sameAdapter)
         {

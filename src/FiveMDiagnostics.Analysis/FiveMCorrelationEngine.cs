@@ -48,6 +48,31 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
     /// </summary>
     private const double ContradictedConfidenceCeiling = 0.3;
 
+    /// <summary>
+    /// Ceiling for a script verdict whose only positive evidence is the per-frame CPU/GPU breakdown.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>MsCPUBusy</c> is derived from the gap between presents, so it reports a thread blocked on a
+    /// lock exactly as it reports a thread running script. That is not a weakness the figure has in
+    /// unusual windows — it is what the figure is, and it means the breakdown can say the time did not
+    /// go to the GPU or to the present path without being able to say that the game's own code ran.
+    /// Nothing else in the ordinary telemetry closes that gap: the per-core counters sample once a
+    /// second and a pinned core is FiveM's main thread on any evening at all, and the process CPU figure
+    /// is an average over the same second. Only a trace or a profiler measures execution.
+    /// </para>
+    /// <para>
+    /// The session of 27 August is the whole argument. All 67 of its frames over 100 ms reported
+    /// <c>MsCPUBusy</c> at 70% or more of frame time and 151 of its 154 incidents were ranked as script
+    /// spikes on the strength of it, at 80% confidence — while the one freeze that had a trace shows the
+    /// main thread off the processor for 178.0 of its 178 ms. Set below the 0.35 bar deliberately, and
+    /// for the same reason the storage verdict resting on throughput is: a conclusion drawn without the
+    /// instrument that could refute it is a lead worth checking, not the answer that ends the
+    /// investigation.
+    /// </para>
+    /// </remarks>
+    private const double UncorroboratedAttributionCeiling = 0.34;
+
     public IncidentAnalysis Analyze(IncidentRecord incident)
     {
         var frameSamples = incident.GetEvents<FrameTelemetrySample>();
@@ -626,12 +651,32 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         var evidence = new List<string>();
         double confidence = 0;
 
-        var profilerEvidence = artifacts.Where(item => item.Kind is ArtifactKind.ProfilerJson or ArtifactKind.ResmonSnapshot).ToArray();
+        // Only a parsed profiler resource with measured time is positive resource evidence. A generic
+        // profiler import and a Resmon text export are useful attachments, but neither proves that a
+        // FiveM resource executed during this window.
+        var profilerEvidence = artifacts
+            .Where(item => item.Kind == ArtifactKind.ProfilerJson
+                && item.Metrics.GetValueOrDefault("topResourceMs") > 0)
+            .ToArray();
         if (profilerEvidence.Length > 0)
         {
             confidence += 0.45;
             evidence.AddRange(profilerEvidence.Select(item => item.Summary));
         }
+
+        // The two instruments that measure execution rather than infer it. A profiler names the resource
+        // that ran; a trace holds the samples that say which thread was on a processor and which was
+        // waiting. Everything else in this method is a second-resolution average or the frame breakdown
+        // itself, and neither can tell a running thread from a blocked one inside a single frame.
+        //
+        // Being an ETL is not the same as having measured anything. A trace can carry DPC latency and
+        // nothing else — sampled profiles refused by another ETW session, a stream that died in the
+        // first seconds, a profile that never asked for them — and a file with no CPU samples of the
+        // game says exactly as much about whether its threads ran as no file at all. So the lift needs
+        // the samples themselves and an attribution of them to the game's own process, which are the
+        // two figures the parser writes when it has them.
+        var measuredExecution = profilerEvidence.Length > 0
+            || artifacts.Any(MeasuredGameExecution);
 
         if (metrics.HasCpuGpuBreakdown && metrics.CpuBoundSpikes > 0)
         {
@@ -698,6 +743,26 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                     + $"{correlatedThreadWait.OverlappingSlowFrameMs:F0} av fönstrets {metrics.CpuBoundSpikeMs:F0} "
                     + $"CPU-bundna spike-ms, så konfidensen är takad till {ContradictedConfidenceCeiling:P0}. "
                     + "En blockerad tråd utför inget skriptarbete, och resterande indicier skiljer inte de två fallen åt.");
+            }
+            else if (!measuredExecution)
+            {
+                // Not a contradiction — nothing here says the thread was asleep. It says nothing said it
+                // was awake either, and a verdict about the game executing script needs a measurement of
+                // the game executing.
+                ceiling = Math.Min(ceiling, UncorroboratedAttributionCeiling);
+
+                // The frame breakdown is named only when the window actually has one. Without it the
+                // hypothesis rests on signals that are weaker still, and the cap is the same.
+                var attributionNote = metrics.HasCpuGpuBreakdown && metrics.CpuBoundSpikes > 0
+                    ? "PresentMon härleder MsCPUBusy ur mellanrummet mellan presents och rapporterar en blockerad "
+                        + "tråd likadant som en som kör skript, och "
+                    : string.Empty;
+
+                evidence.Add(
+                    $"OBEKRÄFTAD: ingen mätning av faktisk exekvering täcker fönstret, så konfidensen är takad till "
+                    + $"{UncorroboratedAttributionCeiling:P0}. {attributionNote}per-kärna-räknarna och processens "
+                    + "CPU-andel samplas en gång i sekunden och kan inte skilja de två fallen åt i en enskild frame. "
+                    + "En deep capture eller en profiler över fönstret avgör frågan.");
             }
 
             hypotheses.Add(new HypothesisScore(RootCauseCategory.FiveMResourceSpike, Math.Min(confidence, ceiling), evidence));
@@ -1325,12 +1390,40 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
     }
 
     /// <summary>
+    /// Whether a trace actually sampled the game running, rather than merely covering the window.
+    /// </summary>
+    /// <remarks>
+    /// <c>cpuSampleCount</c> is what the parser counts of the sampled-profile stream; <c>
+    /// cpuSubjectIsGame</c> records that the selected process really was FiveM/GTA rather than the
+    /// parser's hottest-process fallback. Positive game cores are the weakest claim that is still worth
+    /// something: the trace looked at processors while the window was open and saw the game on them. A trace missing either is kept as
+    /// evidence for everything else it holds — DPC and ISR durations, disk and hard faults, the wait
+    /// chain — and simply does not lift the ceiling on a claim about script work.
+    /// </remarks>
+    private static bool MeasuredGameExecution(ArtifactEvidence artifact)
+    {
+        return artifact.Kind == ArtifactKind.EtlTrace
+            && artifact.Metrics.GetValueOrDefault("cpuSampleCount") > 0
+            && artifact.Metrics.GetValueOrDefault("cpuSubjectIsGame") > 0
+            && artifact.Metrics.GetValueOrDefault("cpuSubjectProcessCores") > 0;
+    }
+
+    /// <summary>
     /// Says what the network probes actually did, rather than that they existed.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// "Nätprober fanns tillgängliga" was true of a window in which every single probe failed, which is
     /// close to the opposite of what a reader takes from it — probes that all fail are either a blocked
     /// ICMP path or a network that was down, and both are findings rather than background.
+    /// </para>
+    /// <para>
+    /// The advice that used to follow — point <c>ServerProfile.ProbeHost</c> at a host that answers, or
+    /// turn the probes off — is the collector's line now and not this one. It is a fact about the
+    /// session and it belongs in the session log once, which is where the collector writes it when it
+    /// gives up on a host. Under every incident it spent three sentences of each report explaining that
+    /// a measurement was missing, which is as useful the hundredth time as it was the first.
+    /// </para>
     /// </remarks>
     private static string BuildProbeHint(IReadOnlyList<NetworkProbeSample> probes)
     {
@@ -1352,10 +1445,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                 .Select(item => item.FailureReason)
                 .FirstOrDefault(item => !string.IsNullOrWhiteSpace(item)) ?? "okänt fel";
 
-            return $" Samtliga {probes.Count} nätprober misslyckades ({reason}), så det finns ingen RTT-mätning "
-                + "för fönstret — varken som stöd för eller emot en nätverksorsak. Prob-hosten härleds från "
-                + "anslutningen och många spelservrar svarar inte på ICMP alls; sätt ServerProfile.ProbeHost "
-                + "till en adress som svarar, eller stäng av proberna.";
+            return $" Samtliga {probes.Count} nätprober misslyckades ({reason}); ingen RTT-mätning för fönstret.";
         }
 
         var succeededRtt = probes.Where(item => item.Success).Select(item => item.RoundTripTimeMs ?? 0).DefaultIfEmpty().Max();

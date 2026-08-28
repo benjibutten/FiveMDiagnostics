@@ -160,4 +160,5 @@
   <data name="LiveVramUnavailable" xml:space="preserve"><value>saknas</value></data>
   <data name="LiveVramOwnersLabel" xml:space="preserve"><value>Störst i VRAM:</value></data>
   <data name="LiveVramOwnersUnavailable" xml:space="preserve"><value>mäts inte</value></data>
+  <data name="SessionAlertsHeader" xml:space="preserve"><value>Behöver åtgärdas</value></data>
 </root>

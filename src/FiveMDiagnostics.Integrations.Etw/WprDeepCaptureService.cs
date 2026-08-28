@@ -660,6 +660,7 @@ public sealed class EtlArtifactParser : IArtifactParser
             if (attribution is not null)
             {
                 metrics["cpuTotalCores"] = Math.Round(attribution.TotalCores, 3);
+                metrics["cpuSubjectIsGame"] = attribution.SubjectIsGame ? 1 : 0;
                 metrics["cpuSubjectProcessCores"] = Math.Round(attribution.SubjectProcessCores, 3);
                 metrics["cpuBusiestThreadCores"] = Math.Round(attribution.BusiestThreadCores, 3);
                 metrics["cpuBusiestThreadId"] = attribution.BusiestThreadId;

@@ -160,4 +160,5 @@
   <data name="LiveVramUnavailable" xml:space="preserve"><value>n/a</value></data>
   <data name="LiveVramOwnersLabel" xml:space="preserve"><value>Largest in VRAM:</value></data>
   <data name="LiveVramOwnersUnavailable" xml:space="preserve"><value>not measured</value></data>
+  <data name="SessionAlertsHeader" xml:space="preserve"><value>Needs attention</value></data>
 </root>

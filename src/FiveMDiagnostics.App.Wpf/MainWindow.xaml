@@ -85,6 +85,27 @@
                         <TextBlock Text="{x:Static props:Strings.LiveVramOwnersLabel}" Foreground="#EAF4FB" FontWeight="SemiBold" Margin="20,0,0,0" />
                         <TextBlock Text="{Binding LiveVramOwnersText}" Foreground="#EAF4FB" Margin="4,0,0,0" />
                     </StackPanel>
+
+                    <!-- A collector that cannot measure has to say so where the user is looking, not
+                         only in a status list that scrolls. The OBS WebSocket was down for a whole
+                         session and the missing render-lag data was discovered the next day. -->
+                    <Border Background="#4A2A1E" BorderBrush="#D96C47" BorderThickness="1" CornerRadius="12"
+                            Padding="12" Margin="0,12,0,0" MaxWidth="900" HorizontalAlignment="Left">
+                        <Border.Style>
+                            <Style TargetType="Border">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding HasSessionAlerts}" Value="True">
+                                        <Setter Property="Visibility" Value="Visible" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Border.Style>
+                        <StackPanel>
+                            <TextBlock Text="{x:Static props:Strings.SessionAlertsHeader}" Foreground="#FFD9C8" FontWeight="SemiBold" />
+                            <TextBlock Text="{Binding SessionAlertsText}" Foreground="#F4E4DC" TextWrapping="Wrap" Margin="0,6,0,0" />
+                        </StackPanel>
+                    </Border>
                 </StackPanel>
 
                 <Border Grid.Column="1" Background="#0F1A22" CornerRadius="16" Padding="16" Width="360">

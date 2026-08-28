@@ -49,6 +49,20 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private AutoDeepCaptureBudget? _autoCaptureBudget;
     private FramePacingMonitor? _framePacing;
     private VramAccountingMonitor? _vramAccounting;
+    private VramBudgetMonitor? _vramBudget;
+
+    /// <summary>
+    /// Trace evidence that arrived before the incident it belongs to had been published.
+    /// </summary>
+    /// <remarks>
+    /// A capture is triggered at the marker and finishes about thirty seconds later, while the incident
+    /// window stays open for sixty — so the ordinary case is that the trace is ready first and there is
+    /// nothing yet to attach it to. Held under <c>_sync</c> and taken in the same critical section that
+    /// publishes an incident, which is what closes the gap: either the capture finds the incident in the
+    /// list, or it leaves the evidence here and publication picks it up. There is no order of the two in
+    /// which the trace is lost.
+    /// </remarks>
+    private readonly Dictionary<Guid, List<(ArtifactEvidence Evidence, ArtifactAttachment Attachment)>> _pendingTraceEvidence = [];
     private volatile IReadOnlyList<ArtifactAttachment>? _attachmentsSnapshot;
 
     /// <summary>
@@ -195,6 +209,14 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _autoCaptureBudget = new AutoDeepCaptureBudget(_settings.DeepCapture);
             _framePacing = new FramePacingMonitor(_settings.FramePacing, Environment?.DisplayRefreshRateHz);
             _vramAccounting = new VramAccountingMonitor();
+            _vramBudget = new VramBudgetMonitor();
+
+            // A capture whose incident never published — the session was stopped while it was still
+            // being written — would otherwise wait here for a marker id the next session cannot produce.
+            lock (_sync)
+            {
+                _pendingTraceEvidence.Clear();
+            }
             _channel = Channel.CreateBounded<TelemetryEvent>(new BoundedChannelOptions(32768)
             {
                 SingleReader = true,
@@ -539,7 +561,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
         var captureThis = sustainedSaturation
             ? TryReserveSaturationCapture(timestamp)
-            : TryReserveAutoCapture(timestamp, trigger.FrameTimeMs);
+            : TryReserveAutoCapture(timestamp, trigger);
 
         CreateMarker(
             timestamp,
@@ -598,7 +620,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         // A frame this large is exactly what the budget exists for, and it is the reason the incident is
         // worth a trace at all — so the escalation gets its own shot at one rather than inheriting the
         // decision made for the smaller frame that opened the window.
-        if (TryReserveAutoCapture(timestamp, trigger.FrameTimeMs) && _settings.DeepCapture.Enabled && _sessionCts is not null)
+        if (TryReserveAutoCapture(timestamp, trigger) && _settings.DeepCapture.Enabled && _sessionCts is not null)
         {
             StartDeepCapture(escalated, _sessionCts.Token);
         }
@@ -642,16 +664,20 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             return;
         }
 
+        // The budget's own threshold rather than the configured constant: it follows the session's
+        // frames upwards, and asking a different question here than the budget will ask a line later
+        // would open windows for frames the budget then refuses to trace.
+        var captureThreshold = _autoCaptureBudget?.EffectiveFrameTimeMs ?? _settings.DeepCapture.AutoCaptureFrameTimeMs;
         var worthItsOwnIncident = trigger.Severity == IncidentSeverity.Severe
             || trigger.Kind == AutoIncidentKind.DroppedFrameRun
-            || trigger.FrameTimeMs >= _settings.DeepCapture.AutoCaptureFrameTimeMs;
+            || trigger.FrameTimeMs >= captureThreshold;
 
         if (!worthItsOwnIncident)
         {
             return;
         }
 
-        var captureThis = TryReserveAutoCapture(timestamp, trigger.FrameTimeMs);
+        var captureThis = TryReserveAutoCapture(timestamp, trigger);
         CreateMarker(timestamp, trigger.Severity, trigger.Label, allowDeepCapture: captureThis, trigger.FrameTimeMs);
     }
 
@@ -663,6 +689,24 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     {
         var budget = _autoCaptureBudget;
         return budget is not null && ReportRefusal(budget.TryReserve(timestamp, frameTimeMs, out var refusal), refusal);
+    }
+
+    /// <summary>
+    /// Reserves according to what the detector observed. A dropped-frame run is a freeze made from
+    /// ordinary frame times, so it deliberately skips the millisecond gate while sharing the same
+    /// cooldown and session/window budgets as every other automatic capture.
+    /// </summary>
+    private bool TryReserveAutoCapture(DateTimeOffset timestamp, AutoIncidentTrigger trigger)
+    {
+        var budget = _autoCaptureBudget;
+        if (budget is null)
+        {
+            return false;
+        }
+
+        return trigger.Kind == AutoIncidentKind.DroppedFrameRun
+            ? ReportRefusal(budget.TryReserveForDroppedFrameRun(timestamp, out var refusal), refusal)
+            : TryReserveAutoCapture(timestamp, trigger.FrameTimeMs);
     }
 
     /// <summary>As above, for a frame rate that has stopped recovering rather than one bad frame.</summary>
@@ -928,6 +972,37 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// use — a state that is impossible rather than merely surprising, and that went unnoticed for a
     /// whole session because every individual row still looked reasonable.
     /// </remarks>
+    /// <summary>
+    /// Marks process rows that have been proved to double count, naming each one the first time.
+    /// </summary>
+    /// <remarks>
+    /// The comparison needs both collectors, so it cannot live in either: the process table comes from
+    /// the Windows counter set and the card's own figure from NVML, and this pump is where they meet.
+    /// </remarks>
+    private GpuProcessMemorySample AnnotateVramAccounting(GpuProcessMemorySample sample)
+    {
+        if (_vramAccounting is not { } accounting)
+        {
+            return sample;
+        }
+
+        var annotated = accounting.Annotate(sample, out var newlyProven);
+
+        foreach (var process in newlyProven)
+        {
+            Report(
+                StatusLevel.Warning,
+                "GpuProcessMemory.Accounting",
+                $"{process.ProcessName} rapporterar {process.DedicatedGigabytes:F1} GB VRAM, vilket är mer än "
+                + "kortet självt anger som använt. En enskild process kan inte hålla mer än hela kortet, så "
+                + "raden dubbelräknar minne som tillhör någon annan — typiskt kompositorn som håller en "
+                + "referens till spelets ytor. Raden loggas men utesluts ur rapporternas topplistor för "
+                + "resten av sessionen, så att den process som faktiskt växer syns.");
+        }
+
+        return annotated;
+    }
+
     private void ReportVramAccounting(GpuProcessMemorySample sample)
     {
         if (_vramAccounting?.Observe(sample) is not { } report)
@@ -937,8 +1012,24 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
         Report(
             report.IsImplausible ? StatusLevel.Warning : StatusLevel.Info,
-            "GpuProcessMemory",
+            "GpuProcessMemory.Accounting",
             report.Message);
+    }
+
+    /// <summary>
+    /// Writes what the card's memory is committed to before the game asks for any.
+    /// </summary>
+    /// <remarks>
+    /// Info rather than Warning: it is a budget, not a fault. Written once the session has both figures
+    /// and the game has allocated something, and again when the stream stack starts or stops, which is
+    /// the only term of it that moves during an evening.
+    /// </remarks>
+    private void ReportVramBudget(GpuProcessMemorySample sample)
+    {
+        if (_vramBudget?.Observe(sample) is { } report)
+        {
+            Report(StatusLevel.Info, "GpuProcessMemory.Budget", report.Message);
+        }
     }
 
     private async Task PumpAsync(ChannelReader<TelemetryEvent> reader, CancellationToken cancellationToken)
@@ -947,6 +1038,14 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         {
             while (reader.TryRead(out var telemetryEvent))
             {
+                // Before the ring buffer, so an incident window holds the annotated table rather than
+                // the raw one: the rows that cannot be believed have to be marked in the copy the
+                // reports are built from, not only in the copy the live view shows.
+                if (telemetryEvent is GpuProcessMemorySample rawGpuProcessSample)
+                {
+                    telemetryEvent = AnnotateVramAccounting(rawGpuProcessSample);
+                }
+
                 _ringBuffer?.Add(telemetryEvent);
 
                 if (telemetryEvent is SystemTelemetrySample systemSample)
@@ -956,11 +1055,13 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 else if (telemetryEvent is GpuTelemetrySample gpuSample)
                 {
                     _vramAccounting?.Observe(gpuSample);
+                    _vramBudget?.Observe(gpuSample);
                     GpuTelemetryUpdated?.Invoke(this, gpuSample);
                 }
                 else if (telemetryEvent is GpuProcessMemorySample gpuProcessSample)
                 {
                     ReportVramAccounting(gpuProcessSample);
+                    ReportVramBudget(gpuProcessSample);
                     GpuProcessMemoryUpdated?.Invoke(this, gpuProcessSample);
                 }
                 else if (telemetryEvent is CaptureHealthTelemetrySample healthSample)
@@ -969,6 +1070,12 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 }
                 else if (telemetryEvent is FrameTelemetrySample frameSample)
                 {
+                    // Every frame, not only the ones that trigger something: the capture thresholds are
+                    // derived from the session's own distribution, and a sample taken only from frames
+                    // that already crossed a threshold would describe the threshold rather than the
+                    // evening.
+                    _autoCaptureBudget?.Observe(frameSample.Timestamp, frameSample.FrameTimeMs);
+
                     // The marker has to be raised before the materializer sees this event, so the frame
                     // that triggered the incident lands inside its own window rather than one event
                     // short of it.
@@ -1072,7 +1179,25 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
     private void PublishIncident(IncidentRecord analyzed)
     {
-        var evicted = AddIncidentWithinCap(analyzed);
+        IReadOnlyList<IncidentRecord> evicted;
+
+        // Taking the pending evidence and adding the incident have to be one critical section, or a
+        // capture finishing between them would find no incident to attach to and leave its evidence in a
+        // map nothing reads again.
+        lock (_sync)
+        {
+            if (_pendingTraceEvidence.Remove(analyzed.Marker.Id, out var pending))
+            {
+                foreach (var (evidence, attachment) in pending)
+                {
+                    analyzed = WithEvidence(analyzed, evidence, attachment);
+                }
+
+                analyzed = Analyze(analyzed);
+            }
+
+            evicted = AddIncidentWithinCap(analyzed);
+        }
 
         // Written before the history is touched by anything else: an incident evicted by the retention
         // cap, or dropped when the app closes, still leaves its summary on disk.
@@ -1115,6 +1240,24 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     }
 
     /// <summary>
+    /// Folds one piece of evidence and the file behind it into an incident that is already complete.
+    /// </summary>
+    /// <remarks>
+    /// The attachment is added only when it is new, so importing the same file twice does not grow the
+    /// export bundle by a duplicate of itself.
+    /// </remarks>
+    private static IncidentRecord WithEvidence(IncidentRecord incident, ArtifactEvidence evidence, ArtifactAttachment attachment)
+    {
+        return incident with
+        {
+            Events = incident.Events.Concat([evidence]).OrderBy(item => item.Timestamp).ToArray(),
+            Attachments = incident.Attachments.Any(item => string.Equals(item.FilePath, attachment.FilePath, StringComparison.OrdinalIgnoreCase))
+                ? incident.Attachments
+                : incident.Attachments.Concat([attachment]).ToArray(),
+        };
+    }
+
+    /// <summary>
     /// Attachments change only on import, but the telemetry pump needs them on every event. Caching the
     /// snapshot keeps that path free of a lock and an array copy per event.
     /// </summary>
@@ -1143,32 +1286,59 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// </summary>
     private void TryAttachEvidenceToLatestIncident(ArtifactEvidence evidence, ArtifactAttachment attachment)
     {
+        TryAttachEvidenceToIncident(markerId: null, evidence, attachment);
+    }
+
+    /// <param name="markerId">
+    /// The incident the evidence belongs to, or null for the most recent one. A capture the app took
+    /// itself knows exactly which marker it was started for, and by the time the ETL has been parsed
+    /// that incident need no longer be the latest — a five hundred megabyte trace takes long enough to
+    /// read that another hitch can arrive first, and attaching a trace of one freeze to a different
+    /// freeze is worse than attaching it to nothing.
+    /// </param>
+    private void TryAttachEvidenceToIncident(Guid? markerId, ArtifactEvidence evidence, ArtifactAttachment attachment)
+    {
         IncidentRecord updated;
 
         lock (_sync)
         {
-            if (_incidents.Count == 0)
+            var index = markerId is { } id
+                ? _incidents.FindLastIndex(item => item.Marker.Id == id)
+                : _incidents.Count - 1;
+
+            if (index < 0)
             {
+                // A capture whose incident has not been published yet, which is the ordinary case for a
+                // trace the app took itself. Held until publication rather than written to the telemetry
+                // channel: the window may already have been finalized, and then the channel goes
+                // nowhere.
+                if (markerId is { } pendingId)
+                {
+                    if (!_pendingTraceEvidence.TryGetValue(pendingId, out var pending))
+                    {
+                        pending = [];
+                        _pendingTraceEvidence[pendingId] = pending;
+                    }
+
+                    if (!pending.Any(item => item.Evidence.Summary == evidence.Summary
+                        && string.Equals(item.Attachment.FilePath, attachment.FilePath, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        pending.Add((evidence, attachment));
+                    }
+                }
+
                 return;
             }
 
-            var latest = _incidents[^1];
+            var latest = _incidents[index];
             if (latest.Attachments.Any(item => string.Equals(item.FilePath, attachment.FilePath, StringComparison.OrdinalIgnoreCase))
                 && latest.Events.OfType<ArtifactEvidence>().Any(item => item.Summary == evidence.Summary))
             {
                 return;
             }
 
-            latest = latest with
-            {
-                Events = latest.Events.Concat([evidence]).OrderBy(item => item.Timestamp).ToArray(),
-                Attachments = latest.Attachments.Any(item => string.Equals(item.FilePath, attachment.FilePath, StringComparison.OrdinalIgnoreCase))
-                    ? latest.Attachments
-                    : latest.Attachments.Concat([attachment]).ToArray(),
-            };
-
-            updated = latest with { Analysis = _analysisEngine.Analyze(latest) };
-            _incidents[^1] = updated;
+            updated = Analyze(WithEvidence(latest, evidence, attachment));
+            _incidents[index] = updated;
         }
 
         // The journal line written when the incident completed describes the analysis as it stood before
@@ -1197,12 +1367,76 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                     _attachments.Add(new ArtifactAttachment(result.CapturePath, ArtifactKind.EtlTrace, Path.GetFileName(result.CapturePath), DateTimeOffset.UtcNow, Sensitive: true));
                     InvalidateAttachmentsSnapshot();
                 }
+
+                await AnalyzeCapturedTraceAsync(marker, result.CapturePath!, cancellationToken).ConfigureAwait(false);
             }
         }
         catch (Exception ex)
         {
             Report(StatusLevel.Warning, nameof(DiagnosticsSessionManager), $"Deep capture misslyckades: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Reads a capture the app took itself back into the incident that triggered it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A trace nothing parses is a file, not evidence. Attaching the ETL and stopping there is what left
+    /// the rule that a trace overrules <c>MsCPUBusy</c> — the one this app has been asked for four
+    /// sessions running — with nothing to act on: the traces were taken, and every incident was still
+    /// ranked on a figure PresentMon derives from the gap between presents and which reads identically
+    /// for a thread executing and a thread asleep.
+    /// </para>
+    /// <para>
+    /// The evidence is stamped with the marker rather than with the time the parse finished, because it
+    /// describes the hitch and belongs at that point of the timeline. Both destinations are used for the
+    /// same reason importing by hand uses both: an incident whose window is still open takes it through
+    /// the channel, and one already materialized has to be updated in place or the trace would reach
+    /// nothing. Whichever runs second finds the evidence already there and stops.
+    /// </para>
+    /// </remarks>
+    private async Task AnalyzeCapturedTraceAsync(IncidentMarker marker, string capturePath, CancellationToken cancellationToken)
+    {
+        if (!_settings.DeepCapture.AnalyzeAutomaticCaptures)
+        {
+            return;
+        }
+
+        var parser = _artifactParsers.FirstOrDefault(candidate => candidate.CanParse(capturePath));
+        if (parser is null)
+        {
+            return;
+        }
+
+        ArtifactParseResult? result;
+        try
+        {
+            result = await parser.ParseAsync(capturePath, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // The session is stopping. The ETL is on disk and can still be imported by hand.
+            return;
+        }
+        catch (Exception ex)
+        {
+            Report(StatusLevel.Warning, nameof(DiagnosticsSessionManager), $"Deep capture kunde inte analyseras: {ex.Message}");
+            return;
+        }
+
+        if (result is null || result.Evidence.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var evidence in result.Evidence)
+        {
+            var stamped = new ArtifactEvidence(marker.MarkedAt, evidence.Kind, evidence.Summary, evidence.Metrics, evidence.SourceFile);
+            TryAttachEvidenceToIncident(marker.Id, stamped, result.Attachment);
+        }
+
+        Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), $"Deep capture analyserad: {result.Evidence[0].Summary}");
     }
 
     private void OnStateChanged()

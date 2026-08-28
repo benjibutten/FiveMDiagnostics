@@ -85,6 +85,17 @@ rather than whether one of them touched a slow frame. A 120 ms wait in a window 
 CPU-bound spikes explains 7% of it and discards nothing; the same rule discards the attribution when the
 waits cover most of that time. Treating any overlap as decisive would hide whatever else was in the window.
 
+**Without a trace or a profiler, the attribution is a lead rather than a verdict.** Nothing else in the
+ordinary telemetry measures execution: the per-core counters sample once a second and a pinned core is
+FiveM's main thread on any evening at all, and the process CPU figure is an average over the same second.
+So a `FiveMResourceSpike` ranking whose only positive evidence is the frame breakdown is capped at 34%,
+below the 35% bar that promotes a hypothesis past "insufficient evidence" — the same treatment the storage
+verdict resting on throughput already gets, and for the same reason. One session ranked 151 of its 154
+incidents as script spikes at 80% confidence, every one of them on a figure that reads identically for a
+thread executing and a thread asleep, and the single freeze that had a trace shows the thread asleep. The
+cap lifts as soon as something measures execution: an imported profiler snapshot, or the deep capture the
+app now reads back into the incident itself.
+
 PresentMon's `PresentMode` and `MsBetweenDisplayChange` are read alongside these and reported in the
 summary, the timeline and the exported metrics. The mode is the only column that says *how* a frame
 reached the screen — a window where every frame sat in `Composed: Copy with GPU GDI` is a machine
@@ -139,6 +150,10 @@ Every value is clamped when settings are read and written. A hand-edited file wi
 snapshotting a 90 second window; `BaselineWindowFrames` is capped because the detector allocates arrays
 of that size up front.
 
+Warnings are also surfaced in the app's header rather than only in the status list, which scrolls. The
+banner shows the latest line from each collector whose most recent word was a warning, so a collector that
+cannot measure stays visible until it says otherwise and clears itself when it recovers.
+
 `MaxIncidentsPerWindow` bounds the rate, so the top-level **MaxRetainedIncidents** (50) bounds the
 history across all sessions. Beyond that the oldest incidents are dropped from memory and from the list —
 exported bundles are unaffected.
@@ -149,7 +164,7 @@ five and a half hour session raised eighteen severe incidents and produced no tr
 one of its hitch clusters unexplained. Three gates now decide, and all three have to pass: the frame has
 to reach **DeepCapture.AutoCaptureFrameTimeMs** (120 ms), captures are spaced by
 **DeepCapture.AutoCaptureCooldown** (10 min) so a burst spends one rather than twenty, and
-**DeepCapture.MaxAutoCapturesPerSession** (8) is a hard ceiling. Set `DeepCapture.CaptureAutoIncidents`
+**DeepCapture.MaxAutoCapturesPerSession** (12) is a hard ceiling. Set `DeepCapture.CaptureAutoIncidents`
 to `false` for the old behaviour.
 
 The threshold was 300 ms, which was right for the sessions it was calibrated against and went blind the
@@ -161,7 +176,7 @@ Lowering the threshold alone would have made the opposite mistake, and the fix i
 `MaxIncidentsPerWindow` applies a level up. Against those real frames, a flat 120 ms threshold with only a
 session ceiling spends all its captures before the ninety minute mark — 43 of the 67 fell inside fourteen
 minutes of the opening hour, a cache rebuilt after a settings change with a sync backlog on top — and
-records nothing for the remaining five hours. **DeepCapture.MaxAutoCapturesPerWindow** (1) over
+records nothing for the remaining five hours. **DeepCapture.MaxAutoCapturesPerWindow** (3) over
 **DeepCapture.CaptureBudgetWindow** (1 h) rations the ordinary frames instead, which against the same
 session spreads six captures across the whole evening and picks up its largest late frame. A frame past
 the override threshold below ignores the window budget, answering to the session ceiling and the ring
@@ -169,8 +184,15 @@ buffer only — and does not spend the window's slot either, since charging it w
 frame buy silence for the rest of the hour, which is the failure the window exists to prevent arriving by
 the one path that is exempt from it.
 
+One per hour was the next thing to become the binding constraint. The session after the threshold was
+lowered refused twenty-four hitches, every one of them with "1 capture(s) per 60 min are already taken",
+and among them the evening's second largest frame at 484 ms — the only large frame of that night with
+neither an explanation nor a trace. Three an hour cannot produce more than three against the ten minute
+cooldown, so the cooldown still decides the volume and the window budget decides only that a quiet hour
+does not lose its slot to a loud one.
+
 The spacing gate has one way past it. A frame beyond **DeepCapture.AutoCaptureOverrideFrameTimeMs**
-(500 ms) spends budget the cooldown would have withheld, because the ceiling was always meant to be the
+(250 ms) spends budget the cooldown would have withheld, because the ceiling was always meant to be the
 binding constraint and a session that turned away its third and fourth largest frames while holding an
 unspent capture had those the wrong way round. What the override cannot skip is the ring buffer
 refilling: **DeepCapture.AutoCaptureOverrideCooldown** (60 s) covers the 28-32 s a capture takes to
@@ -178,6 +200,27 @@ finish writing plus the ~21 s the buffer needs to refill, so an override never r
 ring. It is raised automatically for a larger `RingBufferMegabytes`, which refills proportionally more
 slowly — at the 2 048 MB ceiling the refill alone is about 56 s. Setting the override threshold to the
 ordinary one turns the override off.
+
+**Both thresholds follow the session's own frames upwards.** A constant is right for the sessions it was
+calibrated against and wrong for the next ones, which has now happened twice: 300 ms became 120 after one
+evening improved past it, and 500 ms became 250 after the next one did, each discovered by counting frames
+by hand a session later. **DeepCapture.AdaptiveThresholdFramesPerHour** (20) and
+**DeepCapture.AdaptiveOverrideFramesPerHour** (3) say how many frames an hour may exceed each threshold
+before it moves to where the session's own material is: at three an hour after two hours, the sixth
+largest frame of the session is the level three an hour have reached. The adaptation only ever *raises* —
+the configured values are the floor, so an evening that is going well keeps them exactly — and it does
+nothing until the session has produced at least three frames above the level, since the largest single
+frame of a session is one event rather than an estimate of anything. Set either rate to `0` to pin the
+constant.
+
+**An automatic capture's ETL is read back into the incident that triggered it.** Without this the traces
+exist and the analysis never sees them: the rule that a trace overrules `MsCPUBusy` was implemented for
+three sessions and fired in none of them, because the file was attached to the incident and never handed
+to a parser. One session wrote five ETLs and not one of its 154 incidents carried a line of ETL evidence,
+while 151 were ranked as script spikes — including the freeze whose own trace shows the main thread off
+the processor for 178.0 of its 178 ms. The parse costs a burst of CPU on one core while the session is
+still running; set `DeepCapture.AnalyzeAutomaticCaptures` to `false` to go back to importing traces by
+hand.
 
 A sustained saturation window can spend a capture too, even with no remarkable frame in it — that is the
 condition a frame time threshold structurally cannot see, and it was 104 of 391 minutes in one session.
@@ -436,6 +479,42 @@ holds memory on, so with a second NVIDIA device present those need not be the sa
 difference would be a fact about the hardware rather than about the accounting. The line is still written
 in that case, with the caveat, and never escalates to a warning.
 
+**The same comparison names the row, one row at a time.** A single process cannot hold more memory than
+the card reports as used, so a row that does is double counting by definition — and that catches the case
+the absolute bound was always missing. `dwm` reported a flat 6.1 GB on a 10 GB card, cleared the 64 GB
+bound comfortably, and stood as "largest in VRAM" in all 154 incidents of a session while hiding the
+process that was actually growing; the arithmetic that exposed it was FiveM at 5.9 GB plus dwm at 6.1 GB
+on a card reporting 7.8 GB used. It is expected of the compositor specifically and understood — in
+`Composed: Copy with GPU GDI` DWM holds a reference to every frame it composes and the counter does not
+distinguish a shared allocation from an owned one — but the rule is written against the arithmetic rather
+than the name, because the next compositor-shaped process will not be called dwm. The proof does not
+expire: a row that exceeded the card's figure once is excluded from the reports for the rest of the
+session, named in a warning when it is first proved and again in every reconciliation line, and kept in
+the log. Deciding it per sample instead would have excluded that row from the first incident of the
+evening and named it largest holder in the other 153, since it only exceeded the card's own figure while
+the game was still filling its texture memory.
+
+**The three figures are also stated as a budget.** Once the session has both readings and the game has
+allocated something, one line says what the card's memory is committed to before the game asks for any —
+"skrivbordet håller 1.1 GB och streamstacken 1.0 GB, så spelet har 7.9 GB kvar av kortets 10.0 GB" — and
+it is written again whenever the stream stack starts or stops, which is the only term of the three that
+moves during an evening. This is the one figure in six sessions of investigation that predicted a session
+rather than describing one: the game fills its texture memory to a ceiling set by the graphics preset and
+stops there, so 7.2 GB of game at High plus 2.1 GB of everything else is 9.3 of 10 GB, and that session
+measured a VRAM median of 88.1% with 4.24% of it above 93%. The same subtraction at Medium predicts 82%
+and the session measured 77.6%. It also names the lever: the game's ceiling costs image quality to move,
+while the other two gigabytes are programs. The desktop figure is taken as the card's own number minus
+the game's row rather than as a sum of the other rows, so the double counting above cannot reach it.
+
+Two things it refuses to guess at. On a machine with **more than one GPU** no budget is stated at all:
+the subtraction would be one card's total minus another card's row, and unlike the reconciliation — which
+publishes with a caveat because nobody acts on it directly — this is the number a graphics preset gets
+chosen against, where a wrong figure with a footnote is worse than no figure. And because the process
+table is cut to `Gpu.ProcessMemoryTopCount`, bytes held by processes below the cut land in the desktop
+residual; the total the game does not get stays exactly right either way, but the **split** between
+desktop and stream can be understated, so the line says how much is down there when there is enough of it
+to matter.
+
 Turn it off with `Gpu.ProcessMemoryEnabled`; `Gpu.ProcessMemoryInterval` and `Gpu.ProcessMemoryTopCount`
 (25) set the cadence and how many processes each sample keeps. The list is long because the question is
 what holds the memory the game does not: nine processes held GPU memory for a whole measured session and
@@ -454,7 +533,14 @@ traces rather than one every couple of minutes.
 - No admin required
 - One-click start with the default settings
 - Collects system/process/network telemetry
-- Polls OBS if available
+- Polls OBS if available, and **says so in the window when OBS is running and its WebSocket is not
+  answering**. That state was already recorded — one session carried "process körs, WebSocket
+  frånkopplad" and four empty fields in 130 incident timelines — and being recorded is not being noticed:
+  the same session ran 5 h 47 min without a single OBS measurement, on the evening the stream was failing
+  to start, and it was found the next day by reading incident reports. Render lag and skipped frames are
+  the only view this app has of the stream's own health, the fix is two clicks in OBS, and it is only
+  worth anything while the session is still running. Reported once after
+  **Obs.ConnectionWarningDelay** (30 s), with the recovery reported once as well.
 - Uses PresentMon only if it is configured or found automatically
 - Intended to stay low overhead
 
@@ -616,6 +702,14 @@ Windows exposes no per-socket remote peer for UDP, and FiveM carries gameplay ov
 inferred from the TCP connection to the same host rather than observed directly. This is enough to
 separate many local frametime incidents from probable network incidents, but it is not a full packet
 capture.
+
+A host that answers no probe at all is given up on for the session after thirty consecutive failures —
+most game servers do not answer ICMP, and continuing produces nothing but an explanation in every report
+that no RTT was measured. The explanation belongs in the session log, once, where the collector writes it
+when it gives up and names the host. An incident whose window happens to contain those first failures now
+says so in one sentence rather than three: the advice to point `ServerProfile.ProbeHost` at a host that
+answers, or turn the probes off, is a fact about the session and not about the incident, and under 154 of
+them it was as useful the hundredth time as the first.
 
 For stronger network evidence, have the server-side or client-side `net_statsFile` CSV to hand and import
 it with **Import artifacts**. Its ping, jitter and packet loss feed directly into the network hypothesis

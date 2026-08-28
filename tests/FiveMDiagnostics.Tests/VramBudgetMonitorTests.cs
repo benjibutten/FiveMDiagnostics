@@ -1,0 +1,209 @@
+namespace FiveMDiagnostics.Tests;
+
+using FiveMDiagnostics.Core;
+
+/// <summary>
+/// The one figure in six sessions of investigation that predicted an evening rather than describing it.
+/// </summary>
+/// <remarks>
+/// Measured on 28 August: with OBS running the card held 8.37 GB of 10 with the game at 6.32 GB, and
+/// half an hour after OBS closed the same card held 7.29 GB with the game at 6.12 GB. The stream stack
+/// was the difference, at about a gigabyte, and the desktop underneath it about 1.1 GB. Written as a
+/// budget those two numbers say what preset the card can carry before the session starts — 7.2 GB of
+/// game at High plus 2.1 GB of everything else is 9.3 of 10, and that session measured a median of
+/// 88.1%.
+/// </remarks>
+public sealed class VramBudgetMonitorTests
+{
+    private static readonly DateTimeOffset Start = new(2026, 8, 27, 19, 38, 44, TimeSpan.Zero);
+
+    private const ulong Gigabyte = 1024UL * 1024 * 1024;
+
+    [Fact]
+    public void TheBudgetIsStatedOnceTheSessionHasBothFigures()
+    {
+        var monitor = new VramBudgetMonitor();
+        monitor.Observe(Adapter(Start, usedGigabytes: 8.37));
+
+        var report = monitor.Observe(Sample(Start, gameGigabytes: 6.32, obsGigabytes: 1.02));
+
+        Assert.NotNull(report);
+        Assert.Contains("VRAM-budget", report!.Message, StringComparison.Ordinal);
+
+        // Everything the game does not hold, split into the stack that can be closed and the desktop
+        // underneath it: 8.37 − 6.32 = 2.05, of which OBS is 1.02.
+        Assert.Equal(1.02, report.StreamStackBytes / (double)Gigabyte, 2);
+        Assert.Equal(1.03, report.DesktopBytes / (double)Gigabyte, 2);
+
+        // And what that leaves the game, which is the number a graphics preset is chosen against.
+        Assert.Equal(7.95, report.GameHeadroomBytes / (double)Gigabyte, 2);
+    }
+
+    /// <summary>
+    /// Said once, not every five seconds. It is a budget the session is spent inside, not a reading.
+    /// </summary>
+    [Fact]
+    public void ItIsNotRepeatedWhileNothingChanges()
+    {
+        var monitor = new VramBudgetMonitor();
+        monitor.Observe(Adapter(Start, usedGigabytes: 8.37));
+        Assert.NotNull(monitor.Observe(Sample(Start, gameGigabytes: 6.32, obsGigabytes: 1.02)));
+
+        var later = Start.AddMinutes(20);
+        monitor.Observe(Adapter(later, usedGigabytes: 8.40));
+        Assert.Null(monitor.Observe(Sample(later, gameGigabytes: 6.35, obsGigabytes: 1.03)));
+    }
+
+    /// <summary>
+    /// The one term that moves during an evening, and it moves by a gigabyte. The session of 28 August
+    /// only learned what the stream stack cost because OBS happened to close while the app was running.
+    /// </summary>
+    [Fact]
+    public void ClosingTheStreamStackRestatesTheBudget()
+    {
+        var monitor = new VramBudgetMonitor();
+        monitor.Observe(Adapter(Start, usedGigabytes: 8.37));
+        monitor.Observe(Sample(Start, gameGigabytes: 6.32, obsGigabytes: 1.02));
+
+        var later = Start.AddHours(4);
+        monitor.Observe(Adapter(later, usedGigabytes: 7.29));
+        var report = monitor.Observe(Sample(later, gameGigabytes: 6.12, obsGigabytes: 0));
+
+        Assert.NotNull(report);
+        Assert.Contains("Streamstacken avslutades", report!.Message, StringComparison.Ordinal);
+        Assert.Equal(1.17, report.DesktopBytes / (double)Gigabyte, 2);
+    }
+
+    /// <summary>
+    /// A row that has been proved to double count must not reach the budget. <c>dwm</c> at 6.1 GB would
+    /// otherwise be counted as desktop and turn a 1.1 GB figure into a 7 GB one.
+    /// </summary>
+    [Fact]
+    public void ADoubleCountedRowDoesNotReachTheDesktopFigure()
+    {
+        var monitor = new VramBudgetMonitor();
+        monitor.Observe(Adapter(Start, usedGigabytes: 8.37));
+
+        var sample = Sample(Start, gameGigabytes: 6.32, obsGigabytes: 1.02) with
+        {
+            Processes =
+            [
+                .. Sample(Start, gameGigabytes: 6.32, obsGigabytes: 1.02).Processes,
+                new GpuProcessMemoryUsage(4204, "dwm", (ulong)(6.08 * Gigabyte), 0, 1),
+            ],
+            DoubleCountedProcessIds = [4204],
+        };
+
+        var report = monitor.Observe(sample);
+
+        Assert.NotNull(report);
+        Assert.Equal(1.03, report!.DesktopBytes / (double)Gigabyte, 2);
+    }
+
+    /// <summary>
+    /// Nothing to budget for before the game has allocated anything. A line about the desktop on its own
+    /// answers no question anybody has.
+    /// </summary>
+    [Fact]
+    public void NothingIsSaidBeforeTheGameHoldsMemory()
+    {
+        var monitor = new VramBudgetMonitor();
+        monitor.Observe(Adapter(Start, usedGigabytes: 1.2));
+
+        Assert.Null(monitor.Observe(Sample(Start, gameGigabytes: 0, obsGigabytes: 0.3)));
+    }
+
+    /// <summary>
+    /// A budget is a number somebody picks a graphics preset against, so on a machine where the two
+    /// figures may describe different cards there is no honest budget to state.
+    /// </summary>
+    /// <remarks>
+    /// NVML reads device index 0 for the whole session while the process table is anchored on whichever
+    /// adapter the game holds memory on. With a second NVIDIA device present the subtraction is one
+    /// card's total minus another card's row. The reconciliation elsewhere publishes its comparison with
+    /// a caveat because nobody acts on it directly; this is acted on.
+    /// </remarks>
+    [Fact]
+    public void ASecondGpuLeavesTheBudgetUnstated()
+    {
+        var monitor = new VramBudgetMonitor();
+        monitor.Observe(Adapter(Start, usedGigabytes: 8.37, adapterCount: 2));
+
+        Assert.Null(monitor.Observe(Sample(Start, gameGigabytes: 6.32, obsGigabytes: 1.02)));
+    }
+
+    /// <summary>
+    /// The table is cut to the largest holders, and the stream stack is several processes of which the
+    /// browser sources are small. What the cut costs is the split, not the budget — the desktop figure
+    /// is a residual, so bytes below the cut land in it and the total the game does not get is unchanged.
+    /// Saying so is what keeps the two halves usable, since the advice is given against them.
+    /// </summary>
+    [Fact]
+    public void BytesBelowTheTablesCutAreDeclared()
+    {
+        var monitor = new VramBudgetMonitor();
+        monitor.Observe(Adapter(Start, usedGigabytes: 8.37));
+
+        // The counter set accounted for 0.4 GB more than the rows the table kept.
+        var truncated = Sample(Start, gameGigabytes: 6.32, obsGigabytes: 1.02) with
+        {
+            AllProcessesDedicatedBytes = (ulong)((6.32 + 1.02 + 0.171 + 0.40) * Gigabyte),
+        };
+
+        var report = monitor.Observe(truncated);
+
+        Assert.NotNull(report);
+        Assert.Contains("under topplistans gräns", report!.Message, StringComparison.Ordinal);
+
+        // And the number the preset is chosen against is unaffected by the cut.
+        Assert.Equal(7.95, report.GameHeadroomBytes / (double)Gigabyte, 2);
+    }
+
+    /// <summary>The ordinary case says nothing about it, because there is nothing to say.</summary>
+    [Fact]
+    public void AnUntruncatedTableIsNotAnnotated()
+    {
+        var monitor = new VramBudgetMonitor();
+        monitor.Observe(Adapter(Start, usedGigabytes: 8.37));
+
+        var report = monitor.Observe(Sample(Start, gameGigabytes: 6.32, obsGigabytes: 1.02));
+
+        Assert.NotNull(report);
+        Assert.DoesNotContain("topplistans", report!.Message, StringComparison.Ordinal);
+    }
+
+    private static GpuTelemetrySample Adapter(DateTimeOffset timestamp, double usedGigabytes, int adapterCount = 1)
+    {
+        return new GpuTelemetrySample(
+            timestamp,
+            IsAvailable: true,
+            "NVIDIA GeForce RTX 3080",
+            UtilizationPercent: 44,
+            MemoryBandwidthUtilizationPercent: 21,
+            UsedVramBytes: (ulong)(usedGigabytes * Gigabyte),
+            TotalVramBytes: 10UL * Gigabyte,
+            EncoderUtilizationPercent: 0,
+            DecoderUtilizationPercent: 0,
+            TemperatureCelsius: 61,
+            ThrottleReasons: [],
+            AdapterCount: adapterCount);
+    }
+
+    private static GpuProcessMemorySample Sample(DateTimeOffset timestamp, double gameGigabytes, double obsGigabytes)
+    {
+        var processes = new List<GpuProcessMemoryUsage>();
+        if (gameGigabytes > 0)
+        {
+            processes.Add(new GpuProcessMemoryUsage(18704, "FiveM_b3407_GTAProcess", (ulong)(gameGigabytes * Gigabyte), 0, 1));
+        }
+
+        if (obsGigabytes > 0)
+        {
+            processes.Add(new GpuProcessMemoryUsage(9012, "obs64", (ulong)(obsGigabytes * Gigabyte), 0, 1));
+        }
+
+        processes.Add(new GpuProcessMemoryUsage(2244, "explorer", 175UL * 1024 * 1024, 0, 1));
+
+        return new GpuProcessMemorySample(timestamp, IsAvailable: true, processes);
+    }
+}

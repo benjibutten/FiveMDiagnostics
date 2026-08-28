@@ -101,6 +101,11 @@ public sealed class SettingsStore
             changed = true;
         }
 
+        if (settings.Obs.Normalize())
+        {
+            changed = true;
+        }
+
         settings.DeepCapture.Normalize();
         settings.Gpu.Normalize();
 
@@ -120,6 +125,7 @@ public sealed class SettingsStore
         settings.AutoDetect.Normalize();
         settings.DeepCapture.Normalize();
         settings.Gpu.Normalize();
+        settings.Obs.Normalize();
         settings.MaxRetainedIncidents = Math.Clamp(settings.MaxRetainedIncidents, 1, 1000);
 
         Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);

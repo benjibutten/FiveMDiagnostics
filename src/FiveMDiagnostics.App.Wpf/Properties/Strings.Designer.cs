@@ -138,5 +138,6 @@ public static class Strings
     public static string LiveVramFormat => ResourceManager.GetString("LiveVramFormat", Culture) ?? "{0} of {1} GB ({2}%)";
     public static string LiveVramUnavailable => ResourceManager.GetString("LiveVramUnavailable", Culture) ?? "n/a";
     public static string LiveVramOwnersLabel => ResourceManager.GetString("LiveVramOwnersLabel", Culture) ?? "Largest in VRAM:";
+    public static string SessionAlertsHeader => ResourceManager.GetString("SessionAlertsHeader", Culture) ?? "Needs attention";
     public static string LiveVramOwnersUnavailable => ResourceManager.GetString("LiveVramOwnersUnavailable", Culture) ?? "not measured";
 }

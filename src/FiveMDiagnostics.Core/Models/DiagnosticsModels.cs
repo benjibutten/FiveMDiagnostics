@@ -168,14 +168,48 @@ public sealed record GpuOptions
 
 public sealed record ObsOptions
 {
+    private static readonly TimeSpan MinimumConnectionWarningDelay = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan MaximumConnectionWarningDelay = TimeSpan.FromMinutes(5);
+
     public string Endpoint { get; set; } = "ws://127.0.0.1:4455";
     public string Password { get; set; } = string.Empty;
     public TimeSpan PollingInterval { get; set; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// How long OBS may run without its WebSocket answering before the session says so out loud.
+    /// </summary>
+    /// <remarks>
+    /// The connection is either there within a few polls or it is not there at all — the usual cause is
+    /// that the server was never enabled in OBS, and no amount of waiting fixes that. A session ran five
+    /// hours and 47 minutes with the socket down, on the evening the stream was visibly struggling, and
+    /// the only record of it was the phrase "process körs, WebSocket frånkopplad" repeated in 130
+    /// incident timelines. Nobody reads that as a fault; it reads as a field. Thirty seconds is long
+    /// enough that a normal connect is never reported as a failure.
+    /// </remarks>
+    public TimeSpan ConnectionWarningDelay { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Clamps hand-edited warning delays so the warning is neither immediate nor disabled.</summary>
+    public bool Normalize()
+    {
+        var normalized = ConnectionWarningDelay < MinimumConnectionWarningDelay
+            ? MinimumConnectionWarningDelay
+            : ConnectionWarningDelay > MaximumConnectionWarningDelay
+                ? MaximumConnectionWarningDelay
+                : ConnectionWarningDelay;
+
+        if (normalized == ConnectionWarningDelay)
+        {
+            return false;
+        }
+
+        ConnectionWarningDelay = normalized;
+        return true;
+    }
 }
 
 public sealed record DeepCaptureOptions
 {
-    public const int CurrentCaptureProfileRevision = 2;
+    public const int CurrentCaptureProfileRevision = 3;
 
     /// <summary>
     /// Version of the generated capture profile defaults. Zero means settings written before profile
@@ -324,6 +358,28 @@ public sealed record DeepCaptureOptions
     public bool CaptureAutoIncidents { get; set; } = true;
 
     /// <summary>
+    /// Reads an automatic capture's ETL back into the incident that triggered it, instead of leaving the
+    /// file on disk for somebody to import by hand.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Without this the traces exist and the analysis never sees them. The rule that a trace overrules
+    /// <c>MsCPUBusy</c> — a main thread the ETL shows off the processor is not running script, whatever
+    /// PresentMon reports — has been implemented for three sessions and fired in none of them, because
+    /// an automatic capture was attached to the incident as a file and never parsed. The session of
+    /// 27 August wrote five ETLs and not one incident of its 154 carried a single line of ETL evidence;
+    /// 151 of them were ranked as script spikes, including the one whose trace shows the main thread
+    /// waiting for 178.0 of its 178 ms.
+    /// </para>
+    /// <para>
+    /// The parse costs a burst of CPU on one core while the session is still running — seconds to tens
+    /// of seconds for the 894-916 MB an automatic capture writes, against the same session that has just
+    /// written that file to disk. Turn it off to go back to importing traces by hand.
+    /// </para>
+    /// </remarks>
+    public bool AnalyzeAutomaticCaptures { get; set; } = true;
+
+    /// <summary>
     /// Frame time, in milliseconds, an automatically detected hitch has to reach before it may spend a
     /// capture. Absolute rather than a multiple of baseline, for the same reason
     /// <see cref="FramePacingOptions"/> is: the multiplier moves with the damage, and a threshold meant
@@ -345,7 +401,14 @@ public sealed record DeepCaptureOptions
     /// leaves the ring buffer empty until it refills, so this is the setting that keeps a bad evening
     /// from filling the disk.
     /// </summary>
-    public int MaxAutoCapturesPerSession { get; set; } = 8;
+    /// <remarks>
+    /// Raised from eight alongside <see cref="MaxAutoCapturesPerWindow"/>, because a ceiling of eight
+    /// against three captures an hour is spent before a six hour session is half over — the failure the
+    /// window budget exists to prevent, arriving from the other end. Twelve captures at the 894–916 MB
+    /// the last session measured is about eleven gigabytes for an evening, which is the price of the
+    /// evenings this app exists to explain.
+    /// </remarks>
+    public int MaxAutoCapturesPerSession { get; set; } = 12;
 
     /// <summary>
     /// Ceiling on automatic captures inside <see cref="CaptureBudgetWindow"/>, rather than for a whole
@@ -367,8 +430,16 @@ public sealed record DeepCaptureOptions
     /// ignores the cooldown: the session ceiling is meant to be the binding constraint on a genuinely
     /// catastrophic frame, and spacing meant to ration ordinary ones should not turn one away.
     /// </para>
+    /// <para>
+    /// One per hour became the binding constraint the moment the threshold was fixed. The session of
+    /// 27 August refused twenty-four hitches with "1 capture(s) per 60 min are already taken", among
+    /// them the evening's second largest frame at 484 ms — the one frame of the night with no
+    /// explanation and no trace. Three per hour cannot produce more than three against the ten minute
+    /// cooldown, so the cooldown still decides the volume; this decides only that a quiet hour does not
+    /// lose its slot to a loud one.
+    /// </para>
     /// </remarks>
-    public int MaxAutoCapturesPerWindow { get; set; } = 1;
+    public int MaxAutoCapturesPerWindow { get; set; } = 3;
 
     /// <summary>The window <see cref="MaxAutoCapturesPerWindow"/> is counted over.</summary>
     public TimeSpan CaptureBudgetWindow { get; set; } = TimeSpan.FromHours(1);
@@ -393,8 +464,17 @@ public sealed record DeepCaptureOptions
     /// neither exists in any trace. The ceiling is the constraint this feature was sized around — six
     /// captures across an evening — so a frame far beyond the ordinary threshold should be spending that
     /// ceiling rather than being turned away by spacing meant to collapse a burst.
+    /// <para>
+    /// Five hundred was calibrated against sessions whose worst frames ran to 2 846 ms and went blind
+    /// the moment they improved, exactly as the ordinary threshold had. The session of 27 August had a
+    /// worst frame of 528 ms; its second largest, 484 ms, missed the exception by 16 ms and exists in no
+    /// trace, while the budget still held unspent captures. At 250 ms an override is roughly fifteen
+    /// missed frames at 60 Hz — far outside anything the cooldown was written to collapse — and
+    /// <see cref="AdaptiveOverrideFramesPerHour"/> raises it again by itself on an evening where frames
+    /// that size are ordinary.
+    /// </para>
     /// </remarks>
-    public double AutoCaptureOverrideFrameTimeMs { get; set; } = 500;
+    public double AutoCaptureOverrideFrameTimeMs { get; set; } = 250;
 
     /// <summary>
     /// Spacing an overriding frame still has to clear. The cooldown may be broken; this may not.
@@ -415,6 +495,41 @@ public sealed record DeepCaptureOptions
     /// </remarks>
     public TimeSpan AutoCaptureOverrideCooldown { get; set; } = TimeSpan.FromSeconds(60);
 
+    /// <summary>
+    /// Frames per hour that may exceed the ordinary capture threshold before the threshold follows the
+    /// session's own material upwards. Zero turns the adaptation off and leaves the constants alone.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Both thresholds above are constants, and a constant is right for the sessions it was calibrated
+    /// against and wrong for the next ones. 300 ms was recalibrated to 120 after a session improved past
+    /// it; 500 ms was recalibrated to 250 after the next one did. Twice in two weeks somebody had to
+    /// count frames by hand afterwards to discover it.
+    /// </para>
+    /// <para>
+    /// The adaptation only ever raises. The constants are the floor — an evening that is going well must
+    /// not have its threshold dragged down into ordinary spikes — and the session's own distribution
+    /// lifts them when the machine is producing frames of that size routinely. Held as a rate rather
+    /// than a percentile because the budget is a rate: at twenty an hour the ordinary threshold sits
+    /// where roughly twenty frames an hour have reached, which is the level a budget of three an hour
+    /// can afford to be selective about. A session with fewer than that never leaves the floor.
+    /// </para>
+    /// </remarks>
+    public double AdaptiveThresholdFramesPerHour { get; set; } = 20;
+
+    /// <summary>
+    /// The same rule for <see cref="AutoCaptureOverrideFrameTimeMs"/>: frames per hour that may break
+    /// the cooldown before the exception starts following the material instead of the constant.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately close to <see cref="MaxAutoCapturesPerWindow"/>. The override exists so the few
+    /// largest frames of an evening are never turned away by spacing, and "the few largest" is a rate,
+    /// not a millisecond figure. On the session this was sized against — one frame over 500 ms, four
+    /// over 250 — three an hour leaves the 250 ms floor standing; on an evening of 800 ms frames it
+    /// raises the exception to where 800 ms frames actually are.
+    /// </remarks>
+    public double AdaptiveOverrideFramesPerHour { get; set; } = 3;
+
     /// <summary>Applies one-time changes to settings saved by builds before capture-profile revisions.</summary>
     public bool MigrateCaptureProfile()
     {
@@ -422,6 +537,9 @@ public sealed record DeepCaptureOptions
         {
             return false;
         }
+
+        var previousRevision = CaptureProfileRevision;
+        var migratedLegacySessionDefault = previousRevision < 2 && MaxAutoCapturesPerSession == 6;
 
         // These were the exact persisted defaults in the affected build. Preserve genuinely custom
         // buffer/tail combinations, while ensuring installations on those defaults get enough room for
@@ -443,9 +561,31 @@ public sealed record DeepCaptureOptions
             AutoCaptureFrameTimeMs = 120;
         }
 
-        if (MaxAutoCapturesPerSession == 6)
+        if (previousRevision < 2 && MaxAutoCapturesPerSession == 6)
         {
             MaxAutoCapturesPerSession = 8;
+        }
+
+        // Revision 3 recalibrates the capture budget after the session of 27 August refused twenty-four
+        // hitches, the second largest frame of the evening among them. Same rule as above: only values
+        // that are still the previous defaults are moved, so a hand-picked budget survives untouched.
+        if (AutoCaptureOverrideFrameTimeMs == 500)
+        {
+            AutoCaptureOverrideFrameTimeMs = 250;
+        }
+
+        if (MaxAutoCapturesPerWindow == 1)
+        {
+            MaxAutoCapturesPerWindow = 3;
+        }
+
+        // An 8 loaded from a pre-revision-2 file may be a manual choice. Upgrade it only when this call
+        // just produced it from the old default, or when revision 2 had already persisted it as that
+        // revision's default before this migration began.
+        if (MaxAutoCapturesPerSession == 8
+            && (migratedLegacySessionDefault || previousRevision >= 2))
+        {
+            MaxAutoCapturesPerSession = 12;
         }
 
         CaptureProfileRevision = CurrentCaptureProfileRevision;
@@ -499,6 +639,16 @@ public sealed record DeepCaptureOptions
         AutoCaptureOverrideFrameTimeMs = double.IsNaN(AutoCaptureOverrideFrameTimeMs)
             ? Math.Max(500, AutoCaptureFrameTimeMs)
             : Math.Clamp(AutoCaptureOverrideFrameTimeMs, AutoCaptureFrameTimeMs, 60_000);
+
+        // Negative rates would invert the adaptation into a threshold that falls with the material,
+        // which is the one direction it must never move. Zero is meaningful and means "off".
+        AdaptiveThresholdFramesPerHour = double.IsNaN(AdaptiveThresholdFramesPerHour)
+            ? 20
+            : Math.Clamp(AdaptiveThresholdFramesPerHour, 0, 10_000);
+
+        AdaptiveOverrideFramesPerHour = double.IsNaN(AdaptiveOverrideFramesPerHour)
+            ? 3
+            : Math.Clamp(AdaptiveOverrideFramesPerHour, 0, 10_000);
 
         // Never longer than the cooldown it overrides — that would make it dead code rather than a
         // shorter path — and never shorter than a capture takes to finish and the ring to refill.
@@ -992,13 +1142,34 @@ public sealed record GpuProcessMemoryInstance(string InstanceName, string? Adapt
 /// <c>GPU Process Memory</c> counter set — the same source as Task Manager's per-process column — so
 /// they are vendor neutral and cover processes NVML never reports in WDDM mode.
 /// </remarks>
+/// <param name="DoubleCountedProcessIds">
+/// Processes this session has proved are counting the same memory twice, from
+/// <see cref="VramAccountingMonitor"/>. Their rows are kept in the log and excluded from every report,
+/// exactly as an impossible absolute reading is.
+/// </param>
 public sealed record GpuProcessMemorySample(
     DateTimeOffset Timestamp,
     bool IsAvailable,
     IReadOnlyList<GpuProcessMemoryUsage> Processes,
     string? UnavailableReason = null,
-    ulong? AllProcessesDedicatedBytes = null) : TelemetryEvent(Timestamp, "GpuProcessMemory")
+    ulong? AllProcessesDedicatedBytes = null,
+    IReadOnlyCollection<int>? DoubleCountedProcessIds = null) : TelemetryEvent(Timestamp, "GpuProcessMemory")
 {
+    /// <summary>
+    /// Whether a row cannot be believed: impossible for any adapter, or proved to double count on this
+    /// one.
+    /// </summary>
+    /// <remarks>
+    /// The absolute bound catches only the extreme version of the fault. <c>obs64</c> at 213 GB on a
+    /// 10 GB card cleared it by a factor of three; <c>dwm</c> at 6.1 GB on the same card passed
+    /// underneath it and stood as "largest VRAM holder" in all 154 incidents of a session, hiding the
+    /// process that was actually growing. What both readings have in common is not their size but that
+    /// they exceed what the card itself reports as used, which is impossible for a single process and is
+    /// what <see cref="VramAccountingMonitor"/> now measures per row.
+    /// </remarks>
+    public bool IsUnbelievable(GpuProcessMemoryUsage process) =>
+        process.IsImplausible || DoubleCountedProcessIds?.Contains(process.ProcessId) == true;
+
     /// <summary>
     /// Dedicated bytes across every process on the adapter, including those below the top-N cut.
     /// </summary>
@@ -1027,11 +1198,14 @@ public sealed record GpuProcessMemorySample(
     /// </para>
     /// </remarks>
     public ulong TotalDedicatedBytes => Processes
-        .Where(process => !process.IsImplausible)
+        .Where(process => !IsUnbelievable(process))
         .Aggregate(0UL, (total, process) => total + process.DedicatedBytes);
 
     /// <summary>Processes whose reading is impossible for the adapter, kept in the log and out of reports.</summary>
     public IEnumerable<GpuProcessMemoryUsage> ImplausibleProcesses => Processes.Where(process => process.IsImplausible);
+
+    /// <summary>Processes whose reading cannot be believed, for either reason.</summary>
+    public IEnumerable<GpuProcessMemoryUsage> UnbelievableProcesses => Processes.Where(IsUnbelievable);
 
     /// <summary>
     /// The largest holders, for a report that has room to name a few.
@@ -1045,7 +1219,7 @@ public sealed record GpuProcessMemorySample(
     public IEnumerable<GpuProcessMemoryUsage> Top(int count)
     {
         return Processes
-            .Where(process => !process.IsImplausible)
+            .Where(process => !IsUnbelievable(process))
             .OrderByDescending(process => process.DedicatedBytes)
             .Take(count);
     }
