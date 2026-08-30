@@ -50,6 +50,9 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private FramePacingMonitor? _framePacing;
     private VramAccountingMonitor? _vramAccounting;
     private VramBudgetMonitor? _vramBudget;
+    private LiveVramTracker? _liveVram;
+    private DisplayCadenceMonitor? _displayCadence;
+    private CaptureCostMonitor? _captureCost;
 
     /// <summary>
     /// Trace evidence that arrived before the incident it belongs to had been published.
@@ -113,6 +116,15 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     public event EventHandler<GpuTelemetrySample>? GpuTelemetryUpdated;
 
     public event EventHandler<GpuProcessMemorySample>? GpuProcessMemoryUpdated;
+
+    /// <summary>
+    /// The live table of what is holding the adapter's memory, refreshed with every process sample.
+    /// </summary>
+    /// <remarks>
+    /// Separate from <see cref="GpuProcessMemoryUpdated"/> because it carries what a raw sample cannot:
+    /// what each process held when the session started, so growth reads without anyone diffing a CSV.
+    /// </remarks>
+    public event EventHandler<LiveVramSnapshot>? LiveVramUpdated;
 
     public event EventHandler<CaptureHealthTelemetrySample>? CaptureHealthUpdated;
 
@@ -208,8 +220,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _autoDetector = new AutoIncidentDetector(_settings.AutoDetect, Environment?.DisplayRefreshRateHz);
             _autoCaptureBudget = new AutoDeepCaptureBudget(_settings.DeepCapture);
             _framePacing = new FramePacingMonitor(_settings.FramePacing, Environment?.DisplayRefreshRateHz);
+            _displayCadence = new DisplayCadenceMonitor(Environment?.DisplayRefreshRateHz);
+            _captureCost = new CaptureCostMonitor(Environment?.DisplayRefreshRateHz);
             _vramAccounting = new VramAccountingMonitor();
             _vramBudget = new VramBudgetMonitor();
+            _liveVram = new LiveVramTracker();
 
             // A capture whose incident never published — the session was stopped while it was still
             // being written — would otherwise wait here for a marker id the next session cannot produce.
@@ -254,6 +269,20 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         }
 
         Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), $"Session started for profile '{_settings.ServerProfile.Name}'.");
+
+        // At the start rather than in the summary, because it is the one finding of this investigation
+        // that is fixed before playing rather than analysed afterwards.
+        if (RefreshRateMismatch.Describe(Environment?.Displays) is { } mismatch)
+        {
+            Report(StatusLevel.Warning, "DisplayCadence", mismatch);
+        }
+
+        // Every comparison so far has been made against a remembered setting. Silent when the file is
+        // not where it is looked for, which costs nothing that was not already missing.
+        if (GameGraphicsSettingsReader.Describe() is { } graphics)
+        {
+            Report(StatusLevel.Info, "GameSettings", graphics);
+        }
         OnStateChanged();
     }
 
@@ -378,6 +407,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         _isSessionActive = false;
 
         FinalizeFramePacing();
+        FinalizeDisplayCadence();
+        FinalizeCaptureCost();
         Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), "Session stopped.");
         CloseJournal();
         OnStateChanged();
@@ -508,6 +539,55 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         }
 
         _framePacing = null;
+    }
+
+    /// <summary>
+    /// Writes how many of the session's frames reached the screen in step with the display.
+    /// </summary>
+    /// <remarks>
+    /// At the end rather than during, because it is a property of the whole evening and barely moves
+    /// after the first minutes. It belongs next to the pacing summary: pacing says whether the frames
+    /// were produced on time and this says whether they were shown on time, and for eight sessions the
+    /// first said yes while nobody asked the second.
+    /// </remarks>
+    private void FinalizeDisplayCadence()
+    {
+        if (_displayCadence?.Snapshot() is { } report)
+        {
+            Report(
+                report.IsOffCadence ? StatusLevel.Warning : StatusLevel.Info,
+                "DisplayCadence",
+                report.Message);
+        }
+
+        // The mismatch warning goes out before the first frame exists, so this is the first moment the
+        // session knows whether the condition it stated was true. Only withdrawn, never repeated: the
+        // warning that still applies has already been read, and the cadence line above measures it.
+        if (_displayCadence?.ComposedShare is { } composedShare
+            && RefreshRateMismatch.DescribeWithdrawal(Environment?.Displays, composedShare) is { } withdrawal)
+        {
+            Report(StatusLevel.Info, "DisplayCadence", withdrawal);
+        }
+
+        _displayCadence = null;
+    }
+
+    /// <summary>
+    /// Writes what this session's own deep captures coincided with.
+    /// </summary>
+    /// <remarks>
+    /// Info rather than Warning. It is not a fault — the captures are how the largest hitches get
+    /// explained at all — but two evenings are not comparable without it, and a reader who does not know
+    /// one of them took ten captures and the other took two will read the difference as the machine.
+    /// </remarks>
+    private void FinalizeCaptureCost()
+    {
+        if (_captureCost?.Summary() is { } report)
+        {
+            Report(StatusLevel.Info, "DeepCapture.Cost", report.Message);
+        }
+
+        _captureCost = null;
     }
 
     private void CloseJournal()
@@ -1032,6 +1112,30 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         }
     }
 
+    /// <summary>
+    /// Refreshes the live VRAM view and says so when a process takes a large amount of the card at once.
+    /// </summary>
+    /// <remarks>
+    /// The status line is deliberately the quieter half of this. Someone mid-stream is not reading the
+    /// log, so the table is what they will actually open the app for; the line exists so the step is in
+    /// the session record afterwards, where the 29 August Voicemod step had to be found by diffing a
+    /// column of CSV.
+    /// </remarks>
+    private void ReportLiveVram(GpuProcessMemorySample sample)
+    {
+        if (_liveVram?.Observe(sample) is not { } snapshot)
+        {
+            return;
+        }
+
+        foreach (var growth in snapshot.Growth)
+        {
+            Report(StatusLevel.Info, "GpuProcessMemory.Live", growth.Message);
+        }
+
+        LiveVramUpdated?.Invoke(this, snapshot);
+    }
+
     private async Task PumpAsync(ChannelReader<TelemetryEvent> reader, CancellationToken cancellationToken)
     {
         while (await reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
@@ -1062,6 +1166,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 {
                     ReportVramAccounting(gpuProcessSample);
                     ReportVramBudget(gpuProcessSample);
+                    ReportLiveVram(gpuProcessSample);
                     GpuProcessMemoryUpdated?.Invoke(this, gpuProcessSample);
                 }
                 else if (telemetryEvent is CaptureHealthTelemetrySample healthSample)
@@ -1075,6 +1180,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                     // that already crossed a threshold would describe the threshold rather than the
                     // evening.
                     _autoCaptureBudget?.Observe(frameSample.Timestamp, frameSample.FrameTimeMs);
+                    _displayCadence?.Observe(frameSample);
+                    _captureCost?.Observe(frameSample);
 
                     // The marker has to be raised before the materializer sees this event, so the frame
                     // that triggered the incident lands inside its own window rather than one event
@@ -1362,6 +1469,10 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             // into the export bundle.
             if (!string.IsNullOrWhiteSpace(result.CapturePath) && File.Exists(result.CapturePath))
             {
+                // Timed here rather than when the capture was requested: what disturbs the game is the
+                // flush of the ring buffer to disk, which is what has just finished.
+                _captureCost?.RecordCaptureWritten(DateTimeOffset.UtcNow);
+
                 lock (_sync)
                 {
                     _attachments.Add(new ArtifactAttachment(result.CapturePath, ArtifactKind.EtlTrace, Path.GetFileName(result.CapturePath), DateTimeOffset.UtcNow, Sensitive: true));

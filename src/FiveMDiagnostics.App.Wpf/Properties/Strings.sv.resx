@@ -160,5 +160,13 @@
   <data name="LiveVramUnavailable" xml:space="preserve"><value>saknas</value></data>
   <data name="LiveVramOwnersLabel" xml:space="preserve"><value>Störst i VRAM:</value></data>
   <data name="LiveVramOwnersUnavailable" xml:space="preserve"><value>mäts inte</value></data>
+  <data name="LiveVramPanelHeader" xml:space="preserve"><value>Vad som håller VRAM</value></data>
+  <data name="LiveVramPanelDescription" xml:space="preserve"><value>Live, uppdateras vid varje mätpunkt. "Tagit" är vad en process lagt på sedan sessionen startade — ett program som tar flera hundra megabyte på en gång ger dem sällan tillbaka, och det är minne spelet inte får.</value></data>
+  <data name="LiveVramColumnProcess" xml:space="preserve"><value>Process</value></data>
+  <data name="LiveVramColumnNow" xml:space="preserve"><value>Nu</value></data>
+  <data name="LiveVramColumnTaken" xml:space="preserve"><value>Tagit</value></data>
+  <data name="LiveVramColumnPeak" xml:space="preserve"><value>Topp</value></data>
+  <data name="LiveVramUntrustedNote" xml:space="preserve"><value>dubbelräknar — utesluten ur rapporter</value></data>
+  <data name="LiveVramPanelEmpty" xml:space="preserve"><value>Ingen processtabell ännu. Den dyker upp när sessionen hittat FiveM/GTA-processen — VRAM mäts bara medan spelet kör.</value></data>
   <data name="SessionAlertsHeader" xml:space="preserve"><value>Behöver åtgärdas</value></data>
 </root>

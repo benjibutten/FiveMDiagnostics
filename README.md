@@ -118,6 +118,27 @@ five disk operations and three hard faults. Two rules now apply:
   busy disk from a slow one, so it produces a lead worth checking, not an answer that ends the
   investigation.
 
+The same rule governs `MsCPUBusy`, which is derived from the gap between presents and so reads
+identically for a thread executing script and a thread asleep on a lock. When an attached trace shows
+the game's thread off the processor for the frame, that reading stops counting as evidence of script
+work entirely rather than being counted and then capped.
+
+Correlating the two instruments needs care, because **they do not share a clock**. PresentMon reports
+frame times relative to its own trace and the collector recovers wall clock as
+`min(readUtc - relativeMs)`, an estimate that can only ever be late: `readUtc` is taken after PresentMon
+buffered the row, wrote it and the poll loop read it, so the anchor keeps the smallest pipeline latency
+of the session as a standing bias. Measured on six incidents of the 29 August session that carried both
+a marker and a trace naming the wait behind it, the marker ran **1.17 to 1.32 seconds late** every time.
+An earlier 50 ms tolerance therefore rejected all six, and `FiveMThreadWait` was never once ranked in
+the field across nine sessions while the reports kept concluding a script spike from `MsCPUBusy`.
+
+Matching is now on **duration first and clock second**: a wait explains a frame when it accounts for
+50–150% of what that frame lost, and falls within three seconds of it. The duration test is much the
+stronger of the two — every genuine match in that session lands within a few percent (245.8 ms of wait
+against 245 ms of lost frame, 250.0 against 249, 197.2 against 199, 120.9 against 122, 117.7 against
+119) — and it correctly rejects the one traced hitch that was not a wait, a 252 ms frame where
+`adhesive.dll` held 3.58 cores and the wait covers only 71.4 ms of it.
+
 ### Automatic incident marking
 
 Relying on the user to notice a hitch and hit a hotkey samples the problem at a few percent, and biases
@@ -240,6 +261,44 @@ the telemetry alone cannot establish.
 Stutter is deviation from the cadence the machine is achieving, so thresholds derive from the observed
 median frame time and the display refresh interval (whichever is larger), not a hardcoded 25 ms. A
 120 Hz display running at 120 fps flags spikes from roughly 12.5 ms; a 60 Hz one from roughly 25 ms.
+
+### Frames are timed twice: when the game presents them, and when the screen shows them
+
+A frame time of 16.67 ms means the game produced the frame on time. It does not mean anyone saw it on
+time, and for eight sessions of one investigation those two answers disagreed while only the first was
+computed.
+
+`DisplayCadenceMonitor` rounds every `MsBetweenDisplayChange` to a whole number of display refreshes
+and reports the share that did not land on the cadence the session actually holds. Counting refreshes
+rather than milliseconds is what makes the figure comparable across displays: a 60 fps game changes the
+screen every two refreshes on a 120 Hz panel and every one on a 60 Hz panel, and a frame that slips is
+one refresh out in both cases — but 8.3 ms in the first and 16.7 ms in the second.
+
+Measured across the investigation, with the presents shown alongside for the two sessions that have
+both:
+
+| session | presented on cadence | reached the screen on cadence |
+|---|---:|---:|
+| 21 Aug | — | 87.2% |
+| 22 Aug | — | 79.0% |
+| 23 Aug | — | 85.6% |
+| 24 Aug | — | 88.9% |
+| 25 Aug | — | 89.4% |
+| 26 Aug | — | 86.3% |
+| 27 Aug | — | 89.5% |
+| 28 Aug | 97.2% | 88.7% |
+| 30 Aug | 98.3% | **99.6%** |
+
+On 28 August 5.8% of frames reached the screen a refresh **early** and 5.5% a refresh **late** — an
+oscillation around the right moment, about one frame in nine, all evening, invisible in frame time
+because the frames themselves were on time. The cause was the game's blt swapchain being composed by
+DWM while two monitors ran at different refresh rates, which forces the compositor to resample. Setting
+both displays to the same rate took the figure to 0.41% and halved the hitch rate at every threshold.
+
+So `RefreshRateMismatch` also checks the attached displays at session start and says so when their
+rates differ by more than 10%, which is the one finding of that investigation that is fixed before
+playing rather than analysed afterwards. `EnvironmentMetadata.Displays` records the whole set, because
+the previous field — the primary display's rate alone — could not express the problem.
 
 ### Frame pacing is measured separately, and absolutely
 
@@ -397,8 +456,17 @@ retired process are rejected, and overflow is reported and recovered through the
 of allowing memory to grow without limit.
 
 Timestamps in the CSV are relative to the start of the PresentMon trace. The collector anchors them to
-wall clock by tracking the tightest observed bound across batches, so frames land at their real position
-on the timeline instead of collapsing onto the moment they were read.
+wall clock by tracking the tightest observed bound across batches, so frames land close to their real
+position on the timeline instead of collapsing onto the moment they were read.
+
+The anchor is **biased late, and cannot not be**. It is `min(readUtc - relativeMs)`, and `readUtc` is
+taken after PresentMon buffered the row, wrote it and the poll loop read it — so the estimate carries
+the smallest pipeline latency of the whole session as a standing offset. Measured against ETL
+timestamps, which have no such offset, on six incidents of the 29 August session: **1.17 to 1.32 seconds
+late**. That is invisible while frames are only compared against each other, and it silently broke every
+correlation against a trace until the analysis stopped relying on the two clocks agreeing (see
+[A verdict never outranks the measurement behind it](#a-verdict-never-outranks-the-measurement-behind-it)).
+Anything correlating a frame against another instrument has to allow for it.
 
 
 #### Capture health
@@ -515,11 +583,48 @@ residual; the total the game does not get stays exactly right either way, but th
 desktop and stream can be understated, so the line says how much is down there when there is enough of it
 to matter.
 
+**The table is also live in the window, and it notices a step change.** The status line in the header
+names the two largest holders, which answers "is the card full" but not "what do I close" — the second
+question was only ever answerable by reading the process CSV the following day. `LiveVramTracker` keeps
+what each process held when the session started alongside what it holds now, so growth reads at a glance,
+and it says so when a process takes a large amount of the card at once. The alarm is on **rate**, not on
+size, because the game's own row grows too: FiveM fills its texture pool at about 2.7 MB/s at its fastest
+measured, while `Voicemod` sat flat at 669 MB for three hours and 47 minutes and then took 734 MB in
+twenty seconds — 36.7 MB/s, thirteen times faster — and never gave it back. A threshold on bytes would
+have to be set above the pool fill and would then miss the step. The report waits for the climb to stop
+before naming it, so the line carries the whole 734 MB rather than the 430 it had reached when the
+threshold was crossed. Rows the session has proved impossible stay in the view and stay labelled, since
+this table is where a process claiming 39.9 GB of a 10 GB card gets noticed in the first place.
+
 Turn it off with `Gpu.ProcessMemoryEnabled`; `Gpu.ProcessMemoryInterval` and `Gpu.ProcessMemoryTopCount`
 (25) set the cadence and how many processes each sample keeps. The list is long because the question is
 what holds the memory the game does not: nine processes held GPU memory for a whole measured session and
 four more came and went, and at the original ten places the non-game total was a floor rather than a
 figure.
+
+### The app reports what it costs the session it is measuring
+
+A deep capture ends by flushing roughly 900 MB of ring buffer to disk while the game is running, and the
+app never said what that cost. Counted by hand on the 29 August session, the minute after each of its ten
+flushes held hitches at four times the rate of the rest of the evening — 222 against 80 per hour at the
+33 ms threshold, 96 against 22 at 50 ms — while the large ones were untouched at 6.0 against 6.4 per
+hour. That is roughly 27 of the evening's 412 hitches being the instrument rather than the machine.
+
+`CaptureCostMonitor` now measures it and writes it into the session summary. Part of the excess is not
+the flush at all — a capture happens because a hitch happened, and hitches cluster — so the line states
+what it measured and not what caused it. The point is that two evenings with different numbers of
+captures are not comparable without it.
+
+### The session records the game's own graphics settings
+
+Every comparison in the investigation rested on a remembered setting, and the window mode took four
+sessions to establish from an in-game menu that showed "Fullscreen" and sometimes "Fullscreen
+(Borderless)" for the same configuration. It is one integer in the file the game writes.
+`GameGraphicsSettingsReader` reads `Rockstar Games/GTA V/settings.xml` at session start and records the
+values that cost VRAM or decide presentation, spelling out `Windowed` (0 exclusive, 1 windowed with a
+border, 2 borderless). It is best effort and silent when the file is not found, since a wrong setting in
+the record is worse than none. It is also **not complete**: FiveM's `Extended Texture Budget` is its own
+setting and is not in that file, which matters because it was one of the two knobs moved on 27 August.
 
 ## Capture depth
 

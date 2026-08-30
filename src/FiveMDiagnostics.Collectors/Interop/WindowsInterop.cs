@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 namespace FiveMDiagnostics.Collectors.Interop;
@@ -16,6 +16,9 @@ internal static class WindowsInterop
 
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
     internal static extern bool EnumDisplaySettings(string? deviceName, int modeNum, ref DevMode devMode);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    internal static extern bool EnumDisplayDevices(string? device, uint deviceIndex, ref DisplayDevice displayDevice, uint flags);
 
     [DllImport("iphlpapi.dll", SetLastError = true)]
     internal static extern uint GetExtendedTcpTable(
@@ -249,4 +252,42 @@ internal static class ProcessMetricsReader
         var delta = current - previous;
         return (long)(delta / Math.Max(elapsed.TotalSeconds, 0.001));
     }
+}
+
+/// <summary>One entry of the display adapter/monitor enumeration.</summary>
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+internal struct DisplayDevice
+{
+    private const int DeviceNameSize = 32;
+    private const int DeviceStringSize = 128;
+    private const int DeviceIdSize = 128;
+    private const int DeviceKeySize = 128;
+
+    /// <summary>Attached to the desktop; a device without this holds no mode worth reading.</summary>
+    internal const uint AttachedToDesktop = 0x00000001;
+
+    internal const uint PrimaryDevice = 0x00000004;
+
+    /// <summary>
+    /// A pseudo device — a remote desktop or capture mirror driver — which owns no panel. It can report
+    /// itself as attached to the desktop and carries a mode, so it would otherwise stand in the display
+    /// inventory as a screen running whatever rate it mirrors at.
+    /// </summary>
+    internal const uint MirroringDriver = 0x00000008;
+
+    public int Size;
+
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = DeviceNameSize)]
+    public string DeviceName;
+
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = DeviceStringSize)]
+    public string DeviceString;
+
+    public uint StateFlags;
+
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = DeviceIdSize)]
+    public string DeviceId;
+
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = DeviceKeySize)]
+    public string DeviceKey;
 }

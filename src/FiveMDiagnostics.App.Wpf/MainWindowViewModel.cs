@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.Windows;
 using System.Windows.Threading;
@@ -118,6 +118,7 @@ public sealed class MainWindowViewModel : ObservableObject
         _sessionManager.SystemTelemetryUpdated += OnSystemTelemetryUpdated;
         _sessionManager.GpuTelemetryUpdated += OnGpuTelemetryUpdated;
         _sessionManager.GpuProcessMemoryUpdated += OnGpuProcessMemoryUpdated;
+        _sessionManager.LiveVramUpdated += OnLiveVramUpdated;
         _sessionManager.CaptureHealthUpdated += OnCaptureHealthUpdated;
         _sessionManager.FramePacingWindowCompleted += OnFramePacingWindowCompleted;
 
@@ -144,6 +145,16 @@ public sealed class MainWindowViewModel : ObservableObject
     public ObservableCollection<IncidentRecord> Incidents { get; } = [];
 
     public ObservableCollection<DiagnosticStatusEntry> StatusEntries { get; } = [];
+
+    /// <summary>
+    /// Which processes hold the adapter's memory right now, largest first.
+    /// </summary>
+    /// <remarks>
+    /// The header bar names the two largest, which answers "is the card full" but not "what do I close".
+    /// This is the table behind it, and it is the reason someone would open the window mid-session: the
+    /// same question used to be answerable only by reading the process CSV the following day.
+    /// </remarks>
+    public ObservableCollection<LiveVramRowViewModel> LiveVramRows { get; } = [];
 
     public AsyncRelayCommand StartSessionCommand { get; }
 
@@ -610,6 +621,38 @@ public sealed class MainWindowViewModel : ObservableObject
         _ = _dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() => LiveVramOwnersText = text));
     }
 
+    /// <summary>
+    /// Rebuilds the live VRAM table in place.
+    /// </summary>
+    /// <remarks>
+    /// Rows are updated where they already exist rather than cleared and refilled, so a table someone is
+    /// reading does not flash and lose its scroll position every few seconds. The process set is stable
+    /// for most of a session, so the common case touches no collection membership at all.
+    /// </remarks>
+    private void OnLiveVramUpdated(object? sender, LiveVramSnapshot snapshot)
+    {
+        _ = _dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+        {
+            for (var index = 0; index < snapshot.Rows.Count; index++)
+            {
+                var row = snapshot.Rows[index];
+                if (index < LiveVramRows.Count)
+                {
+                    LiveVramRows[index].Update(row);
+                }
+                else
+                {
+                    LiveVramRows.Add(new LiveVramRowViewModel(row));
+                }
+            }
+
+            while (LiveVramRows.Count > snapshot.Rows.Count)
+            {
+                LiveVramRows.RemoveAt(LiveVramRows.Count - 1);
+            }
+        }));
+    }
+
     private void OnCaptureHealthUpdated(object? sender, CaptureHealthTelemetrySample sample)
     {
         var ready = sample.CaptureProcessRunning
@@ -787,6 +830,7 @@ public sealed class MainWindowViewModel : ObservableObject
             LiveMemoryText = Strings.LiveStatsIdle;
             LiveVramText = Strings.LiveStatsIdle;
             LiveVramOwnersText = Strings.LiveStatsIdle;
+            LiveVramRows.Clear();
 
             // Pacing figures belong to the session that produced them. The session manager builds a fresh
             // FramePacingMonitor on every start, but the view model keeps whatever it was last told —

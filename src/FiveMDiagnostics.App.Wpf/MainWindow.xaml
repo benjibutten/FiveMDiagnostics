@@ -268,6 +268,68 @@
                         </StackPanel>
                     </Border>
 
+                    <Border Style="{StaticResource PanelStyle}">
+                        <Expander Foreground="{StaticResource TextPrimaryBrush}" IsExpanded="True">
+                            <Expander.Header>
+                                <TextBlock Text="{x:Static props:Strings.LiveVramPanelHeader}" FontSize="22" FontWeight="Bold" />
+                            </Expander.Header>
+                            <StackPanel Margin="0,14,0,0">
+                                <TextBlock Text="{x:Static props:Strings.LiveVramPanelDescription}"
+                                           Foreground="{StaticResource TextMutedBrush}" TextWrapping="Wrap" Margin="0,0,0,10" />
+
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="90" />
+                                        <ColumnDefinition Width="90" />
+                                        <ColumnDefinition Width="90" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="{x:Static props:Strings.LiveVramColumnProcess}" Foreground="{StaticResource TextMutedBrush}" FontSize="12" />
+                                    <TextBlock Grid.Column="1" Text="{x:Static props:Strings.LiveVramColumnNow}" Foreground="{StaticResource TextMutedBrush}" FontSize="12" TextAlignment="Right" />
+                                    <TextBlock Grid.Column="2" Text="{x:Static props:Strings.LiveVramColumnTaken}" Foreground="{StaticResource TextMutedBrush}" FontSize="12" TextAlignment="Right" />
+                                    <TextBlock Grid.Column="3" Text="{x:Static props:Strings.LiveVramColumnPeak}" Foreground="{StaticResource TextMutedBrush}" FontSize="12" TextAlignment="Right" />
+                                </Grid>
+
+                                <ItemsControl ItemsSource="{Binding LiveVramRows}">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <Grid Margin="0,0,0,4">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="90" />
+                                                    <ColumnDefinition Width="90" />
+                                                    <ColumnDefinition Width="90" />
+                                                </Grid.ColumnDefinitions>
+                                                <StackPanel Grid.Column="0" Orientation="Horizontal">
+                                                    <TextBlock Text="{Binding ProcessName}" TextTrimming="CharacterEllipsis" />
+                                                    <TextBlock Text="{Binding NoteText}" Foreground="{StaticResource TextMutedBrush}"
+                                                               FontSize="11" Margin="8,1,0,0" />
+                                                </StackPanel>
+                                                <TextBlock Grid.Column="1" Text="{Binding NowText}" TextAlignment="Right" />
+                                                <TextBlock Grid.Column="2" Text="{Binding TakenText}" TextAlignment="Right" Foreground="{StaticResource AccentBrush}" />
+                                                <TextBlock Grid.Column="3" Text="{Binding PeakText}" TextAlignment="Right" Foreground="{StaticResource TextMutedBrush}" />
+                                            </Grid>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+
+                                <TextBlock Text="{x:Static props:Strings.LiveVramPanelEmpty}" Foreground="{StaticResource TextMutedBrush}"
+                                           TextWrapping="Wrap" Margin="0,4,0,0">
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Visibility" Value="Collapsed" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding LiveVramRows.Count}" Value="0">
+                                                    <Setter Property="Visibility" Value="Visible" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+                            </StackPanel>
+                        </Expander>
+                    </Border>
+
                     <Border Style="{StaticResource PanelStyle}" Background="{StaticResource PanelAltBrush}">
                         <Expander Foreground="{StaticResource TextPrimaryBrush}" IsExpanded="False">
                             <Expander.Header>

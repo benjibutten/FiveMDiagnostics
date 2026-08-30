@@ -138,6 +138,14 @@ public static class Strings
     public static string LiveVramFormat => ResourceManager.GetString("LiveVramFormat", Culture) ?? "{0} of {1} GB ({2}%)";
     public static string LiveVramUnavailable => ResourceManager.GetString("LiveVramUnavailable", Culture) ?? "n/a";
     public static string LiveVramOwnersLabel => ResourceManager.GetString("LiveVramOwnersLabel", Culture) ?? "Largest in VRAM:";
+    public static string LiveVramPanelHeader => ResourceManager.GetString("LiveVramPanelHeader", Culture) ?? "What is holding VRAM";
+    public static string LiveVramPanelDescription => ResourceManager.GetString("LiveVramPanelDescription", Culture) ?? "Live, refreshed with every sample. \"Taken\" is what a process has added since this session started — a program that took several hundred megabytes at once usually keeps them, and that is memory the game does not get.";
+    public static string LiveVramColumnProcess => ResourceManager.GetString("LiveVramColumnProcess", Culture) ?? "Process";
+    public static string LiveVramColumnNow => ResourceManager.GetString("LiveVramColumnNow", Culture) ?? "Now";
+    public static string LiveVramColumnTaken => ResourceManager.GetString("LiveVramColumnTaken", Culture) ?? "Taken";
+    public static string LiveVramColumnPeak => ResourceManager.GetString("LiveVramColumnPeak", Culture) ?? "Peak";
+    public static string LiveVramUntrustedNote => ResourceManager.GetString("LiveVramUntrustedNote", Culture) ?? "double counted — excluded from reports";
+    public static string LiveVramPanelEmpty => ResourceManager.GetString("LiveVramPanelEmpty", Culture) ?? "No process table yet. It appears once a session is running.";
     public static string SessionAlertsHeader => ResourceManager.GetString("SessionAlertsHeader", Culture) ?? "Needs attention";
     public static string LiveVramOwnersUnavailable => ResourceManager.GetString("LiveVramOwnersUnavailable", Culture) ?? "not measured";
 }

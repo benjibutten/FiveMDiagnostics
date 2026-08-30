@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Core;
+﻿namespace FiveMDiagnostics.Core;
 
 /// <summary>What happened when a threshold-crossing frame was offered to the incidents already open.</summary>
 public enum IncidentEscalation
@@ -139,12 +139,43 @@ public sealed class IncidentMaterializer
             escalated = open.Marker with
             {
                 Severity = severity > open.Marker.Severity ? severity : open.Marker.Severity,
-                Label = label,
+                Label = LabelWithFrameTime(label, open.Marker.MarkedAt, timestamp),
             };
 
             open.Marker = escalated;
             return IncidentEscalation.Escalated;
         }
+    }
+
+    /// <summary>
+    /// How far the escalating frame may be from the marker before the label has to say when it happened.
+    /// </summary>
+    private static readonly TimeSpan LabelTimeWorthStating = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Appends the frame's own time to the label when it is far enough from the marker to mislead.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The marker time and the window bounds have to stay where they were — moving them would slide the
+    /// window out from under the events already collected in it — so an escalated label can name a frame
+    /// most of a minute away from the timestamp printed beside it. That is tolerable on its own. What is
+    /// not is that a deep capture is triggered by the frame that <em>opened</em> the window, so the
+    /// attached trace can cover a different second entirely from the one the heading names.
+    /// </para>
+    /// <para>
+    /// The 29 August session is the case. Its largest frame, 1 049 ms, escalated an incident that had
+    /// opened 41 seconds earlier; the report went out headed "Auto: 1049 ms frame" beside a marker time
+    /// of 22:50:35 and a trace covering 22:50:11 to 22:50:39 — while the frame it names happened at
+    /// 22:51:16 and had no trace at all, its own capture having been refused by the budget. Reading that
+    /// trace against that heading costs an hour and yields a conclusion about the wrong second.
+    /// </para>
+    /// </remarks>
+    private static string LabelWithFrameTime(string label, DateTimeOffset markedAt, DateTimeOffset frameAt)
+    {
+        return (frameAt - markedAt).Duration() < LabelTimeWorthStating
+            ? label
+            : $"{label} kl. {frameAt.ToLocalTime():HH:mm:ss}";
     }
 
     public IReadOnlyList<IncidentRecord> OnTelemetry(TelemetryEvent telemetryEvent, EnvironmentMetadata environment, IReadOnlyList<ArtifactAttachment> attachments)

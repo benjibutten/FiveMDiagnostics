@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Tests;
+﻿namespace FiveMDiagnostics.Tests;
 
 using FiveMDiagnostics.Core;
 
@@ -37,7 +37,9 @@ public sealed class IncidentEscalationTests
         Assert.NotNull(escalated);
         Assert.Equal(opened.Id, escalated!.Id);
         Assert.Equal(IncidentSeverity.Severe, escalated.Severity);
-        Assert.Equal("Auto: 2846 ms frame", escalated.Label);
+        // Nine seconds from the marker, so the label has to say when the frame it names happened —
+        // otherwise a trace taken for the frame that opened the window reads as covering this one.
+        Assert.StartsWith("Auto: 2846 ms frame kl. ", escalated.Label, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -53,7 +55,7 @@ public sealed class IncidentEscalationTests
 
         var incident = Assert.Single(completed);
         Assert.Equal(IncidentSeverity.Severe, incident.Marker.Severity);
-        Assert.Equal("Auto: 2846 ms frame", incident.Marker.Label);
+        Assert.StartsWith("Auto: 2846 ms frame kl. ", incident.Marker.Label, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -87,7 +89,40 @@ public sealed class IncidentEscalationTests
 
         Assert.Equal(IncidentEscalation.Escalated, outcome);
         Assert.Equal(IncidentSeverity.Severe, escalated!.Severity);
-        Assert.Equal("Auto: 500 ms frame", escalated.Label);
+        Assert.StartsWith("Auto: 500 ms frame", escalated.Label, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A frame that escalates from close to the marker leaves the label alone. The time is there to stop
+    /// a heading being read against a trace from a different second, and a second or two apart is the
+    /// same second for that purpose — while an unconditional timestamp would put one on every label in
+    /// the app for no reader's benefit.
+    /// </summary>
+    [Fact]
+    public void AFrameEscalatingFromCloseToTheMarkerKeepsThePlainLabel()
+    {
+        var materializer = CreateMaterializer();
+        materializer.MarkIncident(Start, IncidentSeverity.Normal, "Auto: 41 ms frame", frameTimeMs: 41);
+
+        materializer.TryEscalate(Start.AddSeconds(2), IncidentSeverity.Severe, "Auto: 300 ms frame", 300, out var escalated);
+
+        Assert.Equal("Auto: 300 ms frame", escalated!.Label);
+    }
+
+    /// <summary>
+    /// The case this exists for, from the 29 August session: a 1 049 ms frame escalating a window that
+    /// opened 41 seconds before it, whose attached trace covers the opening and not the frame named.
+    /// </summary>
+    [Fact]
+    public void AFrameEscalatingFromAcrossTheWindowCarriesItsOwnTime()
+    {
+        var materializer = CreateMaterializer();
+        materializer.MarkIncident(Start, IncidentSeverity.Severe, "Auto: 92 ms frame", frameTimeMs: 92);
+
+        var frameAt = Start.AddSeconds(41);
+        materializer.TryEscalate(frameAt, IncidentSeverity.Severe, "Auto: 1049 ms frame", 1_049, out var escalated);
+
+        Assert.Equal($"Auto: 1049 ms frame kl. {frameAt.ToLocalTime():HH:mm:ss}", escalated!.Label);
     }
 
     /// <summary>

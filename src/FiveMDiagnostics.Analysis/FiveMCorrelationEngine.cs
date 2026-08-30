@@ -1497,6 +1497,60 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             && !processName.Equals("System", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// Widest gap allowed between a frame's anchored timestamp and a wait interval's wall clock before
+    /// the two are treated as unrelated.
+    /// </summary>
+    /// <remarks>
+    /// PresentMon reports frame times relative to its own trace, and the collector recovers wall clock
+    /// as <c>min(readUtc - relativeMs)</c> across every row it has seen. That estimator can only ever be
+    /// late: <c>readUtc</c> is taken after PresentMon buffered the row, wrote it, and the poll loop
+    /// picked it up, so the anchor carries the smallest pipeline latency of the session as a permanent
+    /// bias. The ETL's timestamps have no such offset, and the two clocks therefore disagree by roughly
+    /// that latency.
+    /// <para>
+    /// The bias is measured, not assumed. On the 29 August session six incidents carried both a marker
+    /// (an anchored frame timestamp) and a trace naming the wait behind it, and the marker ran
+    /// <b>1.17 to 1.32 seconds late</b> against the ETL every time. The gate this replaces allowed
+    /// 50 ms, so it rejected all six, and the engine has never once ranked
+    /// <see cref="RootCauseCategory.FiveMThreadWait"/> in the field across nine sessions - while the
+    /// reports kept concluding <see cref="RootCauseCategory.FiveMResourceSpike"/> from
+    /// <c>MsCPUBusy</c> for frames the attached trace showed the thread sleeping through. Three seconds
+    /// covers the measured skew several times over and still rejects a wait from elsewhere in a
+    /// retained ring buffer, which can hold an hour.
+    /// </para>
+    /// </remarks>
+    private const double AnchorSkewToleranceMs = 3_000;
+
+    /// <summary>
+    /// How closely a wait has to account for a frame's lost time to be accepted as its explanation.
+    /// </summary>
+    /// <remarks>
+    /// This is what carries the match now that the clocks alone cannot, and it is much the stronger
+    /// signal of the two. Measured against the 29 August traces, every wait that genuinely caused its
+    /// frame lands within a few percent of the time that frame lost: 245.8 ms of wait against 245 ms of
+    /// lost frame, 250.0 against 249, 197.2 against 199, 120.9 against 122, 120.7 against 110, 117.7
+    /// against 119. The one trace in that session whose frame was <em>not</em> a wait - the 252 ms
+    /// hitch at 01:41 where <c>adhesive.dll</c> held 3.58 cores across four threads - lands at 71.4 ms
+    /// against 235 ms of lost frame and is rejected here, which is the correct verdict for it.
+    /// </remarks>
+    private const double MinimumWaitShareOfLostFrame = 0.5;
+
+    /// <summary>
+    /// Upper bound of the same match. A wait far longer than the frame lost belongs to another frame, or
+    /// to a thread that slept through several of them.
+    /// </summary>
+    private const double MaximumWaitShareOfLostFrame = 1.5;
+
+    /// <summary>
+    /// Finds the off-CPU interval in an attached trace that explains a slow frame in this window.
+    /// </summary>
+    /// <remarks>
+    /// Matching is on duration first and on the clock second, because the two instruments do not share
+    /// a clock (see <see cref="AnchorSkewToleranceMs"/>). A wait qualifies when it falls near the frame
+    /// in absolute time <b>and</b> accounts for a decisive share of what that frame lost, and the best
+    /// match is the one whose duration comes closest to the loss rather than simply the longest one.
+    /// </remarks>
     private static CorrelatedThreadWait? FindCorrelatedThreadWait(
         IReadOnlyList<ArtifactEvidence> artifacts,
         IReadOnlyList<FrameTelemetrySample> frameSamples,
@@ -1510,7 +1564,11 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             return null;
         }
 
-        var matches = new List<CorrelatedThreadWait>();
+        // What a frame lost is what a wait has to account for. Comparing against the whole frame time
+        // instead would ask the wait to explain the 16.7 ms the frame was always going to take.
+        var baseline = metrics.BaselineFrameTime > 0 ? metrics.BaselineFrameTime : 1000d / 60;
+
+        var matches = new List<(CorrelatedThreadWait Wait, double Mismatch, List<int> Frames)>();
         foreach (var trace in artifacts.Where(item => item.Kind == ArtifactKind.EtlTrace))
         {
             var count = (int)trace.Metrics.GetValueOrDefault("gameThreadWaitIntervalCount");
@@ -1525,38 +1583,55 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                     continue;
                 }
 
-                // PresentMon timestamps the beginning of the frame-side work. Fifty milliseconds of
-                // clock/anchor tolerance is enough for batching without allowing an unrelated wait
-                // several seconds earlier in the retained ETL to become the incident's explanation.
-                //
-                // How much of the slow frames the wait actually covers is kept, not just whether it
-                // touched one. A window is ninety seconds and can hold several unrelated causes; a wait
-                // that overlaps one frame by a millisecond is not a reason to discount the attribution
-                // for all of them, and treating it as one hid whatever else was in the window.
-                var overlapMs = 0d;
-                foreach (var frame in slowFrames)
+                // The comparison is against every slow frame the wait could have caused, not against
+                // each one separately. A thread off the processor for 1.7 seconds stops presents for
+                // 1.7 seconds, and PresentMon may report that as one long frame or as several — so a
+                // wait has to be allowed to account for the sum of the frames it spans. Matching frame
+                // by frame instead would reject exactly the case where one wait explains the whole
+                // window, which is the clearest evidence the trace can offer.
+                var lostMs = 0d;
+                var matchedFrames = new List<int>();
+                for (var frameIndex = 0; frameIndex < slowFrames.Length; frameIndex++)
                 {
-                    var frameStart = frame.Timestamp.ToUnixTimeMilliseconds() - 50;
-                    var frameEnd = frame.Timestamp.ToUnixTimeMilliseconds() + frame.FrameTimeMs + 50;
-                    var overlap = Math.Min(end, frameEnd) - Math.Max(start, frameStart);
-                    if (overlap > 0)
+                    var frame = slowFrames[frameIndex];
+                    var frameLostMs = frame.FrameTimeMs - baseline;
+                    if (frameLostMs <= 0)
                     {
-                        overlapMs += overlap;
+                        continue;
+                    }
+
+                    var frameStart = frame.Timestamp.ToUnixTimeMilliseconds();
+                    var frameEnd = frameStart + frame.FrameTimeMs;
+                    var gapMs = Math.Max(0, Math.Max(start - frameEnd, frameStart - end));
+                    if (gapMs <= AnchorSkewToleranceMs)
+                    {
+                        lostMs += frameLostMs;
+                        matchedFrames.Add(frameIndex);
                     }
                 }
 
-                if (overlapMs > 0)
+                if (lostMs <= 0)
                 {
-                    matches.Add(new CorrelatedThreadWait(
+                    continue;
+                }
+
+                var share = duration / lostMs;
+                if (share < MinimumWaitShareOfLostFrame || share > MaximumWaitShareOfLostFrame)
+                {
+                    continue;
+                }
+
+                matches.Add((
+                    new CorrelatedThreadWait(
                         threadId,
                         duration,
                         trace.Metrics.GetValueOrDefault($"gameThreadWait{index}UserRequest") >= 0.5,
 
-                        // Frames can overlap each other after the tolerance is applied, so the summed
-                        // overlap is clamped to the wait itself: a thread cannot be off the processor
-                        // for longer than it was off the processor.
-                        Math.Min(overlapMs, duration)));
-                }
+                        // A thread cannot be off the processor for longer than it was off the
+                        // processor, however many frames its absence turned up in.
+                        Math.Min(lostMs, duration)),
+                    Math.Abs(1 - share),
+                    matchedFrames));
             }
         }
 
@@ -1565,12 +1640,34 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             return null;
         }
 
-        // The longest wait names the incident, but every matched wait counts towards how much of the
-        // window's lost time is accounted for by waiting. Two 300 ms waits explain a 600 ms hole; the
-        // longest of them alone explains half of it.
-        return matches
-            .OrderByDescending(wait => wait.DurationMs)
-            .First() with { OverlappingSlowFrameMs = matches.Sum(wait => wait.OverlappingSlowFrameMs) };
+        // The wait that best accounts for its own frame names the incident; every matched wait counts
+        // towards how much of the window's lost time waiting explains. Two 300 ms waits explain a 600 ms
+        // hole, and the best of them alone explains half of it.
+        var best = matches
+            .OrderBy(match => match.Mismatch)
+            .ThenByDescending(match => match.Wait.DurationMs)
+            .First()
+            .Wait;
+
+        // Bounded from both sides, because neither bound holds on its own. Waiting cannot explain more
+        // milliseconds than the thread spent waiting, and it cannot explain more than the frames it
+        // landed on actually lost. The second is what the plain sum got wrong: the waits come from one
+        // thread and so cannot overlap each other, but the skew tolerance is wide enough that several of
+        // them land on the same slow frame, and each was then credited with that frame's whole loss. Two
+        // 250 ms waits either side of one frame that lost 300 ms claimed 500 of it — against a
+        // denominator of CPU-bound spike time that <see cref="CorrelatedThreadWait.Contradicts"/> takes
+        // a share of, so the overcount could discard a correct attribution.
+        var coveredFrames = new HashSet<int>();
+        var waitedMs = 0d;
+        foreach (var match in matches)
+        {
+            coveredFrames.UnionWith(match.Frames);
+            waitedMs += match.Wait.DurationMs;
+        }
+
+        var coveredLostMs = coveredFrames.Sum(index => slowFrames[index].FrameTimeMs - baseline);
+
+        return best with { OverlappingSlowFrameMs = Math.Min(waitedMs, coveredLostMs) };
     }
 
     private static bool IsKnownOverlayOrHook(string processName)
@@ -1712,7 +1809,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
     /// A wait from the trace that lands on the window's slow frames.
     /// </summary>
     /// <param name="OverlappingSlowFrameMs">
-    /// How much of the slow frames this wait actually covers, summed across every matched wait. This is
+    /// How much of the slow frames waiting actually covers, across every matched wait and counting no
+    /// frame's loss twice however many waits landed on it. This is
     /// what decides whether the wait contradicts the window's CPU attribution or merely coincides with
     /// part of it — a ninety second window can hold more than one cause, and a wait that overlaps one
     /// frame by a millisecond is not a reason to discount the attribution for all of them.

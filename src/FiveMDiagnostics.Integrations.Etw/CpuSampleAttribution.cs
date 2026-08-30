@@ -353,7 +353,7 @@ internal sealed record CpuAttributionSummary(
     public string Describe()
     {
         var modules = BusiestThreadModules.Count > 0
-            ? " – " + string.Join(", ", BusiestThreadModules.Select(item => $"{item.Share:P0} {item.Module}"))
+            ? " – " + string.Join(", ", BusiestThreadModules.Select(item => $"{item.Share:P0} {ModuleGlossary.Annotate(item.Module)}"))
             : string.Empty;
 
         return $"CPU-sampling: {TotalCores:F2} kärnor upptagna totalt. {SubjectProcess} höll {SubjectProcessCores:F2} kärnor, "

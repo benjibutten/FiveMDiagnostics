@@ -950,7 +950,23 @@ public sealed record EnvironmentMetadata(
     bool ObsDetectedAtStart,
     string ServerProfileName,
     DateTimeOffset SessionStartedAt,
-    DateTimeOffset? SessionEndedAt);
+    DateTimeOffset? SessionEndedAt,
+    IReadOnlyList<AttachedDisplay>? Displays = null);
+
+/// <summary>One display attached when the session started.</summary>
+/// <remarks>
+/// The session already recorded the primary display's refresh rate, and that was not enough. What
+/// mattered on this machine was the <em>relationship</em> between two displays: a 120 Hz primary beside
+/// a 60 Hz secondary forced DWM to resample the game's window every frame, and one frame in nine
+/// reached the screen a refresh early or late for eight sessions running. A single number cannot say
+/// that, so the whole set is kept.
+/// </remarks>
+public sealed record AttachedDisplay(
+    string DeviceName,
+    double RefreshRateHz,
+    int Width,
+    int Height,
+    bool IsPrimary);
 
 /// <summary>
 /// A process the diagnostics session is following.
