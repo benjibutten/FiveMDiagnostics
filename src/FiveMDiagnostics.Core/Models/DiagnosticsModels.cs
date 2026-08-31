@@ -675,6 +675,20 @@ public sealed record DeepCaptureOptions
         + TimeSpan.FromSeconds(30);
 
     /// <summary>
+    /// Spacing an extreme frame still has to clear: the previous capture finishing its write, without
+    /// the time the ring buffer needs to fill again.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="MinimumOverrideCooldown"/> minus the refill. The refill is what makes a capture
+    /// <em>good</em>; the tail and the thirty seconds <c>wpr -stop</c> takes to write the file are what
+    /// make one <em>possible</em>, and only the second is a hard constraint. Four sessions running have
+    /// lost their largest frame to the first — 356 ms at 20:23:50 on 31 August, refused with 43 s of
+    /// refill left, in the opening ten minutes where the buffer never catches up — and a trace holding
+    /// eight seconds of run-up would have explained it, while no trace explains nothing.
+    /// </remarks>
+    public TimeSpan ExtremeCaptureSpacing => PostMarkerTail + TimeSpan.FromSeconds(30);
+
+    /// <summary>
     /// Whether a frame is catastrophic enough to spend budget the ordinary cooldown would have withheld.
     /// </summary>
     /// <remarks>

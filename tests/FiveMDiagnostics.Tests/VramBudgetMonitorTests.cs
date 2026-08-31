@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Tests;
+﻿namespace FiveMDiagnostics.Tests;
 
 using FiveMDiagnostics.Core;
 
@@ -58,6 +58,10 @@ public sealed class VramBudgetMonitorTests
     /// The one term that moves during an evening, and it moves by a gigabyte. The session of 28 August
     /// only learned what the stream stack cost because OBS happened to close while the app was running.
     /// </summary>
+    /// <remarks>
+    /// Stated on the third agreeing sample, not the first. See
+    /// <see cref="AFlickeringStreamRowProducesNoTransition"/> for what the first one used to cost.
+    /// </remarks>
     [Fact]
     public void ClosingTheStreamStackRestatesTheBudget()
     {
@@ -65,13 +69,102 @@ public sealed class VramBudgetMonitorTests
         monitor.Observe(Adapter(Start, usedGigabytes: 8.37));
         monitor.Observe(Sample(Start, gameGigabytes: 6.32, obsGigabytes: 1.02));
 
-        var later = Start.AddHours(4);
-        monitor.Observe(Adapter(later, usedGigabytes: 7.29));
-        var report = monitor.Observe(Sample(later, gameGigabytes: 6.12, obsGigabytes: 0));
+        VramBudgetReport? report = null;
+        for (var index = 1; index <= 3; index++)
+        {
+            var at = Start.AddHours(4).AddSeconds(index * 5);
+            monitor.Observe(Adapter(at, usedGigabytes: 7.29));
+            report = monitor.Observe(Sample(at, gameGigabytes: 6.12, obsGigabytes: 0));
+
+            // The first two samples agree with each other and not yet with the reported state.
+            Assert.Equal(index == 3, report is not null);
+        }
 
         Assert.NotNull(report);
         Assert.Contains("Streamstacken avslutades", report!.Message, StringComparison.Ordinal);
         Assert.Equal(1.17, report.DesktopBytes / (double)Gigabyte, 2);
+    }
+
+    /// <summary>
+    /// Eighteen "the stream stack started/stopped" lines were written between 21:48 and 22:04 on an
+    /// evening when OBS neither started nor stopped. The row was alternating between believable and
+    /// excluded, and every flip restated the budget as though a gigabyte had moved.
+    /// </summary>
+    [Fact]
+    public void AFlickeringStreamRowProducesNoTransition()
+    {
+        var monitor = new VramBudgetMonitor();
+        monitor.Observe(Adapter(Start, usedGigabytes: 8.37));
+        Assert.NotNull(monitor.Observe(Sample(Start, gameGigabytes: 6.32, obsGigabytes: 1.02)));
+
+        for (var index = 1; index <= 18; index++)
+        {
+            var at = Start.AddSeconds(index * 5);
+            monitor.Observe(Adapter(at, usedGigabytes: 8.37));
+
+            var sample = Sample(at, gameGigabytes: 6.32, obsGigabytes: 1.02);
+            var flickering = index % 2 == 0
+                ? sample with { DoubleCountedProcessIds = [9012] }
+                : sample;
+
+            Assert.Null(monitor.Observe(flickering));
+        }
+    }
+
+    /// <summary>
+    /// An excluded row must not take its memory out of the budget with it. This is the line that said
+    /// "the game has 8.1 GB left of the card's 10.0" while the card stood at 88–92%: obs64 was excluded
+    /// as double counting, so the stream stack was booked at nothing and the gigabyte it held silently
+    /// became headroom.
+    /// </summary>
+    [Fact]
+    public void AnExcludedStreamRowIsReplacedByTheDifferenceTheCardRequires()
+    {
+        var monitor = new VramBudgetMonitor();
+        monitor.Observe(Adapter(Start, usedGigabytes: 8.37));
+
+        var sample = Sample(Start, gameGigabytes: 6.32, obsGigabytes: 1.02) with
+        {
+            DoubleCountedProcessIds = [9012],
+        };
+
+        var report = monitor.Observe(sample);
+
+        Assert.NotNull(report);
+
+        // The card says 2.05 GB is not the game's, and explorer accounts for 0.17 of it. The rest has
+        // to be somewhere, and the somewhere is the process whose own counter cannot be read.
+        Assert.Equal(0.17, report!.DesktopBytes / (double)Gigabyte, 2);
+        Assert.Equal(1.88, report.StreamStackBytes / (double)Gigabyte, 2);
+        Assert.True(report.StreamStackDerived);
+        Assert.Contains("kan inte mätas per process", report.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Whatever the table says, the room left is the card's own figure. This is the invariant that would
+    /// have caught the wrong line on its own.
+    /// </summary>
+    [Fact]
+    public void TheBudgetNeverReportsMoreRoomThanTheCardHasLeft()
+    {
+        var monitor = new VramBudgetMonitor();
+        monitor.Observe(Adapter(Start, usedGigabytes: 9.21));
+
+        // A table that has lost most of its rows: only the game and a sliver of desktop are believable,
+        // so a budget built from the table alone would report the missing memory as free.
+        var sample = Sample(Start, gameGigabytes: 6.90, obsGigabytes: 1.30) with
+        {
+            DoubleCountedProcessIds = [9012],
+        };
+
+        var report = monitor.Observe(sample);
+
+        Assert.NotNull(report);
+        Assert.Equal(0.79, report!.FreeBytes / (double)Gigabyte, 2);
+        Assert.Equal(
+            report.FreeBytes,
+            report.GameHeadroomBytes - report.GameBytes);
+        Assert.True(report.GameHeadroomBytes - report.GameBytes <= report.AdapterTotalBytes - report.AdapterUsedBytes);
     }
 
     /// <summary>

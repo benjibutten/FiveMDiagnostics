@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Tests;
+﻿namespace FiveMDiagnostics.Tests;
 
 using FiveMDiagnostics.Core;
 
@@ -88,9 +88,16 @@ public sealed class AutoDeepCaptureBudgetTests
     /// the work here and the cooldown only has to collapse what gets past it. The two large frames sit
     /// 25 s apart because that is the measured spacing of the pair that closed the 25 August session —
     /// 384 ms at 01:21:04 and 778 ms at 01:21:29.
+    /// <para>
+    /// Two captures, not one, and the second is the point. The first goes to the 180 ms frame that opens
+    /// the cluster; the second to a 606 ms frame 45 s later, which is extreme enough to be traced against
+    /// a ring buffer that has not refilled. Four notes running recorded an evening's largest frame lost
+    /// to exactly that wait. Twenty-one of the twenty-three still spend nothing, which is what this test
+    /// is about.
+    /// </para>
     /// </remarks>
     [Fact]
-    public void ABurstSpendsOneCaptureNotTwenty()
+    public void ABurstSpendsTwoCapturesNotTwenty()
     {
         var budget = new AutoDeepCaptureBudget(Options());
         var timestamp = Start;
@@ -101,7 +108,85 @@ public sealed class AutoDeepCaptureBudgetTests
             timestamp = timestamp.AddSeconds(5);
         }
 
+        Assert.Equal(2, budget.Spent);
+    }
+
+    /// <summary>
+    /// The frame that has been missed four sessions running: the evening's largest, in the opening ten
+    /// minutes, refused because the ring buffer had not refilled after a capture taken for something
+    /// smaller.
+    /// </summary>
+    /// <remarks>
+    /// 356 ms at 20:23:50 on 31 August, refused with "43 s left before the ring buffer has refilled".
+    /// Half a buffer holds several seconds of run-up; no trace holds none, and the frame is not coming
+    /// back. What it still waits for is the previous capture finishing its own file.
+    /// </remarks>
+    [Fact]
+    public void AnExtremeFrameIsTracedAgainstAHalfFilledBuffer()
+    {
+        var budget = new AutoDeepCaptureBudget(Options());
+
+        Assert.True(budget.TryReserve(Start, frameTimeMs: 160, out _));
+
+        // Inside the 60 s refill spacing, and past the seconds the previous capture needs to write.
+        Assert.True(budget.TryReserve(Start.AddSeconds(40), frameTimeMs: 356, out var refusal));
+        Assert.Null(refusal);
+        Assert.Equal(2, budget.Spent);
+
+        // But not while that file is still being written.
+        Assert.False(budget.TryReserve(Start.AddSeconds(45), frameTimeMs: 420, out refusal));
+        Assert.Contains("skrivit klart", refusal!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And the same frame time cannot do it twice. A bad patch of 900 ms frames is one phenomenon, and
+    /// the trace already on disk describes it as well as a half-filled one would.
+    /// </summary>
+    [Fact]
+    public void ARepeatOfTheSameCatastropheWaitsForTheBuffer()
+    {
+        var budget = new AutoDeepCaptureBudget(Options());
+
+        Assert.True(budget.TryReserve(Start, frameTimeMs: 900, out _));
+        Assert.False(budget.TryReserve(Start.AddSeconds(40), frameTimeMs: 900, out var refusal));
+
+        Assert.Contains("ringbufferten", refusal!, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(1, budget.Spent);
+    }
+
+    /// <summary>
+    /// The exception follows the session's own frames down as well as up.
+    /// </summary>
+    /// <remarks>
+    /// Four notes have recorded the same failure: the constant sits at 250 ms, the evening's largest
+    /// frames come in below it, and the exception turns them away while the budget still holds unspent
+    /// captures. On 31 August that was a 235 ms frame — the evening's second largest — refused by ten
+    /// minutes of cooldown. Three an hour is what bounds the lowering: the level is where three frames
+    /// an hour actually reach, so it can never admit more than the budget was sized for.
+    /// </remarks>
+    [Fact]
+    public void TheExceptionFollowsTheSessionsOwnFramesDownwards()
+    {
+        var budget = new AutoDeepCaptureBudget(CooldownOnlyOptions());
+
+        // Two hours of an evening whose largest frames are 160–235 ms: six frames at three an hour, so
+        // the level is the sixth largest rather than the 250 ms constant.
+        var timestamp = Start;
+        foreach (var frameTimeMs in new[] { 235d, 220, 205, 190, 175, 160 })
+        {
+            budget.Observe(timestamp, frameTimeMs);
+            timestamp = timestamp.AddMinutes(20);
+        }
+
+        Assert.True(budget.EffectiveOverrideFrameTimeMs < 250);
+        Assert.True(budget.EffectiveOverrideFrameTimeMs >= budget.EffectiveFrameTimeMs * 1.25);
+
+        Assert.True(budget.TryReserve(Start, frameTimeMs: 300, out _));
+
+        // Five minutes later: deep inside the ten minute cooldown, and past the 60 s refill.
+        Assert.True(budget.TryReserve(Start.AddMinutes(5), frameTimeMs: 235, out var refusal));
+        Assert.Null(refusal);
+        Assert.Equal(2, budget.Spent);
     }
 
     [Fact]

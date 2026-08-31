@@ -25,6 +25,15 @@ namespace FiveMDiagnostics.Core;
 /// budget built by adding its rows together would inherit that error whole. The subtraction cannot: it
 /// rests on the adapter's total, which is the one figure nothing in the table can inflate.
 /// </para>
+/// <para>
+/// Every figure is reconciled against the card before it is stated, and that is the fix for the worst
+/// thing this class has done. On the evening of 30 August it wrote "the game has 8.1 GB left of the
+/// card's 10.0" while the card itself stood at 88–92%, because excluding a double-counting row removed
+/// it from the budget as well as from the top list: the stream stack was booked at 0.1 GB instead of
+/// about 1.3, and the difference silently became headroom. An excluded row now leaves the budget with a
+/// hole the card's own figure fills — see <see cref="Observe(GpuProcessMemorySample)"/> — and the free
+/// space reported can never exceed total minus what the card says is used, whatever the table claims.
+/// </para>
 /// </remarks>
 public sealed class VramBudgetMonitor
 {
@@ -45,11 +54,28 @@ public sealed class VramBudgetMonitor
     /// </summary>
     private const ulong MaterialHiddenBytes = 64UL * 1024 * 1024;
 
+    /// <summary>
+    /// Consecutive process samples the stream stack has to hold a state before a change is written.
+    /// </summary>
+    /// <remarks>
+    /// The threshold above stops a launch flickering; it does nothing about a row that alternates
+    /// between believable and excluded, which is what actually happened. Eighteen "the stream stack
+    /// started/stopped" lines were written between 21:48 and 22:04 on an evening when OBS neither
+    /// started nor stopped, and each of them restated the budget as though a gigabyte had moved. Three
+    /// samples at the five second process cadence is fifteen seconds of agreement — far shorter than
+    /// any real transition, and long enough that a single odd sample cannot produce a line.
+    /// </remarks>
+    private const int StableSamplesForTransition = 3;
+
     private static readonly TimeSpan AdapterFreshness = TimeSpan.FromSeconds(10);
 
     private GpuTelemetrySample? _lastAdapter;
     private bool _reported;
     private bool _streamStackPresent;
+
+    /// <summary>The state the recent samples agree on, which becomes the reported one once it holds.</summary>
+    private bool _candidatePresent;
+    private int _candidateSamples;
 
     /// <summary>Notes the most recent adapter reading, which the next process table is measured against.</summary>
     /// <remarks>
@@ -74,9 +100,19 @@ public sealed class VramBudgetMonitor
     /// Returns the budget line when it is worth writing, and null otherwise.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Written once at the start, and again whenever the stream stack starts or stops — which is the
     /// only term of the three that changes during an evening, and changes by a gigabyte when it does.
     /// Everything else is a constant the session is spent inside.
+    /// </para>
+    /// <para>
+    /// The split is against the card, never against the table alone. An excluded row is excluded from
+    /// the top lists because its number cannot be believed, and the mistake was to let that exclusion
+    /// remove the memory as well: the process still holds whatever it holds, the card is still counting
+    /// it, and dropping the row silently moved that memory into the game's headroom. So a stream stack
+    /// that cannot be measured per process is measured by difference instead — desktop from the rows
+    /// that can still be believed, and everything the card says is missing booked onto the stack.
+    /// </para>
     /// </remarks>
     public VramBudgetReport? Observe(GpuProcessMemorySample sample)
     {
@@ -100,8 +136,6 @@ public sealed class VramBudgetMonitor
             return null;
         }
 
-        var streamBytes = believable.Where(IsStreamStack).Aggregate(0UL, (total, process) => total + process.DedicatedBytes);
-
         // The table is cut to the largest holders, and the stream stack is several processes of which
         // the browser sources are small enough to fall under a low cut. What that costs is the split
         // rather than the budget: the desktop figure is a residual, so a stream row below the cut is
@@ -114,30 +148,66 @@ public sealed class VramBudgetMonitor
         // counting cannot reach it. Floored because the two collectors sample at different instants and
         // a game that grew between them would otherwise produce a negative desktop.
         var otherBytes = usedBytes > gameBytes ? usedBytes - gameBytes : 0;
-        var desktopBytes = otherBytes > streamBytes ? otherBytes - streamBytes : 0;
 
-        var streamPresent = streamBytes >= StreamStackPresentBytes;
-        if (_reported && streamPresent == _streamStackPresent)
+        var streamMeasuredBytes = believable.Where(IsStreamStack).Aggregate(0UL, (total, process) => total + process.DedicatedBytes);
+
+        // A stream process whose row has been proved to double count cannot be measured, and must not
+        // therefore be measured as zero. This is the case that produced the wrong headroom figure.
+        var streamUnmeasurable = sample.UnbelievableProcesses.Any(IsStreamStack);
+
+        ulong streamBytes;
+        ulong desktopBytes;
+        if (streamUnmeasurable)
+        {
+            var desktopMeasured = believable
+                .Where(process => !IsGame(process) && !IsStreamStack(process))
+                .Aggregate(hiddenBytes, (total, process) => total + process.DedicatedBytes);
+
+            desktopBytes = Math.Min(desktopMeasured, otherBytes);
+            streamBytes = otherBytes - desktopBytes;
+        }
+        else
+        {
+            streamBytes = Math.Min(streamMeasuredBytes, otherBytes);
+            desktopBytes = otherBytes - streamBytes;
+        }
+
+        var transition = TrackStreamStack(streamUnmeasurable ? null : streamMeasuredBytes >= StreamStackPresentBytes);
+        if (_reported && transition is null)
         {
             return null;
         }
 
-        var transition = _reported
-            ? streamPresent ? "Streamstacken startade. " : "Streamstacken avslutades. "
-            : string.Empty;
-
         _reported = true;
-        _streamStackPresent = streamPresent;
 
-        // What the game may still grow into, which is the number the graphics preset is chosen against.
+        // What the card itself says is unspent. Nothing derived from the process table is allowed to
+        // exceed it: the line below is what a texture setting is chosen against, and on the evening
+        // this was written for it said there were eight gigabytes free while the card was at 92%.
+        var freeNowBytes = totalBytes > usedBytes ? totalBytes - usedBytes : 0;
+
+        // What the game may still grow into: what it holds now plus what the card has left. Written as
+        // a subtraction from the total as well, and the smaller of the two wins, so a table that has
+        // lost a row cannot inflate it.
         var reservedBytes = desktopBytes + streamBytes;
-        var headroomBytes = totalBytes > reservedBytes ? totalBytes - reservedBytes : 0;
+        var headroomBytes = Math.Min(
+            totalBytes > reservedBytes ? totalBytes - reservedBytes : 0,
+            gameBytes + freeNowBytes);
 
         var message =
             $"{transition}VRAM-budget: skrivbordet håller {Gigabytes(desktopBytes)} och streamstacken "
-            + $"{Gigabytes(streamBytes)}, så spelet har {Gigabytes(headroomBytes)} kvar av kortets "
-            + $"{Gigabytes(totalBytes)} och håller nu {Gigabytes(gameBytes)}. Spelets tak sätts av "
-            + "texturinställningen; utrymme för ett steg upp tas ur de två första posterna, inte ur kortet.";
+            + $"{Gigabytes(streamBytes)}. Spelet håller nu {Gigabytes(gameBytes)} och kan växa till "
+            + $"{Gigabytes(headroomBytes)}; kortet rapporterar {Gigabytes(usedBytes)} av "
+            + $"{Gigabytes(totalBytes)} använt, alltså {Gigabytes(freeNowBytes)} ledigt just nu. "
+            + "Spelets tak sätts av texturinställningen; utrymme för ett steg upp tas ur de två första "
+            + "posterna, inte ur kortet.";
+
+        if (streamUnmeasurable)
+        {
+            message +=
+                $" Streamstacken kan inte mätas per process (räknaren är trasig och raden är utesluten); "
+                + $"enligt kortet saknas {Gigabytes(streamBytes)} efter skrivbordet och de bokförs på "
+                + "streamstacken.";
+        }
 
         if (hiddenBytes >= MaterialHiddenBytes)
         {
@@ -146,7 +216,68 @@ public sealed class VramBudgetMonitor
                 + "skrivbord; höj Gpu.ProcessMemoryTopCount om uppdelningen ska stämma på posten.";
         }
 
-        return new VramBudgetReport(message, desktopBytes, streamBytes, gameBytes, headroomBytes, totalBytes);
+        return new VramBudgetReport(
+            message,
+            desktopBytes,
+            streamBytes,
+            gameBytes,
+            headroomBytes,
+            totalBytes,
+            usedBytes,
+            freeNowBytes,
+            streamUnmeasurable);
+    }
+
+    /// <summary>
+    /// Follows the stream stack's state, returning the sentence that opens the line when it has really
+    /// changed and null when there is nothing to report.
+    /// </summary>
+    /// <param name="present">
+    /// What this sample observed, or null when the stack's rows cannot be believed and the sample
+    /// therefore observed nothing. A broken row is not evidence that the stack stopped, which is exactly
+    /// the mistake that produced eighteen transitions in sixteen minutes.
+    /// </param>
+    private string? TrackStreamStack(bool? present)
+    {
+        if (present is not { } observed)
+        {
+            // Hold. The state stands until something that can be measured disagrees with it.
+            _candidateSamples = 0;
+            return _reported ? null : string.Empty;
+        }
+
+        if (!_reported)
+        {
+            // The first line states the budget rather than a change, so it is not held back: there is
+            // no previous state for it to flap against.
+            _streamStackPresent = observed;
+            _candidatePresent = observed;
+            _candidateSamples = 1;
+            return string.Empty;
+        }
+
+        if (observed == _streamStackPresent)
+        {
+            _candidatePresent = observed;
+            _candidateSamples = 0;
+            return null;
+        }
+
+        if (observed != _candidatePresent)
+        {
+            _candidatePresent = observed;
+            _candidateSamples = 1;
+            return null;
+        }
+
+        if (++_candidateSamples < StableSamplesForTransition)
+        {
+            return null;
+        }
+
+        _streamStackPresent = observed;
+        _candidateSamples = 0;
+        return observed ? "Streamstacken startade. " : "Streamstacken avslutades. ";
     }
 
     /// <summary>
@@ -185,10 +316,21 @@ public sealed class VramBudgetMonitor
 }
 
 /// <summary>One statement of what the card's memory is committed to before the game asks for any.</summary>
+/// <param name="AdapterUsedBytes">What the card itself reports as used, which every figure above answers to.</param>
+/// <param name="FreeBytes">
+/// Total minus the card's own used figure. The budget may never report more room than this, however the
+/// per-process table splits it.
+/// </param>
+/// <param name="StreamStackDerived">
+/// True when the stream stack was measured by difference because its own rows could not be believed.
+/// </param>
 public sealed record VramBudgetReport(
     string Message,
     ulong DesktopBytes,
     ulong StreamStackBytes,
     ulong GameBytes,
     ulong GameHeadroomBytes,
-    ulong AdapterTotalBytes);
+    ulong AdapterTotalBytes,
+    ulong AdapterUsedBytes,
+    ulong FreeBytes,
+    bool StreamStackDerived);

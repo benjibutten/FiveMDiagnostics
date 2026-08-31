@@ -53,6 +53,23 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private LiveVramTracker? _liveVram;
     private DisplayCadenceMonitor? _displayCadence;
     private CaptureCostMonitor? _captureCost;
+    private VramPressureBandMonitor? _vramPressure;
+    private SlowFrameWaitProfile? _slowFrameWaits;
+    private IncidentVerdictTally? _verdicts;
+    private GameGraphicsSettingsMonitor? _gameSettings;
+
+    /// <summary>
+    /// When the graphics settings file is next re-read.
+    /// </summary>
+    /// <remarks>
+    /// Read and written only from the finalize loop, which is a single task. The check exists because
+    /// this machine is switched off rather than stopped: anything written only at session end is
+    /// written on one evening in ten.
+    /// </remarks>
+    private DateTimeOffset _nextGameSettingsCheck = DateTimeOffset.MaxValue;
+
+    /// <summary>How often the graphics settings file is compared against what the session started with.</summary>
+    private static readonly TimeSpan GameSettingsCheckInterval = TimeSpan.FromMinutes(5);
 
     /// <summary>
     /// Trace evidence that arrived before the incident it belongs to had been published.
@@ -224,6 +241,9 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _captureCost = new CaptureCostMonitor(Environment?.DisplayRefreshRateHz);
             _vramAccounting = new VramAccountingMonitor();
             _vramBudget = new VramBudgetMonitor();
+            _vramPressure = new VramPressureBandMonitor(Environment?.DisplayRefreshRateHz);
+            _slowFrameWaits = new SlowFrameWaitProfile();
+            _verdicts = new IncidentVerdictTally();
             _liveVram = new LiveVramTracker();
 
             // A capture whose incident never published — the session was stopped while it was still
@@ -278,8 +298,13 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         }
 
         // Every comparison so far has been made against a remembered setting. Silent when the file is
-        // not where it is looked for, which costs nothing that was not already missing.
-        if (GameGraphicsSettingsReader.Describe() is { } graphics)
+        // not where it is looked for, which costs nothing that was not already missing. The session
+        // start is passed in so the line can say whether the file predates it, which is the difference
+        // between "these are the settings" and "these are the settings from some evening in August".
+        var sessionStartedAt = DateTimeOffset.UtcNow;
+        _gameSettings = new GameGraphicsSettingsMonitor(sessionStartedAt);
+        _nextGameSettingsCheck = sessionStartedAt + GameSettingsCheckInterval;
+        if (_gameSettings.DescribeInitial() is { } graphics)
         {
             Report(StatusLevel.Info, "GameSettings", graphics);
         }
@@ -326,6 +351,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         _autoCaptureBudget = null;
         _ringBuffer = null;
         _incidentMaterializer = null;
+        _vramPressure = null;
+        _slowFrameWaits = null;
+        _verdicts = null;
+        _gameSettings = null;
+        _nextGameSettingsCheck = DateTimeOffset.MaxValue;
         _collectorTasks = [];
         _isSessionActive = false;
 
@@ -409,6 +439,10 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         FinalizeFramePacing();
         FinalizeDisplayCadence();
         FinalizeCaptureCost();
+        FinalizeVramPressure();
+        FinalizeSlowFrameWaits();
+        FinalizeVerdicts();
+        FinalizeGameSettings();
         Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), "Session stopped.");
         CloseJournal();
         OnStateChanged();
@@ -588,6 +622,60 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         }
 
         _captureCost = null;
+    }
+
+    /// <summary>
+    /// Writes how much of the session the card spent inside the VRAM band, and what it cost there.
+    /// </summary>
+    /// <remarks>
+    /// A Warning when the band was genuinely occupied, because it is the one line of this summary that
+    /// names something fixable before the next session. Every session so far has warned only about
+    /// processes whose VRAM grew, which is silent on the evening where the memory was taken before the
+    /// game started — and that was the evening.
+    /// </remarks>
+    private void FinalizeVramPressure()
+    {
+        if (_vramPressure?.Summary() is { } report)
+        {
+            Report(
+                report.IsPressured ? StatusLevel.Warning : StatusLevel.Info,
+                "GpuVram.Pressure",
+                report.Message);
+        }
+
+        _vramPressure = null;
+    }
+
+    /// <summary>
+    /// Writes how many of the session's largest frames still had CPU slack, which is the line that
+    /// separates a blocked thread from a pipeline working flat out.
+    /// </summary>
+    private void FinalizeSlowFrameWaits()
+    {
+        if (_slowFrameWaits?.Summary() is { } report)
+        {
+            Report(StatusLevel.Info, "FramePacing.Wait", report.Message);
+        }
+
+        _slowFrameWaits = null;
+    }
+
+    /// <summary>
+    /// Writes what the engine concluded across the whole session, with the VRAM verdict on its own line.
+    /// </summary>
+    private void FinalizeVerdicts()
+    {
+        if (_verdicts?.Summary() is { } report)
+        {
+            if (report.VramPressureMessage is { } vram)
+            {
+                Report(StatusLevel.Warning, "Analysis.Verdicts", vram);
+            }
+
+            Report(StatusLevel.Info, "Analysis.Verdicts", report.Message);
+        }
+
+        _verdicts = null;
     }
 
     private void CloseJournal()
@@ -977,6 +1065,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         var analyzed = incident.Analysis is null ? Analyze(incident) : incident;
         var evicted = AddIncidentWithinCap(analyzed);
 
+        // Counted like every other incident. A demo scenario added during a live session ends up in the
+        // session's own history, so leaving it out of the tally made the end-of-session ranking
+        // disagree with the incident list it is supposed to summarise.
+        _verdicts?.Record(analyzed.Marker.Id, analyzed.Analysis?.Hypotheses.FirstOrDefault()?.Category);
+
         IncidentCompleted?.Invoke(this, analyzed);
 
         if (evicted.Count > 0)
@@ -1160,6 +1253,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 {
                     _vramAccounting?.Observe(gpuSample);
                     _vramBudget?.Observe(gpuSample);
+                    _vramPressure?.Observe(gpuSample);
                     GpuTelemetryUpdated?.Invoke(this, gpuSample);
                 }
                 else if (telemetryEvent is GpuProcessMemorySample gpuProcessSample)
@@ -1182,6 +1276,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                     _autoCaptureBudget?.Observe(frameSample.Timestamp, frameSample.FrameTimeMs);
                     _displayCadence?.Observe(frameSample);
                     _captureCost?.Observe(frameSample);
+                    _vramPressure?.Observe(frameSample);
+                    _slowFrameWaits?.Observe(frameSample);
 
                     // The marker has to be raised before the materializer sees this event, so the frame
                     // that triggered the incident lands inside its own window rather than one event
@@ -1219,8 +1315,48 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
         while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
         {
-            await FlushPendingIncidentsAsync(DateTimeOffset.UtcNow).ConfigureAwait(false);
+            var now = DateTimeOffset.UtcNow;
+            await FlushPendingIncidentsAsync(now).ConfigureAwait(false);
+            CheckGameSettings(now);
         }
+    }
+
+    /// <summary>
+    /// Re-reads the graphics settings file when it is due, and reports whatever moved.
+    /// </summary>
+    /// <remarks>
+    /// On the cadence rather than at session end, because the session on this machine does not end: the
+    /// computer is switched off with it still running, so the final read runs on a minority of evenings.
+    /// A settings change mid-session splits the telemetry into two configurations, and a reader
+    /// comparing the evening against another one needs to know that before doing the arithmetic.
+    /// </remarks>
+    private void CheckGameSettings(DateTimeOffset now)
+    {
+        if (_gameSettings is not { } monitor || now < _nextGameSettingsCheck)
+        {
+            return;
+        }
+
+        _nextGameSettingsCheck = now + GameSettingsCheckInterval;
+
+        if (monitor.DescribeChange() is { } change)
+        {
+            Report(StatusLevel.Warning, "GameSettings", change);
+        }
+    }
+
+    /// <summary>
+    /// Takes one last look at the settings file, for the sessions that do get stopped properly.
+    /// </summary>
+    private void FinalizeGameSettings()
+    {
+        if (_gameSettings?.DescribeChange() is { } change)
+        {
+            Report(StatusLevel.Warning, "GameSettings", change);
+        }
+
+        _gameSettings = null;
+        _nextGameSettingsCheck = DateTimeOffset.MaxValue;
     }
 
     private async Task FlushPendingIncidentsAsync(DateTimeOffset now)
@@ -1305,6 +1441,10 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
             evicted = AddIncidentWithinCap(analyzed);
         }
+
+        // Counted by marker rather than by publication, so a re-analysis replaces the verdict instead of
+        // adding a second one for the same incident.
+        _verdicts?.Record(analyzed.Marker.Id, analyzed.Analysis?.Hypotheses.FirstOrDefault()?.Category);
 
         // Written before the history is touched by anything else: an incident evicted by the retention
         // cap, or dropped when the app closes, still leaves its summary on disk.
@@ -1448,6 +1588,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _incidents[index] = updated;
         }
 
+        _verdicts?.Record(updated.Marker.Id, updated.Analysis?.Hypotheses.FirstOrDefault()?.Category);
+
         // The journal line written when the incident completed describes the analysis as it stood before
         // this import, so the conclusion the import produced — usually the one that actually explains
         // the incident — would otherwise exist only in memory.
@@ -1543,11 +1685,48 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
         foreach (var evidence in result.Evidence)
         {
-            var stamped = new ArtifactEvidence(marker.MarkedAt, evidence.Kind, evidence.Summary, evidence.Metrics, evidence.SourceFile);
+            var stamped = new ArtifactEvidence(
+                marker.MarkedAt,
+                evidence.Kind,
+                evidence.Summary + DescribeMarkerAgainstTrace(marker, evidence.Metrics),
+                evidence.Metrics,
+                evidence.SourceFile);
             TryAttachEvidenceToIncident(marker.Id, stamped, result.Attachment);
         }
 
         Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), $"Deep capture analyserad: {result.Evidence[0].Summary}");
+    }
+
+    /// <summary>
+    /// Says where the marker falls relative to the window the trace actually covers.
+    /// </summary>
+    /// <remarks>
+    /// The parser knows what the file holds and nothing about why it was taken; this call knows the
+    /// marker and nothing about the file. Putting the two in one sentence is what makes an attachment
+    /// checkable — "the trace covers 20:23:31–20:23:52; the hitch happened at 20:23:48" is read in a
+    /// second, where the same judgement previously took opening the ETL. It is also the other half of
+    /// the 30 August finding, where an incident carried the label of a frame that happened 37 seconds
+    /// after its trace ended.
+    /// </remarks>
+    private static string DescribeMarkerAgainstTrace(IncidentMarker marker, IReadOnlyDictionary<string, double> metrics)
+    {
+        if (!metrics.TryGetValue("traceCoveredStartUnixMs", out var startMs)
+            || !metrics.TryGetValue("traceCoveredEndUnixMs", out var endMs)
+            || endMs <= startMs)
+        {
+            return string.Empty;
+        }
+
+        var start = DateTimeOffset.FromUnixTimeMilliseconds((long)startMs);
+        var end = DateTimeOffset.FromUnixTimeMilliseconds((long)endMs);
+        var markedAt = marker.MarkedAt;
+        var verdict = markedAt >= start && markedAt <= end
+            ? "alltså inuti det fönster tracen täcker"
+            : markedAt < start
+                ? $"alltså {(start - markedAt).TotalSeconds:F0} s före tracens början — bilagan beskriver inte händelsen"
+                : $"alltså {(markedAt - end).TotalSeconds:F0} s efter tracens slut — bilagan beskriver inte händelsen";
+
+        return $" Markeringen gjordes {markedAt.ToLocalTime():HH:mm:ss}, {verdict}.";
     }
 
     private void OnStateChanged()

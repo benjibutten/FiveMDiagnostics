@@ -619,12 +619,28 @@ public sealed class EtlArtifactParser : IArtifactParser
 
             source.Process();
 
-            var durationSeconds = firstTimestamp is not null && lastTimestamp is not null
+            // What the file spans, which for a ring buffer capture is the time since the session was
+            // started and says nothing about how much history the file holds. Kept because it is the
+            // one figure that names the ring buffer's age, and reported as such.
+            var fileSpanSeconds = firstTimestamp is not null && lastTimestamp is not null
                 ? (lastTimestamp.Value - firstTimestamp.Value).TotalSeconds
                 : 0;
 
-            var cswitchCoverage = contextSwitches.CoverageSeconds(firstTimestamp);
-            var stackCoverage = stacks.CoverageSeconds(firstTimestamp);
+            // What the trace actually covers. A ring buffer wraps its high-rate streams and keeps its
+            // rundown and metadata events from the moment the session started, so last-minus-first over
+            // every event measured the age of the session — 2 919 s for a 768 MB ring holding twenty
+            // seconds of history on 31 August, printed as though the trace covered forty-nine minutes.
+            // The streams that are emitted continuously are the only ones whose extent is the history:
+            // context switches and CPU samples both run at kilohertz, so where they start is where the
+            // retained window starts.
+            var coveredStart = Earliest(contextSwitches.FirstTimestamp, samples.FirstTimestamp) ?? firstTimestamp;
+            var coveredEnd = Latest(contextSwitches.LastTimestamp, samples.LastTimestamp) ?? lastTimestamp;
+            var durationSeconds = coveredStart is { } start && coveredEnd is { } end
+                ? Math.Max(0, (end - start).TotalSeconds)
+                : 0;
+
+            var cswitchCoverage = contextSwitches.CoverageSeconds(coveredStart);
+            var stackCoverage = stacks.CoverageSeconds(coveredStart);
 
             // Rates come out of the sampled span, which the attribution owns: CoverageSeconds measures
             // from the start of the *trace* on purpose, which is right for coverage and catastrophically
@@ -637,6 +653,7 @@ public sealed class EtlArtifactParser : IArtifactParser
             {
                 ["eventCount"] = eventCount,
                 ["durationSeconds"] = durationSeconds,
+                ["fileSpanSeconds"] = fileSpanSeconds,
                 ["eventsLost"] = source.EventsLost,
                 ["dpcCount"] = dpc.Count,
                 ["dpcMaxMs"] = dpc.MaxMs,
@@ -653,9 +670,21 @@ public sealed class EtlArtifactParser : IArtifactParser
                 ["stackCoverageSeconds"] = stackCoverage,
                 ["stackCoverageRatio"] = Ratio(stackCoverage, durationSeconds),
                 ["cpuSampleCount"] = cpu.SampleCount,
-                ["cpuSampleCoverageSeconds"] = samples.CoverageSeconds(firstTimestamp),
+
+                // Measured from the same covered start the other coverage figures use. Against
+                // firstTimestamp it reported the ring buffer's age instead of the sampled window: 2 919
+                // seconds of "sample coverage" for a file that held twenty seconds of samples.
+                ["cpuSampleCoverageSeconds"] = samples.CoverageSeconds(coveredStart),
                 ["cpuSampledSeconds"] = cpu.SampledSeconds,
             };
+
+            if (coveredStart is { } coveredStartAt && coveredEnd is { } coveredEndAt)
+            {
+                // Written out so the caller — which is the only thing that knows what the capture was
+                // taken for — can say whether the marker falls inside the window this file describes.
+                metrics["traceCoveredStartUnixMs"] = ToUnixTimeMilliseconds(coveredStartAt);
+                metrics["traceCoveredEndUnixMs"] = ToUnixTimeMilliseconds(coveredEndAt);
+            }
 
             if (attribution is not null)
             {
@@ -692,15 +721,66 @@ public sealed class EtlArtifactParser : IArtifactParser
             }
 
             var summary = BuildSummary(dpc, isr, durationSeconds, eventCount)
+                + BuildSpanSummary(coveredStart, coveredEnd, durationSeconds, fileSpanSeconds)
                 + (attribution is not null ? " " + attribution.Describe() : string.Empty)
                 + (threadWait is not null ? " " + threadWait.Describe() : string.Empty)
-                + BuildCoverageSummary(contextSwitches, stacks, firstTimestamp, durationSeconds, source.EventsLost);
+                + BuildCoverageSummary(contextSwitches, stacks, coveredStart, durationSeconds, source.EventsLost);
 
             return new ArtifactParseResult(
                 new ArtifactAttachment(path, ArtifactKind.EtlTrace, Path.GetFileName(path), DateTimeOffset.UtcNow, Sensitive: true),
                 [new ArtifactEvidence(DateTimeOffset.UtcNow, ArtifactKind.EtlTrace, summary, metrics, path)],
                 []);
         }, cancellationToken);
+    }
+
+    private static DateTime? Earliest(DateTime? left, DateTime? right)
+    {
+        return left is null ? right : right is null ? left : left < right ? left : right;
+    }
+
+    private static DateTime? Latest(DateTime? left, DateTime? right)
+    {
+        return left is null ? right : right is null ? left : left > right ? left : right;
+    }
+
+    /// <summary>
+    /// Turns one <c>TraceEvent.TimeStamp</c> into absolute milliseconds.
+    /// </summary>
+    /// <remarks>
+    /// TraceEvent hands out local time, and pairing a local <see cref="DateTime"/> with a zero offset
+    /// throws — on every machine whose own zone is not UTC, which is every machine this app has ever
+    /// run on. The whole parse went with it: one <see cref="ArgumentException"/> raised while filling
+    /// the metrics dictionary, and the trace produced no evidence at all. Letting
+    /// <see cref="DateTimeOffset"/> read the kind gets both cases right — local and unspecified take
+    /// the machine's offset, an already-UTC value keeps zero.
+    /// </remarks>
+    private static long ToUnixTimeMilliseconds(DateTime timestamp)
+    {
+        return new DateTimeOffset(timestamp).ToUnixTimeMilliseconds();
+    }
+
+    /// <summary>
+    /// Says what window the file actually describes, next to what it spans.
+    /// </summary>
+    /// <remarks>
+    /// The two are wildly different for a ring buffer and the difference is the whole question of
+    /// whether an attachment is relevant. Reading "over 2 919 seconds" next to a hitch at 20:23:48
+    /// suggests the trace has the hitch in it; the file held twenty seconds ending at 20:23:52, and
+    /// that is legible only if it is printed.
+    /// </remarks>
+    private static string BuildSpanSummary(DateTime? coveredStart, DateTime? coveredEnd, double durationSeconds, double fileSpanSeconds)
+    {
+        if (coveredStart is not { } start || coveredEnd is not { } end)
+        {
+            return string.Empty;
+        }
+
+        var local = $"{start.ToLocalTime():HH:mm:ss}–{end.ToLocalTime():HH:mm:ss}";
+        var ring = fileSpanSeconds > durationSeconds * 1.5
+            ? $" Filen sträcker sig över {fileSpanSeconds:F0} s, vilket är ringbuffertens ålder och inte dess innehåll."
+            : string.Empty;
+
+        return $" Tracen täcker {local} ({durationSeconds:F1} s sammanhängande ström).{ring}";
     }
 
     private static double Ratio(double covered, double total)

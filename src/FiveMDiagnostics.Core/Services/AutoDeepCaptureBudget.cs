@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Core;
+﻿namespace FiveMDiagnostics.Core;
 
 /// <summary>
 /// Decides whether an automatically detected hitch may spend one of the session's deep captures.
@@ -72,6 +72,18 @@ public sealed class AutoDeepCaptureBudget
     /// </remarks>
     private const int MinimumAdaptiveRank = 3;
 
+    /// <summary>
+    /// How far above the ordinary threshold the exception has to stay when the session's own frames
+    /// place it, expressed as a ratio.
+    /// </summary>
+    /// <remarks>
+    /// The session level may lower the exception — that is the point of it — but not into the ordinary
+    /// threshold. When the two meet, every frame that qualifies for a capture also bypasses the cooldown
+    /// and the window budget, and the session ceiling becomes the only gate left. A quarter above what
+    /// already counts as capture-worthy keeps them apart on any threshold.
+    /// </remarks>
+    private const double MinimumOverrideRatio = 1.25;
+
     private readonly DeepCaptureOptions _options;
     private readonly List<DateTimeOffset> _spentAt = [];
 
@@ -84,6 +96,17 @@ public sealed class AutoDeepCaptureBudget
 
     private int _spent;
     private DateTimeOffset? _lastCaptureAt;
+
+    /// <summary>
+    /// The frame time the previous capture was taken for, or zero when it was taken for something with
+    /// no frame time — saturation, or a run of dropped frames.
+    /// </summary>
+    /// <remarks>
+    /// What keeps the extreme tier from eating the session. Skipping the ring buffer's refill is worth
+    /// it for a frame nothing has traced yet; it is not worth it for the fourth 900 ms frame of an
+    /// unbroken bad patch, which the trace already on disk describes as well as a half-filled one would.
+    /// </remarks>
+    private double _lastCaptureFrameTimeMs;
     private DateTimeOffset? _firstFrameAt;
     private DateTimeOffset? _lastFrameAt;
 
@@ -125,9 +148,50 @@ public sealed class AutoDeepCaptureBudget
     /// rather than firing on everything.
     /// </para>
     /// </remarks>
-    public double EffectiveOverrideFrameTimeMs => Math.Max(
-        EffectiveFrameTimeMs + ConfiguredOverrideMarginMs,
-        Adapt(_options.AutoCaptureOverrideFrameTimeMs, _options.AdaptiveOverrideFramesPerHour));
+    public double EffectiveOverrideFrameTimeMs
+    {
+        get
+        {
+            var adapted = Math.Max(
+                EffectiveFrameTimeMs + ConfiguredOverrideMarginMs,
+                Adapt(_options.AutoCaptureOverrideFrameTimeMs, _options.AdaptiveOverrideFramesPerHour));
+
+            // The session's own level, allowed to lower the exception as well as raise it. Four notes
+            // running have recorded the same failure from the other side: the constant sits at 250 ms,
+            // an evening's largest frames come in at 150–240, and the exception turns away the very
+            // frames it exists for while the budget still holds unspent captures. On 31 August that was
+            // a 235 ms frame — the evening's second largest — refused with nine hours of session left.
+            // The rate is what bounds it: at three an hour the level is where three frames an hour
+            // actually reach, so lowering it cannot admit more than the budget was already sized for.
+            if (SessionLevel(_options.AdaptiveOverrideFramesPerHour) is not { } level)
+            {
+                return adapted;
+            }
+
+            return level < adapted && level >= EffectiveFrameTimeMs * MinimumOverrideRatio ? level : adapted;
+        }
+    }
+
+    /// <summary>
+    /// Frame time from which a hitch may also skip the ring buffer's refill, rather than only the
+    /// cooldown.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is what the configured constant is for now that the session's own material places the
+    /// ordinary exception. A frame this large is the evening's worst, and refusing it to protect the
+    /// buffer has now cost four sessions their largest frame in a row — 356 ms at 20:23:50 on
+    /// 31 August, refused with "43 s left before the ring buffer has refilled", in the opening ten
+    /// minutes where the buffer never catches up at all.
+    /// </para>
+    /// <para>
+    /// Half a ring buffer is worth more than no trace. What it may not skip is the previous capture
+    /// still writing itself to disk, which is a different constraint from the refill and is what
+    /// <see cref="DeepCaptureOptions.ExtremeCaptureSpacing"/> holds.
+    /// </para>
+    /// </remarks>
+    public double EffectiveExtremeFrameTimeMs =>
+        Math.Max(_options.AutoCaptureOverrideFrameTimeMs, EffectiveOverrideFrameTimeMs);
 
     /// <summary>
     /// How far above the ordinary threshold the configuration puts the exception. Zero when the override
@@ -204,7 +268,23 @@ public sealed class AutoDeepCaptureBudget
             timestamp,
             $"en {frameTimeMs:F0} ms hitch",
             mayOverrideCooldown: OverridesCooldownFor(frameTimeMs),
+            mayOverrideRefill: SkipsRefillFor(frameTimeMs),
+            frameTimeMs,
             out refusal);
+    }
+
+    /// <summary>
+    /// Whether a frame is extreme enough to be traced against a ring buffer that has not refilled.
+    /// </summary>
+    /// <remarks>
+    /// Answers to the same disabling case as the cooldown exception: with the override configured off
+    /// there is no extreme tier either, and every frame waits for the buffer as it always did.
+    /// </remarks>
+    private bool SkipsRefillFor(double frameTimeMs)
+    {
+        return _options.AutoCaptureOverrideFrameTimeMs > _options.AutoCaptureFrameTimeMs
+            && frameTimeMs >= EffectiveExtremeFrameTimeMs
+            && frameTimeMs > _lastCaptureFrameTimeMs;
     }
 
     /// <summary>
@@ -241,6 +321,8 @@ public sealed class AutoDeepCaptureBudget
             timestamp,
             "en period där bildfrekvensen inte återhämtade sig",
             mayOverrideCooldown: false,
+            mayOverrideRefill: false,
+            frameTimeMs: 0,
             out refusal);
     }
 
@@ -255,6 +337,8 @@ public sealed class AutoDeepCaptureBudget
             timestamp,
             "en sammanhängande följd av tappade frames",
             mayOverrideCooldown: false,
+            mayOverrideRefill: false,
+            frameTimeMs: 0,
             out refusal);
     }
 
@@ -263,7 +347,19 @@ public sealed class AutoDeepCaptureBudget
     /// withheld. The shorter <see cref="DeepCaptureOptions.AutoCaptureOverrideCooldown"/> still applies:
     /// it is what keeps the override from capturing a ring buffer that has not refilled yet.
     /// </param>
-    private bool TryReserveCore(DateTimeOffset timestamp, string description, bool mayOverrideCooldown, out string? refusal)
+    /// <param name="mayOverrideRefill">
+    /// Whether the frame is extreme enough to be worth a half-filled ring buffer. It still answers to
+    /// <see cref="DeepCaptureOptions.ExtremeCaptureSpacing"/>, which is the previous capture finishing
+    /// its write rather than the buffer filling again — starting a capture inside that produces two
+    /// files describing the same seconds and neither of them complete.
+    /// </param>
+    private bool TryReserveCore(
+        DateTimeOffset timestamp,
+        string description,
+        bool mayOverrideCooldown,
+        bool mayOverrideRefill,
+        double frameTimeMs,
+        out string? refusal)
     {
         if (!_options.Enabled || !_options.CaptureAutoIncidents)
         {
@@ -299,23 +395,33 @@ public sealed class AutoDeepCaptureBudget
         if (_lastCaptureAt is { } last)
         {
             var elapsed = timestamp - last;
-            var cooldown = mayOverrideCooldown ? _options.AutoCaptureOverrideCooldown : _options.AutoCaptureCooldown;
+            var cooldown = mayOverrideRefill
+                ? _options.ExtremeCaptureSpacing
+                : mayOverrideCooldown
+                    ? _options.AutoCaptureOverrideCooldown
+                    : _options.AutoCaptureCooldown;
 
             if (elapsed < cooldown)
             {
                 var remaining = cooldown - elapsed;
-                refusal = mayOverrideCooldown
+                refusal = mayOverrideRefill
                     ? $"Deep capture hoppades över för {description}: {remaining.TotalSeconds:F0} s kvar innan "
-                        + "ringbufferten hunnit fyllas på efter föregående capture. Frametimen räckte för att "
-                        + "bryta cooldownen, men inte för att kringgå påfyllningen."
-                    : $"Deep capture hoppades över för {description}: {remaining.TotalMinutes:F0} min "
-                        + "kvar av cooldown efter föregående capture, och ringbufferten har ännu inte fyllts på.";
+                        + "föregående capture skrivit klart sin fil. Frametimen räckte för att kringgå "
+                        + "påfyllningen av ringbufferten, men två captures kan inte skriva samtidigt."
+                    : mayOverrideCooldown
+                        ? $"Deep capture hoppades över för {description}: {remaining.TotalSeconds:F0} s kvar innan "
+                            + "ringbufferten hunnit fyllas på efter föregående capture. Frametimen räckte för att "
+                            + $"bryta cooldownen; en frame över {EffectiveExtremeFrameTimeMs:F0} ms hade tagits "
+                            + "ändå, mot en halvfull buffert."
+                        : $"Deep capture hoppades över för {description}: {remaining.TotalMinutes:F0} min "
+                            + "kvar av cooldown efter föregående capture, och ringbufferten har ännu inte fyllts på.";
                 return false;
             }
         }
 
         _spent++;
         _lastCaptureAt = timestamp;
+        _lastCaptureFrameTimeMs = frameTimeMs;
 
         // Only ordinary captures are charged to the window. An override that took the hour's slot would
         // let one catastrophic frame buy silence for the rest of it, which is the failure the window was
@@ -343,19 +449,34 @@ public sealed class AutoDeepCaptureBudget
     /// </remarks>
     private double Adapt(double configuredMs, double framesPerHour)
     {
+        return SessionLevel(framesPerHour) is { } level ? Math.Max(configuredMs, level) : configuredMs;
+    }
+
+    /// <summary>
+    /// The frame time <paramref name="framesPerHour"/> frames an hour have actually reached this
+    /// session, or null while the session has not produced the material to say.
+    /// </summary>
+    /// <remarks>
+    /// The raw level, in both directions. <see cref="Adapt"/> takes it as a floor under a configured
+    /// constant, which is right for the ordinary threshold; <see cref="EffectiveOverrideFrameTimeMs"/>
+    /// also lets it lower the exception, which is what four notes have asked for and what a constant
+    /// cannot do.
+    /// </remarks>
+    private double? SessionLevel(double framesPerHour)
+    {
         if (framesPerHour <= 0 || _firstFrameAt is not { } first || _lastFrameAt is not { } last)
         {
-            return configuredMs;
+            return null;
         }
 
         var hours = Math.Clamp((last - first).TotalHours, 0, MaxAdaptiveHours);
         var rank = (int)Math.Floor(framesPerHour * hours);
         if (rank < MinimumAdaptiveRank || _largestFrames.Count < rank)
         {
-            return configuredMs;
+            return null;
         }
 
-        return Math.Max(configuredMs, _largestFrames[rank - 1]);
+        return _largestFrames[rank - 1];
     }
 
     /// <summary>

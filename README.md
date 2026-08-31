@@ -123,6 +123,18 @@ identically for a thread executing script and a thread asleep on a lock. When an
 the game's thread off the processor for the frame, that reading stops counting as evidence of script
 work entirely rather than being counted and then capped.
 
+**And the frame's own `MsCPUWait` bounds the trace in return.** A trace can only show that *some* thread
+waited; the frame says whether the frame waited. On 30 August the engine ranked an incident
+`FiveMThreadWait` at 98% confidence from a wait on a worker thread that was waiting for the main thread,
+while all 35 of that evening's frames over 100 ms reported between 0.1 and 0.4 ms of `MsCPUWait`. So a
+window whose large frames carry the column and show under a millisecond of wait **cannot rank a
+thread-wait verdict highest**, whatever the attachment shows for other threads. The consequence is worth
+stating plainly: on this machine `MsCPUWait` reads ~0.1 ms even for frames whose trace shows the game's
+own thread off the processor for the whole frame — verified at 0.0737 ms for the 261.6 ms frame of
+30 August — so the rule also demotes that case. Neither verdict then tops the ranking: the script spike
+is still contradicted by the trace, the wait is bounded by the frame, and the incident is reported as
+unresolved rather than as a confident answer built on an instrument that cannot tell the two apart.
+
 Correlating the two instruments needs care, because **they do not share a clock**. PresentMon reports
 frame times relative to its own trace and the collector recovers wall clock as
 `min(readUtc - relativeMs)`, an estimate that can only ever be late: `readUtc` is taken after PresentMon
@@ -222,17 +234,32 @@ ring. It is raised automatically for a larger `RingBufferMegabytes`, which refil
 slowly — at the 2 048 MB ceiling the refill alone is about 56 s. Setting the override threshold to the
 ordinary one turns the override off.
 
+**And the refill itself has one way past it, for an extreme frame.** Four sessions running lost their
+largest frame to that wait — most recently 356 ms at 20:23:50, refused with "43 s left before the ring
+buffer has refilled", in the opening ten minutes of a session where the buffer never catches up at all. A
+frame at or above the configured `AutoCaptureOverrideFrameTimeMs` is traced against a half-filled buffer
+instead, because several seconds of run-up beats none and the frame is not coming back. It still waits for
+the previous capture to finish writing its own file — the tail plus the ~30 s `wpr -stop` takes — and it
+must be **larger than the frame the previous capture was taken for**, so an unbroken patch of 900 ms
+frames spends one capture per refill rather than one per write.
+
 **Both thresholds follow the session's own frames upwards.** A constant is right for the sessions it was
 calibrated against and wrong for the next ones, which has now happened twice: 300 ms became 120 after one
 evening improved past it, and 500 ms became 250 after the next one did, each discovered by counting frames
 by hand a session later. **DeepCapture.AdaptiveThresholdFramesPerHour** (20) and
 **DeepCapture.AdaptiveOverrideFramesPerHour** (3) say how many frames an hour may exceed each threshold
 before it moves to where the session's own material is: at three an hour after two hours, the sixth
-largest frame of the session is the level three an hour have reached. The adaptation only ever *raises* —
-the configured values are the floor, so an evening that is going well keeps them exactly — and it does
-nothing until the session has produced at least three frames above the level, since the largest single
-frame of a session is one event rather than an estimate of anything. Set either rate to `0` to pin the
-constant.
+largest frame of the session is the level three an hour have reached. It does nothing until the session
+has produced at least three frames above the level, since the largest single frame of a session is one
+event rather than an estimate of anything. Set either rate to `0` to pin the constant.
+
+The ordinary threshold only ever *raises*; the **override also follows the session's frames downwards**,
+which four notes running asked for. The constant sits at 250 ms, an evening's largest frames come in at
+150–240, and the exception then turns away the very frames it exists for while the budget still holds
+unspent captures — a 235 ms frame, the evening's second largest, refused by ten minutes of cooldown. The
+rate is what bounds the lowering: at three an hour the level is where three frames an hour actually
+reach, so it can never admit more than the budget was sized for, and it may not fall within 25% of the
+ordinary threshold, where the exception would swallow the rule.
 
 **An automatic capture's ETL is read back into the incident that triggered it.** Without this the traces
 exist and the analysis never sees them: the rule that a trace overrules `MsCPUBusy` was implemented for
@@ -574,6 +601,24 @@ and the session measured 77.6%. It also names the lever: the game's ceiling cost
 while the other two gigabytes are programs. The desktop figure is taken as the card's own number minus
 the game's row rather than as a sum of the other rows, so the double counting above cannot reach it.
 
+**An excluded row does not leave the budget with it.** Excluding a proved double-counter from the top
+lists is right; letting the exclusion remove the memory as well is not, because the process still holds
+whatever it holds and the card is still counting it. That is how one evening produced "the game has 8.1 GB
+left of the card's 10.0" while the card itself stood at 88–92%: obs64 had been excluded, so the stream
+stack was booked at 0.1 GB instead of about 1.3 and the difference silently became headroom. A stream
+stack that cannot be measured per process is now measured **by difference** — the desktop from the rows
+that can still be believed, and everything the card says is missing booked onto the stack, stated as
+such: "the stream stack cannot be measured per process; the card is missing 1.3 GB and they are booked
+there". The line also states what the card reports as used and free, and the room it offers the game can
+never exceed total minus used, whatever the table claims.
+
+**The stream stack's start and stop need hysteresis.** Eighteen "the stream stack started/stopped" lines
+were written between 21:48 and 22:04 on an evening when OBS neither started nor stopped: the row was
+alternating between believable and excluded, and each flip restated the budget as though a gigabyte had
+moved. A change is now written only after three consecutive samples agree — fifteen seconds at the
+process cadence — and while the stack's rows cannot be believed at all, the state is held rather than
+decided from a row already known to be broken.
+
 Two things it refuses to guess at. On a machine with **more than one GPU** no budget is stated at all:
 the subtraction would be one card's total minus another card's row, and unlike the reconciliation — which
 publishes with a caveat because nobody acts on it directly — this is the number a graphics preset gets
@@ -615,6 +660,32 @@ the flush at all — a capture happens because a hitch happened, and hitches clu
 what it measured and not what caused it. The point is that two evenings with different numbers of
 captures are not comparable without it.
 
+### The session summary states the card's band, the wait distribution and the engine's own ranking
+
+Three numbers the 31 August review had to work out by hand out of the CSV, each of which the app already
+had every input for, and each now a line in the session summary.
+
+**The VRAM band, with its measured cost.** Every previous session warned only about processes whose VRAM
+grew, which is silent on the evening where the memory was taken before the game started. `VramPressureBandMonitor`
+buckets the session into minutes, counts the minutes whose adapter readings were mostly above 88% and
+above 91%, and compares the hitch rate inside the band against outside it — "the card was above 88% in 33
+of 278 minutes; in those minutes the hitch rate was 4.1× higher than in the rest". The 88% band is no
+longer a guess from 26 August: it is these minutes compared with each other, and the gradient behind it
+was 82 against 794 hitches ≥33 ms per hour. The hitch threshold follows the cadence the session actually
+holds, as `CaptureCostMonitor`'s does.
+
+**The `MsCPUWait` distribution of the largest frames.** "None of the 35 frames over 100 ms waited" was the
+sharpest single observation of that review and is one subtraction away from data every session already
+collects. It separates a blocked thread from a pipeline working flat out on one line, and it is the same
+measurement that bounds the thread-wait verdict above.
+
+**What the engine concluded, across the session.** The ranking lives inside one incident, so the only way
+to see the distribution was to count lines in the jsonl. `IncidentVerdictTally` keeps the top-ranked
+category per marker — per marker, so an incident re-analysed when its trace arrives is counted once
+rather than twice — and writes the distribution at session end, with `GpuVramPressure` on a line of its
+own: it was ranked highest in 26 of 119 incidents on 31 August and was right about the evening before
+anybody looked, which is the first time the ranking has led to the answer on its own.
+
 ### The session records the game's own graphics settings
 
 Every comparison in the investigation rested on a remembered setting, and the window mode took four
@@ -625,6 +696,20 @@ values that cost VRAM or decide presentation, spelling out `Windowed` (0 exclusi
 border, 2 borderless). It is best effort and silent when the file is not found, since a wrong setting in
 the record is worse than none. It is also **not complete**: FiveM's `Extended Texture Budget` is its own
 setting and is not in that file, which matters because it was one of the two knobs moved on 27 August.
+
+**The newest copy wins, and the line says when it was written.** Taking the first candidate path that
+existed was wrong on exactly the machine this was written for: Documents is redirected into OneDrive, a
+copy is routinely left behind on the non-redirected path, and the session then recorded settings nobody
+had used for months with nothing in the line to show it. Every candidate that exists is now enumerated,
+the one with the latest `LastWriteTimeUtc` is read, the older ones are named, and the timestamp is printed
+— "senast skriven 2026-08-24 21:11, alltså före den här sessionen" makes the remaining failure
+self-evident instead of silent.
+
+**And it is re-read while the session runs**, every five minutes as well as at the end, reporting what
+moved: `TextureQuality 2 → 1`, or a file that stopped being readable. At session end alone it would be
+written on one evening in ten, because this machine is switched off rather than stopped through the app.
+A change mid-session splits the telemetry into two configurations, which anyone comparing the evening
+against another one has to know before doing the arithmetic.
 
 ## Capture depth
 
@@ -680,6 +765,14 @@ traces rather than one every couple of minutes.
 - ETL analysis reconstructs long off-CPU intervals for active GTA threads and reports their wait state,
   reason and duration. This prevents PresentMon `MsCPUBusy` from being mistaken for CPU execution when
   the thread actually spent most of the frame blocked in `Wait/UserRequest`.
+- ETL analysis reports **the window the file actually covers**, not the span of its events. A ring
+  buffer keeps its rundown and metadata events from the moment the session started, so last-minus-first
+  measured the age of the ring rather than its contents — up to 2 919 s for a 768 MB buffer holding
+  twenty seconds of history, printed as though the trace covered forty-nine minutes. The span is now
+  taken from the streams that are actually continuous (context switches and CPU samples), written out
+  next to the marker's own time — "the trace covers 20:23:31–20:23:52; the marker was at 20:23:48, inside
+  it" — so whether an attachment is relevant is one line rather than an hour with the ETL open. The
+  file's own span is kept as `fileSpanSeconds` and named as the ring buffer's age.
 - ETL analysis also reports **per-stream coverage**. Context switches and stacks have been observed
   stopping at 23 of 54 seconds while `EventsLost` stayed at 0 — that counts events the consumer failed to
   drain, not a provider that went silent because another ETW session took the keyword. A trace with full

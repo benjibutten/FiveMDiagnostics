@@ -73,6 +73,65 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
     /// </remarks>
     private const double UncorroboratedAttributionCeiling = 0.34;
 
+    /// <summary>
+    /// Frame time from which a frame is one a root cause has to explain.
+    /// </summary>
+    /// <remarks>
+    /// Shared by the wait correlation and by the per-frame wait check that bounds it, so both describe
+    /// the same frames. A relative threshold would let a bad window redefine which frames are being
+    /// argued about halfway through the argument.
+    /// </remarks>
+    private const double SlowFrameFloorMs = 100;
+
+    /// <summary>
+    /// <c>MsCPUWait</c> below which a frame did not wait at all.
+    /// </summary>
+    /// <remarks>
+    /// The same millisecond <see cref="FramePacingOptions.SaturatedCpuWaitMs"/> calls "out of headroom".
+    /// Inside a frame of 100 ms or more it is a rounding error: such a frame spent essentially all of
+    /// itself doing something other than waiting.
+    /// </remarks>
+    private const double WaitedFrameCpuWaitMs = 1.0;
+
+    /// <summary>
+    /// Ceiling on a thread-wait verdict for a window whose own frames did not wait.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the sixth session the correlation has been asked for and the first with an unambiguous
+    /// counter-example: on 30 August every one of the 35 frames over 100 ms reported
+    /// <c>MsCPUWait</c> between 0.1 and 0.4 ms, and the engine still ranked the 20:23 incident
+    /// <see cref="RootCauseCategory.FiveMThreadWait"/> at 98% confidence — from a trace showing a
+    /// worker thread waiting on the main thread, which is what a worker thread does when the main
+    /// thread is busy. The trace was right about the worker and irrelevant about the frame.
+    /// </para>
+    /// <para>
+    /// The rule is one line and deliberately absolute: PresentMon measures the frame, the trace
+    /// measures a thread, and when the frame says nobody waited, no thread's wait can be the frame's
+    /// explanation. Below the 0.35 bar, so the verdict stays visible as a lead and cannot be the answer.
+    /// </para>
+    /// </remarks>
+    private const double UnwaitedFrameConfidenceCeiling = 0.3;
+
+    /// <summary>
+    /// Ceiling on a thread-wait verdict for a window whose large frames were never measured at all.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The gap between the two ceilings above and no ceiling. <see cref="UnwaitedFrameConfidenceCeiling"/>
+    /// answers a window whose frames refute the wait; this answers one where nothing can either confirm
+    /// or refute it, because not one frame over <see cref="SlowFrameFloorMs"/> carried
+    /// <c>MsCPUWait</c> — a PresentMon v1 capture, or a v2 run that lost the column. Absent is not zero
+    /// on either side: the frames cannot clear the trace any more than they can contradict it.
+    /// </para>
+    /// <para>
+    /// Left above the 0.35 bar, so the trace's own measurement can still be the leading explanation.
+    /// What it cannot be any more is 90–98%, which is a figure the window has nothing to justify — the
+    /// same trace on a window whose frames were measured would have had to survive them first.
+    /// </para>
+    /// </remarks>
+    private const double UnmeasuredFrameConfidenceCeiling = 0.6;
+
     public IncidentAnalysis Analyze(IncidentRecord incident)
     {
         var frameSamples = incident.GetEvents<FrameTelemetrySample>();
@@ -109,7 +168,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         var hypotheses = new List<HypothesisScore>();
         var correlatedThreadWait = FindCorrelatedThreadWait(artifacts, frameSamples, metrics);
 
-        AddThreadWaitHypothesis(hypotheses, correlatedThreadWait);
+        AddThreadWaitHypothesis(hypotheses, correlatedThreadWait, metrics);
         AddVramHypothesis(hypotheses, metrics, gpu, correlatedThreadWait, gpuProcessMemory);
         AddObsHypothesis(hypotheses, metrics, obsSamples, gpu);
         AddGpuHypothesis(hypotheses, metrics, obsSamples, systemSamples, gpu, correlatedThreadWait);
@@ -163,6 +222,17 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         var severeThreshold = Math.Max(baseline * SevereMultiplier, 16);
 
         var spikes = frameSamples.Where(item => item.FrameTimeMs >= spikeThreshold).ToArray();
+
+        // The frames a thread-wait verdict would be about, and only the ones that carry the column that
+        // can confirm or refute it. Same population FindCorrelatedThreadWait matches against, so the
+        // wait measured per frame and the wait read out of the trace describe the same frames.
+        // Held apart from the measured subset so a window where the column is simply absent stays
+        // distinguishable from one that had no large frames. Both produce MeasuredSlowFrames == 0, and
+        // the wait verdict has to treat them as opposites.
+        var slowFrames = frameSamples
+            .Where(item => item.FrameTimeMs >= Math.Max(SlowFrameFloorMs, spikeThreshold))
+            .ToArray();
+        var measuredSlowFrames = slowFrames.Where(item => item.CpuWaitMs is not null).ToArray();
         // Attribution needs BOTH sides. PresentMon v1 supplies msGPUActive but no CPU figure, and a
         // missing CPU value is indistinguishable from an idle CPU — which would silently turn every
         // v1 spike into a "GPU-bound" or "present-bound" verdict the data cannot support.
@@ -229,6 +299,10 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             frameSamples.Select(item => item.GpuWaitMs ?? 0).DefaultIfEmpty().Max(),
             frameSamples.Select(item => item.FlipDelayMs ?? 0).DefaultIfEmpty().Max(),
             frameSamples.Count(item => item.Dropped),
+            measuredSlowFrames.Length,
+            measuredSlowFrames.Count(item => item.CpuWaitMs!.Value >= WaitedFrameCpuWaitMs),
+            measuredSlowFrames.Select(item => item.CpuWaitMs!.Value).DefaultIfEmpty().Max(),
+            slowFrames.Length - measuredSlowFrames.Length,
             BuildPresentModeMetrics(frameSamples),
             BuildDisplayChangeMetrics(frameSamples, baseline));
     }
@@ -613,9 +687,16 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         }
     }
 
+    /// <param name="metrics">
+    /// The window's own frames, which have the last word. A trace can only show that some thread waited;
+    /// <c>MsCPUWait</c> shows whether the frame did, and the two disagree far more often than the trace
+    /// being attached suggests — a worker thread waiting on a busy main thread produces exactly the wait
+    /// the correlation matches, on frames that never waited at all.
+    /// </param>
     private static void AddThreadWaitHypothesis(
         List<HypothesisScore> hypotheses,
-        CorrelatedThreadWait? wait)
+        CorrelatedThreadWait? wait,
+        FrameMetrics metrics)
     {
         if (wait is null)
         {
@@ -633,6 +714,30 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         {
             confidence = 0.98;
             evidence.Add("Den överlappande väntan klassades som Wait/UserRequest, vilket pekar på synkronisering, en signal eller I/O-svar inne i spelprocessen snarare än CPU- eller GPU-mättnad.");
+        }
+
+        // The frame's own measurement outranks the trace's. Never lifted by anything the attachment
+        // shows for other threads: that is the case this exists for.
+        if (metrics.NoSlowFrameWaited)
+        {
+            confidence = Math.Min(confidence, UnwaitedFrameConfidenceCeiling);
+            evidence.Add(
+                $"Men ingen av fönstrets {metrics.MeasuredSlowFrames} frames över {SlowFrameFloorMs:F0} ms hade "
+                + $"mer än {WaitedFrameCpuWaitMs:F1} ms MsCPUWait (störst {metrics.MaxSlowFrameCpuWaitMs:F1} ms). "
+                + "En frame som inte väntade kan inte förklaras av att en tråd väntade, så väntan i spåret "
+                + "tillhör en annan tråd än den som höll framen. Hypotesen kan därför inte rankas högst.");
+        }
+        else if (metrics.SlowFramesUnmeasured)
+        {
+            // Not a contradiction, so not the ceiling a contradiction gets. But the trace's word is the
+            // only word here, and the instrument that decides between a waiting thread and a busy one
+            // never reported on these frames at all.
+            confidence = Math.Min(confidence, UnmeasuredFrameConfidenceCeiling);
+            evidence.Add(
+                $"Ingen av fönstrets {metrics.UnmeasuredSlowFrames} frames över {SlowFrameFloorMs:F0} ms bar "
+                + "MsCPUWait, så det finns ingen frame-mätning som kan bekräfta eller motsäga spårets väntan "
+                + "(PresentMon v1 eller en capture utan kolumnen). Konfidensen hålls nere tills en capture "
+                + "med kolumnen mäter samma sorts frames.");
         }
 
         hypotheses.Add(new HypothesisScore(RootCauseCategory.FiveMThreadWait, confidence, evidence));
@@ -1203,7 +1308,22 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             evidence.Add("Ingen annan stark lokal contention-stack överröstade ETW-fynden.");
         }
 
-        hypotheses.Add(new HypothesisScore(RootCauseCategory.OsOrDriverLatency, Math.Min(confidence, 0.9), evidence));
+        // Having a trace is not the same as having measured latency in it. The base above is paid for
+        // the attachment existing, and with a longest DPC of a quarter of a millisecond the rest of this
+        // method is the frame data restated — which is how a window whose worst DPC was 0.23 ms of
+        // 206 457 came to be ranked a driver problem the moment a competing hypothesis was demoted.
+        // Same treatment as an unmeasured script verdict: a lead, below the bar that ends an
+        // investigation.
+        var ceiling = worstLatency >= 1 ? 0.9 : UncorroboratedAttributionCeiling;
+        if (worstLatency < 1)
+        {
+            evidence.Add(
+                $"OBEKRÄFTAD: längsta uppmätta DPC/ISR i spåret var {worstLatency:F2} ms, vilket inte räcker för "
+                + "att blockera schemaläggaren. Resten av indicierna här är frametime-data omskriven, så "
+                + $"konfidensen är takad till {UncorroboratedAttributionCeiling:P0}.");
+        }
+
+        hypotheses.Add(new HypothesisScore(RootCauseCategory.OsOrDriverLatency, Math.Min(confidence, ceiling), evidence));
     }
 
     private static void AddCorruptionHypothesis(List<HypothesisScore> hypotheses, IReadOnlyList<ArtifactEvidence> artifacts)
@@ -1557,7 +1677,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         FrameMetrics metrics)
     {
         var slowFrames = frameSamples
-            .Where(frame => frame.FrameTimeMs >= Math.Max(100, metrics.SpikeThresholdMs))
+            .Where(frame => frame.FrameTimeMs >= Math.Max(SlowFrameFloorMs, metrics.SpikeThresholdMs))
             .ToArray();
         if (slowFrames.Length == 0)
         {
@@ -1791,11 +1911,41 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         double MaxGpuWaitMs,
         double MaxFlipDelayMs,
         int DroppedCount,
+        int MeasuredSlowFrames,
+        int SlowFramesThatWaited,
+        double MaxSlowFrameCpuWaitMs,
+        int UnmeasuredSlowFrames,
         PresentModeMetrics PresentMode,
         DisplayChangeMetrics DisplayChange)
     {
         public static FrameMetrics Empty { get; } =
-            new(0, 0, 16.67, 25, 40, 0, 0, 0, 0, 0, 0, false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, PresentModeMetrics.Empty, DisplayChangeMetrics.Empty);
+            new(0, 0, 16.67, 25, 40, 0, 0, 0, 0, 0, 0, false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, PresentModeMetrics.Empty, DisplayChangeMetrics.Empty);
+
+        /// <summary>
+        /// True when the window's own large frames carried <c>MsCPUWait</c> and none of them waited.
+        /// </summary>
+        /// <remarks>
+        /// The measurement that ends a thread-wait argument. A frame that lost 300 ms while waiting
+        /// 0.2 ms of it did not lose that time waiting, whatever a trace shows some other thread doing —
+        /// and on 30 August all 35 frames over 100 ms reported between 0.1 and 0.4 ms while the engine
+        /// ranked the incident <see cref="RootCauseCategory.FiveMThreadWait"/> at 98%, on a worker
+        /// thread that was waiting for the main thread. Requires the column to be present: PresentMon
+        /// v1 supplies no wait figure, and absent is not zero.
+        /// </remarks>
+        public bool NoSlowFrameWaited => MeasuredSlowFrames > 0 && SlowFramesThatWaited == 0;
+
+        /// <summary>
+        /// True when the window had the frames a wait verdict would be about and not one of them
+        /// carried <c>MsCPUWait</c>.
+        /// </summary>
+        /// <remarks>
+        /// The blind spot behind <see cref="NoSlowFrameWaited"/>. Frames without the column are dropped
+        /// before the count is taken, so a window where every large frame lacks it produces the same
+        /// zeroes as one with no large frames at all — and the check above, which only ever lowers a
+        /// verdict, stays silent. The trace then went unchallenged at 98% on a window that had measured
+        /// nothing.
+        /// </remarks>
+        public bool SlowFramesUnmeasured => MeasuredSlowFrames == 0 && UnmeasuredSlowFrames > 0;
 
         /// <summary>
         /// Share of the window's whole lost time that the CPU spent computing rather than waiting.

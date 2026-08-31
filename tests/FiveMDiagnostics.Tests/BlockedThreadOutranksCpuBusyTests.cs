@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Tests;
+﻿namespace FiveMDiagnostics.Tests;
 
 using FiveMDiagnostics.Analysis;
 using FiveMDiagnostics.Core;
@@ -49,15 +49,28 @@ public sealed class BlockedThreadOutranksCpuBusyTests
     }
 
     /// <summary>
-    /// The thread wait hypothesis is the one the evidence actually supports, so it has to come out on
-    /// top — the ranking is what the incident report prints.
+    /// Neither hypothesis may claim the window, because the two instruments disagree about it.
     /// </summary>
+    /// <remarks>
+    /// This used to assert that the thread wait came out on top. The 31 August note added the rule that
+    /// a frame whose own <c>MsCPUWait</c> is under a millisecond cannot be explained by a thread
+    /// waiting, and this frame reports 0.4 ms — the same 0.1–0.4 ms band as every large frame of that
+    /// evening, and the same band as the 08-30 frame this file's sibling is built from (0.0737 ms in the
+    /// CSV, for a frame the trace shows the main thread off the processor for 245.8 of 261.6 ms). So the
+    /// trace says a game thread slept through the frame and PresentMon says the frame did not wait, and
+    /// nothing in the window settles which is right. Both are capped below the bar, and the incident
+    /// reads as what it is: unresolved. What must not happen is the earlier failure — a confident
+    /// script verdict built on <c>MsCPUBusy</c> — and that is what the assertion below protects.
+    /// </remarks>
     [Fact]
-    public void TheThreadWaitHypothesisOutranksTheScriptSpike()
+    public void NeitherVerdictWinsWhenTheFrameAndTheTraceDisagree()
     {
         var analysis = _engine.Analyze(BuildIncident(withTrace: true));
 
-        Assert.Equal(RootCauseCategory.FiveMThreadWait, analysis.Hypotheses[0].Category);
+        Assert.Equal(RootCauseCategory.InsufficientEvidence, analysis.Hypotheses[0].Category);
+        Assert.All(
+            analysis.Hypotheses.Where(item => item.Category is RootCauseCategory.FiveMThreadWait or RootCauseCategory.FiveMResourceSpike),
+            item => Assert.True(item.Confidence <= 0.3, $"{item.Category} reached {item.Confidence:P0}"));
     }
 
     /// <summary>
@@ -288,10 +301,51 @@ public sealed class BlockedThreadOutranksCpuBusyTests
         };
     }
 
+    /// <summary>
+    /// The other side of the 31 August rule: a frame that did wait is still explained by a wait.
+    /// </summary>
+    /// <remarks>
+    /// The rule is a bound on a verdict, not a removal of the category. When the frame's own
+    /// <c>MsCPUWait</c> agrees with the trace, the two instruments say the same thing and the wait is
+    /// the answer — which is what nine sessions of notes asked for and what must survive the bound.
+    /// </remarks>
+    [Fact]
+    public void AFrameThatDidWaitIsStillExplainedByTheWait()
+    {
+        var analysis = _engine.Analyze(BuildIncident(withTrace: true, cpuWaitMs: 560.0));
+
+        Assert.Equal(RootCauseCategory.FiveMThreadWait, analysis.Hypotheses[0].Category);
+        Assert.True(analysis.Hypotheses[0].Confidence >= 0.9);
+    }
+
+    /// <summary>
+    /// A window whose large frames never carried <c>MsCPUWait</c> cannot confirm the trace either, and
+    /// the verdict has to stop short of the near-certainty it used to reach.
+    /// </summary>
+    /// <remarks>
+    /// The blind spot between the two rules above. Frames without the column are dropped before the
+    /// wait counts are taken, so a PresentMon v1 capture produces the same zeroes as a window with no
+    /// large frames — and the check that lowers a wait verdict never fires. The trace then stood
+    /// unchallenged at 98% on an incident where nothing had measured the frames at all.
+    /// </remarks>
+    [Fact]
+    public void AnUnmeasuredWindowCannotGiveTheWaitNearCertainty()
+    {
+        var analysis = _engine.Analyze(BuildIncident(withTrace: true, cpuWaitMs: null));
+        var wait = analysis.Hypotheses.First(item => item.Category == RootCauseCategory.FiveMThreadWait);
+
+        Assert.True(wait.Confidence <= 0.6, $"an unmeasured window reached {wait.Confidence:P0}");
+        Assert.Contains(wait.Evidence, item => item.Contains("bar MsCPUWait", StringComparison.Ordinal));
+
+        // Not a contradiction either. The trace measured something and stays the leading lead.
+        Assert.True(wait.Confidence > 0.34, $"an uncontradicted wait was discarded ({wait.Confidence:P0})");
+    }
+
     private static IncidentRecord BuildIncident(
         bool withTrace,
         double waitMs = 568.9,
-        bool extraCpuBoundSpikes = false)
+        bool extraCpuBoundSpikes = false,
+        double? cpuWaitMs = 0.4)
     {
         var events = new List<TelemetryEvent>();
         var markedAt = Start.AddSeconds(30);
@@ -320,7 +374,7 @@ public sealed class BlockedThreadOutranksCpuBusyTests
             Dropped: false,
             ProcessName: "FiveM_b3407_GTAProcess.exe",
             CpuBusyMs: 585.2,
-            CpuWaitMs: 0.4));
+            CpuWaitMs: cpuWaitMs));
 
         // Four further CPU-bound spikes in the two seconds after the marker, making roughly 1 750 ms of
         // CPU-bound spike time in the window. A short wait covers almost none of it; a 1 700 ms one

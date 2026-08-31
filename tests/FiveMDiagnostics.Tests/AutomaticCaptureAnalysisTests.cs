@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Tests;
+﻿namespace FiveMDiagnostics.Tests;
 
 using FiveMDiagnostics.Analysis;
 using FiveMDiagnostics.Collectors;
@@ -47,16 +47,27 @@ public sealed class AutomaticCaptureAnalysisTests : IDisposable
     }
 
     /// <summary>
-    /// And the point of it reaching the analysis: the verdict changes. The window looks entirely
-    /// CPU-bound to PresentMon, which is what a blocked thread looks like to PresentMon.
+    /// And the point of it reaching the analysis: the trace is in the ranking rather than on disk.
     /// </summary>
+    /// <remarks>
+    /// It no longer wins. The 31 August note added the rule that a frame whose own <c>MsCPUWait</c> is
+    /// under a millisecond cannot be explained by a thread waiting, and this fixture's frame reports
+    /// 0.4 ms — so the wait the trace found is ranked as a lead and the window is decided by what was
+    /// measured executing. The wait and its evidence are still in the list, which is what this asserts;
+    /// what it can no longer assert is the ranking, because the frame contradicts it.
+    /// </remarks>
     [Fact]
-    public async Task TheTraceOverrulesTheCpuBoundAttribution()
+    public async Task TheTraceReachesTheRankingEvenWhenTheFrameContradictsIt()
     {
         var incident = await RunSessionAsync(new StubEtlParser());
 
         Assert.NotNull(incident.Analysis);
-        Assert.Equal(RootCauseCategory.FiveMThreadWait, incident.Analysis!.Hypotheses[0].Category);
+        var wait = incident.Analysis!.Hypotheses.FirstOrDefault(item => item.Category == RootCauseCategory.FiveMThreadWait);
+
+        Assert.NotNull(wait);
+        Assert.True(wait!.Confidence <= 0.3, $"a wait the frame contradicts reached {wait.Confidence:P0}");
+        Assert.Contains(wait.Evidence, item => item.Contains("MsCPUWait", StringComparison.Ordinal));
+        Assert.NotEqual(RootCauseCategory.FiveMThreadWait, incident.Analysis.Hypotheses[0].Category);
     }
 
     /// <summary>

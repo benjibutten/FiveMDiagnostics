@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Tests;
+﻿namespace FiveMDiagnostics.Tests;
 
 using System.Globalization;
 using System.Text.RegularExpressions;
@@ -54,7 +54,11 @@ public sealed class AnchorSkewThreadWaitCorrelationTests
     {
         var analysis = _engine.Analyze(BuildAugust29Incident(anchorSkewMs: MeasuredAnchorSkewMs));
 
-        Assert.Equal(RootCauseCategory.FiveMThreadWait, analysis.Hypotheses[0].Category);
+        // Found, listed, and no longer ranked first: this frame's own MsCPUWait is 0.0737 ms in the
+        // CSV, and the 31 August rule says a frame that did not wait cannot be explained by a wait.
+        // Finding the wait at all is what the anchor tolerance is about, and that is what is asserted
+        // here; the ranking it now produces is asserted in TheWindowIsUnresolvedWhenTheFrameDidNotWait.
+        Assert.Contains(analysis.Hypotheses, item => item.Category == RootCauseCategory.FiveMThreadWait);
     }
 
     /// <summary>
@@ -82,7 +86,29 @@ public sealed class AnchorSkewThreadWaitCorrelationTests
     {
         var analysis = _engine.Analyze(BuildAugust29Incident(anchorSkewMs: 0));
 
-        Assert.Equal(RootCauseCategory.FiveMThreadWait, analysis.Hypotheses[0].Category);
+        Assert.Contains(analysis.Hypotheses, item => item.Category == RootCauseCategory.FiveMThreadWait);
+    }
+
+    /// <summary>
+    /// And what the ranking says about it now: nothing, on purpose.
+    /// </summary>
+    /// <remarks>
+    /// The trace shows the main thread off the processor for 245.8 of this frame's 261.6 ms, and
+    /// PresentMon reports 0.0737 ms of <c>MsCPUWait</c> for the same frame — verified against
+    /// <c>presentmon_5264_20260829_204657.csv</c>. Both instruments describe the same frame and they
+    /// cannot both be right, so no verdict built on either may top the ranking: the wait is capped by
+    /// the 31 August rule and the script spike by the contradiction that was already there. The window
+    /// is reported as unresolved, which is the one answer that is not a claim the data cannot support.
+    /// </remarks>
+    [Fact]
+    public void TheWindowIsUnresolvedWhenTheFrameDidNotWait()
+    {
+        var analysis = _engine.Analyze(BuildAugust29Incident(anchorSkewMs: MeasuredAnchorSkewMs));
+
+        Assert.Equal(RootCauseCategory.InsufficientEvidence, analysis.Hypotheses[0].Category);
+        Assert.All(
+            analysis.Hypotheses.Where(item => item.Category is RootCauseCategory.FiveMThreadWait or RootCauseCategory.FiveMResourceSpike),
+            item => Assert.True(item.Confidence <= 0.3, $"{item.Category} reached {item.Confidence:P0}"));
     }
 
     /// <summary>
