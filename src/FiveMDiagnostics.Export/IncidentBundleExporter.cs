@@ -1,4 +1,4 @@
-using System.IO.Compression;
+﻿using System.IO.Compression;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
@@ -326,6 +326,10 @@ public sealed class IncidentBundleExporter : IIncidentExporter
                 ("success", probe.Success.ToString()),
                 ("rttMs", probe.RoundTripTimeMs?.ToString("F1", CultureInfo.InvariantCulture) ?? string.Empty),
                 ("failureReason", probe.FailureReason ?? string.Empty),
+
+                // Which host this was. Without it the export is a column of RTTs against hostnames the
+                // reader has to recognise, and the gateway reads as one more measurement of the server.
+                ("isReferenceHost", probe.IsReferenceHost.ToString()),
             ],
             ArtifactEvidence artifact =>
             [

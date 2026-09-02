@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Tools.EtlAnalyzer;
+﻿namespace FiveMDiagnostics.Tools.EtlAnalyzer;
 
 using System.Runtime.InteropServices;
 
@@ -125,6 +125,10 @@ internal static class Program
                 CpuReports.Timeline(window, IntOf(args, "--bucket") ?? 200);
                 break;
 
+            case "vram":
+                CpuReports.VideoMemory(window, target, IntOf(args, "--bucket") ?? 1000);
+                break;
+
             case "io":
                 IoReports.Report(window, hardFaults!.Result.Faults, diskIo!.Result.Activity, fileIo!.Result, target);
                 break;
@@ -132,6 +136,7 @@ internal static class Program
             case "all":
                 RunWait(path, target, args);
                 CpuReports.Cpu(window, target, IntOf(args, "--threads") ?? 12);
+                CpuReports.VideoMemory(window, target, 1000);
                 CpuReports.Timeline(window, IntOf(args, "--bucket") ?? 200);
                 IoReports.Report(window, hardFaults!.Result.Faults, diskIo!.Result.Activity, fileIo!.Result, target);
                 break;
@@ -191,9 +196,10 @@ internal static class Program
               thread --tid <id>   module breakdown for one thread, in cores
               smt    --tid <id>   how often that thread shared a physical core, and with what
               timeline            per-bucket CPU for the busiest processes
+              vram                per-second dxgmms2.sys (video memory paging) next to the target
               io                  hard faults, disk operations and file system traffic
               wait                off-CPU intervals on the game thread, and the thread that released it
-              all                 cpu + timeline + wait + io
+              all                 cpu + vram + timeline + wait + io
 
             Options
               --process <name>    substring of the process to focus on (default: GTAProcess)

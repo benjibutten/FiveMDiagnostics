@@ -325,6 +325,26 @@ public sealed record DeepCaptureOptions
     public TimeSpan PostMarkerTail { get; set; } = TimeSpan.FromSeconds(2);
 
     /// <summary>
+    /// Longest the tail may run when frames are still arriving late at the end of it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="PostMarkerTail"/> is sized for the ordinary case, where the marker lands at the end of
+    /// a hitch and two seconds is enough to show the recovery. A freeze is not that case: on
+    /// 1 September one ran from 00:11:45 to 00:11:54, the capture stopped at 00:11:51, and the 790, 677
+    /// and 291 ms frames — the three largest of the evening — fell outside the trace that was attached
+    /// to the incident named after them. Four further captures were refused in those same seconds
+    /// because the first one was still writing, so extending the one that is running is the only way
+    /// the file can cover the event at all.
+    /// </para>
+    /// <para>
+    /// Bounded rather than open-ended: the ring buffer is a fixed size, so a tail that ran for a minute
+    /// would overwrite the run-up it was recorded to keep.
+    /// </para>
+    /// </remarks>
+    public TimeSpan MaxPostMarkerTail { get; set; } = TimeSpan.FromSeconds(12);
+
+    /// <summary>
     /// Duration of a one-shot capture, used only when no ring buffer session is running — an unelevated
     /// start, a profile WPR rejected, or a marker that arrived before the session came up. Such a
     /// capture holds nothing from before the marker.
@@ -606,6 +626,14 @@ public sealed record DeepCaptureOptions
                 ? TimeSpan.FromSeconds(60)
                 : PostMarkerTail;
 
+        // Never shorter than the fixed tail, so a configuration that lowers only this one cannot turn
+        // the ordinary tail off by accident, and never long enough to overwrite the run-up.
+        MaxPostMarkerTail = MaxPostMarkerTail < PostMarkerTail
+            ? PostMarkerTail
+            : MaxPostMarkerTail > TimeSpan.FromSeconds(60)
+                ? TimeSpan.FromSeconds(60)
+                : MaxPostMarkerTail;
+
         // A threshold at or below an ordinary spike would let a routine 40 ms frame spend a capture, and
         // the budget would be gone in the first minute. 100 ms is already three missed frames at 60 Hz.
         AutoCaptureFrameTimeMs = double.IsNaN(AutoCaptureFrameTimeMs) || AutoCaptureFrameTimeMs < 100
@@ -679,14 +707,25 @@ public sealed record DeepCaptureOptions
     /// the time the ring buffer needs to fill again.
     /// </summary>
     /// <remarks>
-    /// <see cref="MinimumOverrideCooldown"/> minus the refill. The refill is what makes a capture
-    /// <em>good</em>; the tail and the thirty seconds <c>wpr -stop</c> takes to write the file are what
-    /// make one <em>possible</em>, and only the second is a hard constraint. Four sessions running have
-    /// lost their largest frame to the first — 356 ms at 20:23:50 on 31 August, refused with 43 s of
-    /// refill left, in the opening ten minutes where the buffer never catches up — and a trace holding
-    /// eight seconds of run-up would have explained it, while no trace explains nothing.
+    /// <para>
+    /// The same constraint <see cref="MinimumOverrideCooldown"/> enforces, without the refill. The
+    /// refill is what makes a capture <em>good</em>; the tail and the thirty seconds <c>wpr -stop</c>
+    /// takes to write the file are what make one <em>possible</em>, and only the second is a hard
+    /// constraint. Four sessions running have lost their largest frame to the first — 356 ms at
+    /// 20:23:50 on 31 August, refused with 43 s of refill left, in the opening ten minutes where the
+    /// buffer never catches up — and a trace holding eight seconds of run-up would have explained it,
+    /// while no trace explains nothing.
+    /// </para>
+    /// <para>
+    /// Measured against <see cref="MaxPostMarkerTail"/> and not <see cref="PostMarkerTail"/>, because
+    /// the tail a capture actually takes is decided by the stall and not by the setting: a freeze that
+    /// keeps producing late frames holds the tail open up to the maximum. Sized on the nominal two
+    /// seconds, this gate hands out a reservation while the previous capture is still recording, the
+    /// budget is spent, and the capture gate then refuses the capture that was paid for — the one
+    /// outcome worse than refusing it here, since a refusal here at least leaves the budget intact.
+    /// </para>
     /// </remarks>
-    public TimeSpan ExtremeCaptureSpacing => PostMarkerTail + TimeSpan.FromSeconds(30);
+    public TimeSpan ExtremeCaptureSpacing => MaxPostMarkerTail + TimeSpan.FromSeconds(30);
 
     /// <summary>
     /// Whether a frame is catastrophic enough to spend budget the ordinary cooldown would have withheld.
@@ -1312,12 +1351,18 @@ public sealed record NetworkEndpointSample(
     IReadOnlyList<RemoteEndpointInfo> RemoteEndpoints,
     IReadOnlyList<int> UdpLocalPorts) : TelemetryEvent(Timestamp, "Network");
 
+/// <param name="IsReferenceHost">
+/// True when the host is a stand-in rather than the game server — the default gateway, probed because
+/// the server does not answer ICMP at all. Such a probe says whether the local network was healthy and
+/// nothing whatsoever about the path to the server, and every report that quotes it has to say so.
+/// </param>
 public sealed record NetworkProbeSample(
     DateTimeOffset Timestamp,
     string Host,
     double? RoundTripTimeMs,
     bool Success,
-    string? FailureReason = null) : TelemetryEvent(Timestamp, "Probe");
+    string? FailureReason = null,
+    bool IsReferenceHost = false) : TelemetryEvent(Timestamp, "Probe");
 
 public sealed record ArtifactEvidence(
     DateTimeOffset Timestamp,

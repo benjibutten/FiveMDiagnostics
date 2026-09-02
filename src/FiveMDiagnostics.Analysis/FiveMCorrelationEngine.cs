@@ -132,6 +132,65 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
     /// </remarks>
     private const double UnmeasuredFrameConfidenceCeiling = 0.6;
 
+    /// <summary>
+    /// How far OBS's skipped render frames have to exceed the game's own losses before they are OBS's.
+    /// </summary>
+    /// <remarks>
+    /// A capture source renders what the game hands it, so when the game loses three hundred refresh
+    /// slots the source loses about three hundred frames whatever else is true. Slack of half again
+    /// absorbs the ordinary mismatch between a 60 Hz game and a 60 fps canvas that are not in phase;
+    /// beyond it, OBS is dropping frames the game did produce, which is its own problem.
+    /// </remarks>
+    private const double ObsExcessRenderSkipRatio = 1.5;
+
+    /// <summary>Render time above which OBS's own loop is late rather than merely idle.</summary>
+    private const double ObsLateRenderMs = 18;
+
+    /// <summary>
+    /// Ceiling on an OBS verdict with no counter of OBS's own behind it.
+    /// </summary>
+    /// <remarks>
+    /// The 1 September session is the argument. Its worst incident — a 790 ms frame inside a nine-second
+    /// freeze, with the card at 92% and the video memory manager at 0.91 cores — was ranked OBS
+    /// contention at 80%, on four signals that are every one of them downstream of the freeze: render
+    /// skips (the game produced nothing to capture), render time (the whole machine stalled), severe
+    /// spikes (the freeze itself) and an NVENC peak (the encoder catching up afterwards). Output
+    /// skipped frames, the one counter that measures OBS rather than the game, stood at zero from
+    /// 23:11 to 01:10. Below the 0.35 bar, so the state stays on the incident as context and cannot be
+    /// the conclusion.
+    /// </remarks>
+    private const double ObsWitnessConfidenceCeiling = 0.25;
+
+    /// <summary>
+    /// Confidence a witnessing OBS hypothesis carries, so its explanation is attached to the incident.
+    /// </summary>
+    /// <remarks>
+    /// Not zero, because a hypothesis with no confidence is not recorded at all and the reader then sees
+    /// an OBS counter that moved during the freeze with nothing saying why it does not matter. Far below
+    /// the 0.35 bar, because it is not a cause.
+    /// </remarks>
+    private const double ObsWitnessFloor = 0.1;
+
+    /// <summary>
+    /// Video memory manager rate in a trace above which Windows was demonstrably evacuating the card.
+    /// </summary>
+    /// <remarks>
+    /// Mirrors <c>VideoMemoryPressure.PressuredCores</c> in the ETL parser, which is where the figure is
+    /// calibrated. Duplicated as a constant rather than shared because the analysis assembly does not
+    /// reference the ETW one — the number travels as an artifact metric.
+    /// </remarks>
+    private const double VideoMemoryManagerPressuredCores = 0.40;
+
+    /// <summary>
+    /// Confidence a hypothesis has to reach before it is reported as the incident's likely cause.
+    /// </summary>
+    /// <remarks>
+    /// Named rather than inlined because three ceilings are set relative to it — a verdict held below
+    /// this bar stays visible as a lead and cannot be the answer — and because the summary now prints
+    /// it when a window falls short.
+    /// </remarks>
+    private const double ClassificationFloor = 0.35;
+
     public IncidentAnalysis Analyze(IncidentRecord incident)
     {
         var frameSamples = incident.GetEvents<FrameTelemetrySample>();
@@ -168,8 +227,10 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         var hypotheses = new List<HypothesisScore>();
         var correlatedThreadWait = FindCorrelatedThreadWait(artifacts, frameSamples, metrics);
 
+        var videoMemory = FindVideoMemoryPressure(artifacts, incident.WindowStart, incident.WindowEnd);
+
         AddThreadWaitHypothesis(hypotheses, correlatedThreadWait, metrics);
-        AddVramHypothesis(hypotheses, metrics, gpu, correlatedThreadWait, gpuProcessMemory);
+        AddVramHypothesis(hypotheses, metrics, gpu, correlatedThreadWait, gpuProcessMemory, videoMemory);
         AddObsHypothesis(hypotheses, metrics, obsSamples, gpu);
         AddGpuHypothesis(hypotheses, metrics, obsSamples, systemSamples, gpu, correlatedThreadWait);
         AddResourceHypothesis(hypotheses, metrics, processSamples, artifacts, obsSamples, systemSamples, cores, correlatedThreadWait);
@@ -183,7 +244,11 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             .OrderByDescending(item => item.Confidence)
             .ToList();
 
-        if (hypotheses.Count == 0 || hypotheses[0].Confidence < 0.35)
+        // Kept before the fallback is inserted, so the summary can say how close the engine came rather
+        // than only that it fell short.
+        var runnerUp = hypotheses.FirstOrDefault();
+
+        if (hypotheses.Count == 0 || hypotheses[0].Confidence < ClassificationFloor)
         {
             hypotheses.Insert(0, new HypothesisScore(
                 RootCauseCategory.InsufficientEvidence,
@@ -193,7 +258,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
 
         var highlights = BuildHighlights(incident, metrics, hypotheses.First(), artifacts, obsSamples, gpu, networkProbes, suspectedProcesses, gpuProcessMemory);
         var top = hypotheses[0];
-        var summary = BuildSummary(top, metrics, obsSamples, gpu, artifacts, networkProbes, suspectedProcesses, gpuProcessMemory);
+        var summary = BuildSummary(top, runnerUp, metrics, obsSamples, gpu, artifacts, networkProbes, suspectedProcesses, gpuProcessMemory);
 
         return new IncidentAnalysis(
             hypotheses,
@@ -504,23 +569,31 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         FrameMetrics metrics,
         GpuMetrics gpu,
         CorrelatedThreadWait? correlatedThreadWait,
-        GpuProcessMemorySample? gpuProcessMemory)
+        GpuProcessMemorySample? gpuProcessMemory,
+        TraceVideoMemoryPressure? videoMemory)
     {
         if (!gpu.HasData || gpu.PeakVramPercent < VramPressurePercent || metrics.SpikeCount == 0)
         {
             return;
         }
 
+        // A trace that watched the video memory manager work is not a correlation between occupancy and
+        // stutter — it is the eviction itself, measured. Both guards below exist because occupancy alone
+        // proves nothing, and neither of them should survive an instrument that saw the mechanism.
+        var measuredEviction = videoMemory is { IsPressured: true };
+
         // A measured off-CPU wait is direct evidence for where the missing time went. High occupancy
         // cannot override it: VRAM is adapter-wide and full VRAM is normal until an eviction is seen.
-        if (correlatedThreadWait is not null)
+        // A thread waiting while the driver pages video memory is waiting *for* the driver, so the
+        // trace's own video memory figure is the exception.
+        if (correlatedThreadWait is not null && !measuredEviction)
         {
             return;
         }
 
         // The signature of eviction is a long frame where neither engine was working. Without the
         // per-frame breakdown that distinction cannot be made, so this stays a weak correlation.
-        if (metrics.HasCpuGpuBreakdown && metrics.PresentBoundSpikes == 0)
+        if (metrics.HasCpuGpuBreakdown && metrics.PresentBoundSpikes == 0 && !measuredEviction)
         {
             return;
         }
@@ -562,6 +635,27 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             evidence.Add($"NVENC låg på {gpu.PeakEncoderPercent:F0}%, så encodern konkurrerade om samma GPU-minne.");
         }
 
+        if (videoMemory is { IsPressured: true } pressure)
+        {
+            // The strongest single piece of evidence this hypothesis can carry, and the only one that
+            // observes the mechanism rather than its symptoms.
+            confidence += 0.35;
+            evidence.Add(
+                $"ETL-spåret mätte Windows videominneshanterare (dxgmms2.sys) till {pressure.PeakCores:F2} kärnor som mest "
+                + $"under en sekund, mot {pressure.BaselineCores:F2} i spårets lugna sekunder. Så mycket flyttning sker bara "
+                + "när kortet är fullt och drivrutinen evakuerar ytor över PCIe.");
+
+            if (pressure.SubjectWentQuiet
+                && pressure.SubjectCoresAtPeak is { } atPeak
+                && pressure.SubjectBaselineCores is { } baselineCores)
+            {
+                evidence.Add(
+                    $"Samtidigt föll spelets egen CPU-förbrukning till {atPeak:F2} kärnor, mot {baselineCores:F2} i övriga "
+                    + "sekunder — tiden gick åt till att vänta på flytten, inte till att räkna, vilket är varför framesen "
+                    + "ändå ser CPU-bundna ut i PresentMon.");
+            }
+        }
+
         evidence.Add(DescribeGpuProcessMemory(gpuProcessMemory) is { } owners
             ? $"Fördelningen vid trycket: {owners}"
             : "Obs: VRAM mäts per grafikkort, inte per process, så andra program bidrar till siffran.");
@@ -588,34 +682,65 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         var skippedOutput = Delta(connectedSamples.Select(item => item.OutputSkippedFrames));
         var maxRenderTime = connectedSamples.Select(item => item.AverageFrameRenderTimeMs ?? 0).DefaultIfEmpty().Max();
 
-        if (skippedRender > 0)
-        {
-            confidence += 0.35;
-            evidence.Add($"OBS render skipped frames ökade med {skippedRender} under incidentfönstret.");
-        }
+        // Only the frames OBS dropped *beyond* the game's own losses are OBS's. Everything up to that
+        // line is the capture source failing to find a new frame in a window where the game was not
+        // producing any, which is what a witness looks like.
+        var lostSlots = metrics.LostFrameSlots;
+        var excessRenderSkips = skippedRender > lostSlots * ObsExcessRenderSkipRatio;
+
+        // The stream's own pipeline, and the only counter here that a stalled game cannot produce:
+        // output frames are dropped when the encoder or the network cannot keep up, not when there is
+        // nothing new to encode.
+        var causal = skippedOutput > 0 || excessRenderSkips || maxRenderTime >= ObsLateRenderMs;
 
         if (skippedOutput > 0)
         {
-            confidence += 0.25;
-            evidence.Add($"OBS output skipped frames ökade med {skippedOutput} under incidentfönstret.");
+            confidence += 0.35;
+            evidence.Add($"OBS output skipped frames ökade med {skippedOutput} under incidentfönstret, vilket är streamens egen pipeline och inte en följd av att spelet stannade.");
         }
 
-        if (maxRenderTime >= 18)
+        if (excessRenderSkips)
+        {
+            confidence += 0.3;
+            evidence.Add($"OBS render skipped frames ökade med {skippedRender}, mot spelets egna {lostSlots:F0} tappade bildrutor i samma fönster — OBS tappade alltså mer än spelet.");
+        }
+        else if (skippedRender > 0)
+        {
+            // Enough to put the hypothesis on the incident and nowhere near enough to rank it. The
+            // sentence is the point: without it the next reader finds an OBS counter that moved by 280
+            // during a freeze and no record of anyone having checked what it means.
+            confidence += ObsWitnessFloor;
+            evidence.Add($"OBS render skipped frames ökade med {skippedRender}, men spelet tappade självt {lostSlots:F0} bildrutor i samma fönster. En capture-källa kan inte rendera frames spelet aldrig producerade, så räknaren mäter stuttern i stället för att förklara den.");
+        }
+
+        if (maxRenderTime >= ObsLateRenderMs)
         {
             confidence += 0.2;
             evidence.Add($"OBS average frame render time toppade på {maxRenderTime:F1} ms.");
         }
 
-        if (metrics.SevereSpikeCount > 0)
+        // Both of these rise during any system-wide stall — the encoder because it catches up once the
+        // game resumes — so they may only add to a case that already has a cause of its own.
+        if (causal && metrics.SevereSpikeCount > 0)
         {
             confidence += 0.15;
             evidence.Add($"Frametime hade {metrics.SevereSpikeCount} spikes över {metrics.SevereThresholdMs:F0} ms samtidigt som OBS var aktivt.");
         }
 
-        if (gpu.HasData && gpu.PeakEncoderPercent >= 40)
+        if (causal && gpu.HasData && gpu.PeakEncoderPercent >= 40)
         {
             confidence += 0.1;
             evidence.Add($"NVENC-encodern toppade på {gpu.PeakEncoderPercent:F0}%.");
+        }
+
+        if (!causal)
+        {
+            // Kept as a lead so the OBS state stays visible on the incident, held below the 0.35 bar so
+            // it cannot be the answer. Every signal that put it at 80% on 1 September — render skips,
+            // render time, severe spikes, an NVENC sawtooth — is downstream of the freeze it was blamed
+            // for, and output skipped stood at zero for the whole evening.
+            confidence = Math.Min(confidence, ObsWitnessConfidenceCeiling);
+            evidence.Add($"Noll output skipped frames: tittarna tappade ingen bild. Utan en räknare som är OBS egen kan hypotesen inte rankas över {ObsWitnessConfidenceCeiling:P0}.");
         }
 
         if (confidence > 0)
@@ -794,14 +919,14 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             if (correlatedThreadWait?.Contradicts(metrics.CpuBoundSpikeMs) != true)
             {
                 confidence += 0.35;
-                evidence.Add($"{metrics.CpuBoundSpikes} av {metrics.SpikeCount} frametime-spikes var CPU-bundna (CPU busy dominerade frametiden).");
+                evidence.Add($"{metrics.CpuBoundSpikes} av {metrics.SpikeCount} frametime-spikes låg på pipelinens CPU-sida (MsCPUBusy dominerade frametiden). Det måttet är väggklocktid före present, inte förbrukad processortid: en tråd som står inne i ett drivrutinsanrop bokförs likadant som en som räknar.");
             }
             else
             {
                 evidence.Add(
-                    $"BORTSETT: {metrics.CpuBoundSpikes} av {metrics.SpikeCount} spikes ser CPU-bundna ut, men ETL-spåret visar "
+                    $"BORTSETT: {metrics.CpuBoundSpikes} av {metrics.SpikeCount} spikes ligger på CPU-sidan, men ETL-spåret visar "
                     + $"att aktiv GTA-tråd tid {correlatedThreadWait.ThreadId:F0} låg av CPU:n i "
-                    + $"{correlatedThreadWait.OverlappingSlowFrameMs:F0} av spikarnas {metrics.CpuBoundSpikeMs:F0} CPU-bundna ms. "
+                    + $"{correlatedThreadWait.OverlappingSlowFrameMs:F0} av spikarnas {metrics.CpuBoundSpikeMs:F0} ms på CPU-sidan. "
                     + "PresentMon räknar blockerad tid som CPU busy, så attributionen kan inte "
                     + "skilja skriptarbete från väntan här och räknas därför inte som stöd.");
             }
@@ -846,7 +971,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                 evidence.Add(
                     $"NEDVIKTAD: ETL-spåret visar en aktiv GTA-tråd av CPU:n i "
                     + $"{correlatedThreadWait.OverlappingSlowFrameMs:F0} av fönstrets {metrics.CpuBoundSpikeMs:F0} "
-                    + $"CPU-bundna spike-ms, så konfidensen är takad till {ContradictedConfidenceCeiling:P0}. "
+                    + $"spike-ms på CPU-sidan, så konfidensen är takad till {ContradictedConfidenceCeiling:P0}. "
                     + "En blockerad tråd utför inget skriptarbete, och resterande indicier skiljer inte de två fallen åt.");
             }
             else if (!measuredExecution)
@@ -918,8 +1043,15 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             }
         }
 
-        var successfulProbes = probes.Where(item => item.Success && item.RoundTripTimeMs is not null).ToArray();
-        var failedProbes = probes.Count(item => !item.Success);
+        // A gateway probe is not a measurement of the path to the server. It is taken because the server
+        // refuses ICMP and something is better than four sessions of nothing, but every figure derived
+        // from it would be a claim about the wrong hop — so it is scored separately and never as the
+        // server.
+        var serverProbes = probes.Where(item => !item.IsReferenceHost).ToArray();
+        var referenceProbes = probes.Where(item => item.IsReferenceHost).ToArray();
+
+        var successfulProbes = serverProbes.Where(item => item.Success && item.RoundTripTimeMs is not null).ToArray();
+        var failedProbes = serverProbes.Count(item => !item.Success);
         var maxRtt = successfulProbes.Select(item => item.RoundTripTimeMs ?? 0).DefaultIfEmpty().Max();
         var avgRtt = successfulProbes.Select(item => item.RoundTripTimeMs ?? 0).DefaultIfEmpty().Average();
 
@@ -929,7 +1061,26 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         // probe was aimed at something that was never going to reply. Treating that as evidence of
         // packet loss produced a network hypothesis in 26 incidents of a session whose every spike was
         // CPU bound, so the probes are allowed to say nothing rather than to say the wrong thing.
-        var probesNeverAnswered = probes.Count > 0 && successfulProbes.Length == 0;
+        var probesNeverAnswered = serverProbes.Length > 0 && successfulProbes.Length == 0;
+
+        // The one thing the reference host can settle, and only in the negative direction: a gateway
+        // that stopped answering means the machine's own link went away, which is a far larger event
+        // than a game server hiccuping and is worth saying out loud.
+        var referenceFailures = referenceProbes.Count(item => !item.Success);
+        if (referenceFailures > 0 && referenceProbes.Length > 0)
+        {
+            confidence += referenceFailures == referenceProbes.Length ? 0.35 : 0.2;
+            evidence.Add(
+                $"{referenceFailures} av {referenceProbes.Length} prober mot nätets egen gateway misslyckades under "
+                + "incidenten. Gatewayen är på samma kabel som datorn, så det gäller hela anslutningen och inte "
+                + "bara vägen till spelservern.");
+        }
+        else if (referenceProbes.Length > 0)
+        {
+            evidence.Add(
+                $"Alla {referenceProbes.Length} prober mot nätets egen gateway svarade, så det lokala nätet var uppe. "
+                + "Det säger ingenting om vägen till spelservern, som inte svarar på ICMP.");
+        }
 
         if (maxRtt >= 120)
         {
@@ -1122,7 +1273,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
 
                     evidence.Add(
                         $"NEDVIKTAD: {decisiveShare:P0} av spike-tiden ({metrics.CpuBoundSpikeMs:F0} av {metrics.TotalSpikeMs:F0} ms, "
-                        + $"{metrics.CpuBoundSpikes} av {metrics.SpikeCount} spikes) var CPU-bunden. {counterNote}, "
+                        + $"{metrics.CpuBoundSpikes} av {metrics.SpikeCount} spikes) låg på CPU-sidan. {counterNote}, "
                         + $"så konfidensen är takad till {ContradictedConfidenceCeiling:P0}.");
                 }
             }
@@ -1362,7 +1513,9 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             highlights.Add(new(
                 incident.Marker.MarkedAt,
                 "Frame attribution",
-                $"Spikes fördelade som CPU-bundna {metrics.CpuBoundSpikes}, GPU-bundna {metrics.GpuBoundSpikes}, present/display {metrics.PresentBoundSpikes}."));
+                $"Av {metrics.SpikeCount} spikes låg {metrics.CpuBoundSpikes} på pipelinens CPU-sida (GPU-arbetet var inte flaskhalsen), "
+                + $"{metrics.GpuBoundSpikes} var GPU-bundna och {metrics.PresentBoundSpikes} present/display-bundna. "
+                + "CPU-sidan mäts som väggklocktid före present och betyder inte att processorn räknade."));
         }
 
         if (metrics.PresentMode.HasData)
@@ -1415,13 +1568,14 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             highlights.Add(new(obs.Timestamp, "OBS", $"OBS-status: {state}. Render time {obs.AverageFrameRenderTimeMs:F1} ms, render skipped {obs.RenderSkippedFrames}, output skipped {obs.OutputSkippedFrames}."));
         }
 
-        var probe = probes.OrderByDescending(item => item.RoundTripTimeMs ?? 0).FirstOrDefault();
-        if (probe is not null)
-        {
-            highlights.Add(new(probe.Timestamp, "Network", probe.Success
-                ? $"RTT mot {probe.Host} nådde {probe.RoundTripTimeMs:F0} ms."
-                : $"Probe mot {probe.Host} misslyckades: {probe.FailureReason ?? "okänt fel"}."));
-        }
+        // Said apart, exactly as BuildProbeHint says them apart. The worst RTT of the window is often
+        // the gateway's, and "RTT mot 192.168.1.1 nådde 41 ms" on the Network line reads as a
+        // measurement of the connection to the server — which is the one thing it is not.
+        AddProbeHighlight(highlights, probes.Where(item => !item.IsReferenceHost).ToArray(), "spelservern");
+        AddProbeHighlight(
+            highlights,
+            probes.Where(item => item.IsReferenceHost).ToArray(),
+            "nätets gateway (referens, inte spelservern)");
 
         var suspect = suspectedProcesses.FirstOrDefault();
         if (suspect is not null)
@@ -1434,8 +1588,26 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         return highlights.OrderBy(item => item.Timestamp).ToArray();
     }
 
+    /// <summary>Adds the worst probe of one host class to the timeline, named as that class.</summary>
+    private static void AddProbeHighlight(
+        List<TimelineHighlight> highlights,
+        IReadOnlyList<NetworkProbeSample> probes,
+        string label)
+    {
+        var probe = probes.OrderByDescending(item => item.RoundTripTimeMs ?? 0).FirstOrDefault();
+        if (probe is null)
+        {
+            return;
+        }
+
+        highlights.Add(new(probe.Timestamp, "Network", probe.Success
+            ? $"RTT mot {label} ({probe.Host}) nådde {probe.RoundTripTimeMs:F0} ms."
+            : $"Probe mot {label} ({probe.Host}) misslyckades: {probe.FailureReason ?? "okänt fel"}."));
+    }
+
     private static string BuildSummary(
         HypothesisScore top,
+        HypothesisScore? runnerUp,
         FrameMetrics metrics,
         IReadOnlyList<ObsTelemetrySample> obsSamples,
         GpuMetrics gpu,
@@ -1458,31 +1630,6 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         };
         var probeHint = BuildProbeHint(probes);
 
-        if (top.Category == RootCauseCategory.InsufficientEvidence)
-        {
-            var missing = new List<string>();
-            if (!metrics.HasCpuGpuBreakdown)
-            {
-                missing.Add("PresentMon med --v2_metrics (ger CPU/GPU-uppdelning per frame)");
-            }
-
-            if (!gpu.HasData)
-            {
-                missing.Add("GPU-telemetri (VRAM och encoder-last)");
-            }
-
-            if (artifacts.Count == 0)
-            {
-                missing.Add("profiler/net_stats eller en deep capture");
-            }
-
-            var hint = missing.Count > 0
-                ? $" Starkast förbättring just nu: {string.Join(", ", missing)}."
-                : string.Empty;
-
-            return $"Insufficient evidence. Kör gärna en ny session i grundläge igen.{hint}{presentModeHint}{probeHint}";
-        }
-
         var obsActive = obsSamples.Any(item => item.IsStreaming)
             ? "OBS-processen körde, WebSocket var ansluten och streamen var aktiv."
             : obsSamples.Any(item => item.IsConnected)
@@ -1491,7 +1638,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                     ? "OBS-processen körde men WebSocket var inte ansluten."
                     : "OBS-processen körde inte.";
         var attribution = metrics.HasCpuGpuBreakdown && metrics.SpikeCount > 0
-            ? $" Av {metrics.SpikeCount} spikes var {metrics.CpuBoundSpikes} CPU-bundna, {metrics.GpuBoundSpikes} GPU-bundna och {metrics.PresentBoundSpikes} present/display-bundna."
+            ? $" Av {metrics.SpikeCount} spikes låg {metrics.CpuBoundSpikes} på pipelinens CPU-sida (GPU-arbetet var inte flaskhalsen), {metrics.GpuBoundSpikes} var GPU-bundna och {metrics.PresentBoundSpikes} present/display-bundna."
             : string.Empty;
         // The adapter figure says how full the card was; the top holder says whose memory it was. Four
         // sessions of reports carried the first without the second, and the reader could only guess.
@@ -1506,7 +1653,62 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             ? $" Mest avvikande bakgrundsprocess: {suspect.ProcessName} ({suspect.Reason.ToLowerInvariant()})."
             : string.Empty;
 
-        return $"Trolig rotorsak: {ToLabel(top.Category)} ({top.Confidence:P0}). Frametime-fönstret hade baseline {metrics.BaselineFrameTime:F1} ms, P95 {metrics.P95FrameTime:F1} ms och P99 {metrics.P99FrameTime:F1} ms.{attribution}{presentModeHint}{vramHint} {obsActive}{artifactHint}{probeHint}{suspectHint}";
+        // Everything above this line is measurement, and measurement does not depend on the engine
+        // reaching a verdict. The unclassified branch used to return before any of it: on 1 September
+        // fifteen of forty-eight incidents therefore said nothing at all about the card, while it sat
+        // between 85 and 92% in every one of them. What is withheld when the evidence is thin is the
+        // conclusion, not the readings.
+        var measurements = $"Frametime-fönstret hade baseline {metrics.BaselineFrameTime:F1} ms, P95 {metrics.P95FrameTime:F1} ms "
+            + $"och P99 {metrics.P99FrameTime:F1} ms.{attribution}{presentModeHint}{vramHint} {obsActive}{artifactHint}{probeHint}{suspectHint}";
+
+        if (top.Category == RootCauseCategory.InsufficientEvidence)
+        {
+            return $"Insufficient evidence. {measurements}{BuildShortfallHint(runnerUp, metrics, gpu, artifacts)}";
+        }
+
+        return $"Trolig rotorsak: {ToLabel(top.Category)} ({top.Confidence:P0}). {measurements}";
+    }
+
+    /// <summary>
+    /// Says how close the engine came and what would have closed the gap.
+    /// </summary>
+    /// <remarks>
+    /// "Insufficient evidence" next to a hypothesis list whose first entry reads 34% is the same
+    /// sentence whether the window held nothing or missed the bar by a percentage point, and the two
+    /// call for opposite responses. Naming the runner-up and the threshold makes the difference legible
+    /// without opening the journal.
+    /// </remarks>
+    private static string BuildShortfallHint(
+        HypothesisScore? runnerUp,
+        FrameMetrics metrics,
+        GpuMetrics gpu,
+        IReadOnlyList<ArtifactEvidence> artifacts)
+    {
+        var shortfall = runnerUp is not null
+            ? $" Högsta hypotes var {ToLabel(runnerUp.Category)} på {runnerUp.Confidence:P0}, under tröskeln {ClassificationFloor:P0}."
+            : " Ingen hypotes fick något stöd alls i fönstret.";
+
+        var missing = new List<string>();
+        if (!metrics.HasCpuGpuBreakdown)
+        {
+            missing.Add("PresentMon med --v2_metrics (ger CPU/GPU-uppdelning per frame)");
+        }
+
+        if (!gpu.HasData)
+        {
+            missing.Add("GPU-telemetri (VRAM och encoder-last)");
+        }
+
+        if (artifacts.Count == 0)
+        {
+            missing.Add("profiler/net_stats eller en deep capture");
+        }
+
+        var hint = missing.Count > 0
+            ? $" Starkast förbättring just nu: {string.Join(", ", missing)}."
+            : string.Empty;
+
+        return $"{shortfall}{hint}";
     }
 
     /// <summary>
@@ -1552,11 +1754,26 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             return string.Empty;
         }
 
+        // Said apart, always. A sentence that folds a gateway's RTT in with the server's reads as a
+        // measurement of the connection to the server, and it is not one.
+        var server = probes.Where(item => !item.IsReferenceHost).ToArray();
+        var reference = probes.Where(item => item.IsReferenceHost).ToArray();
+
+        return DescribeProbes(server, "nätprober") + DescribeProbes(reference, "prober mot nätets gateway (referens, inte spelservern)");
+    }
+
+    private static string DescribeProbes(IReadOnlyList<NetworkProbeSample> probes, string label)
+    {
+        if (probes.Count == 0)
+        {
+            return string.Empty;
+        }
+
         var failed = probes.Count(item => !item.Success);
         if (failed == 0)
         {
             var worstRtt = probes.Select(item => item.RoundTripTimeMs ?? 0).DefaultIfEmpty().Max();
-            return $" Alla {probes.Count} nätprober svarade, högsta RTT {worstRtt:F0} ms.";
+            return $" Alla {probes.Count} {label} svarade, högsta RTT {worstRtt:F0} ms.";
         }
 
         if (failed == probes.Count)
@@ -1565,11 +1782,11 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                 .Select(item => item.FailureReason)
                 .FirstOrDefault(item => !string.IsNullOrWhiteSpace(item)) ?? "okänt fel";
 
-            return $" Samtliga {probes.Count} nätprober misslyckades ({reason}); ingen RTT-mätning för fönstret.";
+            return $" Samtliga {probes.Count} {label} misslyckades ({reason}); ingen RTT-mätning för fönstret.";
         }
 
         var succeededRtt = probes.Where(item => item.Success).Select(item => item.RoundTripTimeMs ?? 0).DefaultIfEmpty().Max();
-        return $" {failed} av {probes.Count} nätprober misslyckades; de som svarade toppade på {succeededRtt:F0} ms.";
+        return $" {failed} av {probes.Count} {label} misslyckades; de som svarade toppade på {succeededRtt:F0} ms.";
     }
 
     private static IReadOnlyList<SuspectedProcessImpact> AnalyzeSuspiciousProcesses(IReadOnlyList<SystemTelemetrySample> systemSamples)
@@ -1888,6 +2105,88 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         PresentBound,
     }
 
+    /// <summary>
+    /// What a deep capture measured about Windows moving video memory during the incident window.
+    /// </summary>
+    /// <param name="PeakCores">Busiest second in <c>dxgmms2.sys</c>.</param>
+    /// <param name="BaselineCores">Median second in the same module across the retained trace.</param>
+    /// <param name="SubjectCoresAtPeak">What the game held during that second.</param>
+    /// <param name="SubjectBaselineCores">What the game held in the median second.</param>
+    /// <param name="SubjectWentQuiet">Whether the game used materially less CPU while the driver worked.</param>
+    private sealed record TraceVideoMemoryPressure(
+        double PeakCores,
+        double BaselineCores,
+        double? SubjectCoresAtPeak,
+        double? SubjectBaselineCores,
+        bool SubjectWentQuiet)
+    {
+        public bool IsPressured => PeakCores >= VideoMemoryManagerPressuredCores;
+    }
+
+    /// <summary>
+    /// Reads the video memory manager figures out of whichever attached trace saw the most paging.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Max rather than average across attachments: an incident window can carry more than one capture,
+    /// and the question is whether the driver was ever seen evacuating the card, not how a quiet trace
+    /// dilutes a busy one.
+    /// </para>
+    /// <para>
+    /// Max <em>among the traces that were looking at this incident</em>, though. The same window can
+    /// hold a capture taken for a hitch a minute earlier, and paging the driver did then says nothing
+    /// about the frames under examination now — while it is exactly what tips
+    /// <see cref="RootCauseCategory.GpuVramPressure"/> over its bar. The parser already writes what
+    /// each file covers; this is the reader that was missing.
+    /// </para>
+    /// </remarks>
+    private static TraceVideoMemoryPressure? FindVideoMemoryPressure(
+        IReadOnlyList<ArtifactEvidence> artifacts,
+        DateTimeOffset windowStart,
+        DateTimeOffset windowEnd)
+    {
+        var trace = artifacts
+            .Where(item => item.Kind == ArtifactKind.EtlTrace
+                && item.Metrics.ContainsKey("videoMemoryManagerPeakCores")
+                && OverlapsWindow(item, windowStart, windowEnd))
+            .OrderByDescending(item => item.Metrics.GetValueOrDefault("videoMemoryManagerPeakCores"))
+            .FirstOrDefault();
+
+        if (trace is null)
+        {
+            return null;
+        }
+
+        var hasSubject = trace.Metrics.ContainsKey("videoMemorySubjectCoresAtPeak");
+        return new TraceVideoMemoryPressure(
+            trace.Metrics.GetValueOrDefault("videoMemoryManagerPeakCores"),
+            trace.Metrics.GetValueOrDefault("videoMemoryManagerBaselineCores"),
+            hasSubject ? trace.Metrics.GetValueOrDefault("videoMemorySubjectCoresAtPeak") : null,
+            hasSubject ? trace.Metrics.GetValueOrDefault("videoMemorySubjectBaselineCores") : null,
+            trace.Metrics.GetValueOrDefault("videoMemorySubjectWentQuiet") >= 0.5);
+    }
+
+    /// <summary>
+    /// Whether the span a trace says it covers touches the incident window at all.
+    /// </summary>
+    /// <remarks>
+    /// A trace that names no span is kept rather than discarded. The pair is written whenever the file
+    /// held a timestamped event to read it from, and an attachment that could not say what it covers
+    /// was still captured for this marker — silent is not the same as elsewhere.
+    /// </remarks>
+    private static bool OverlapsWindow(ArtifactEvidence trace, DateTimeOffset windowStart, DateTimeOffset windowEnd)
+    {
+        if (!trace.Metrics.TryGetValue("traceCoveredStartUnixMs", out var startMs)
+            || !trace.Metrics.TryGetValue("traceCoveredEndUnixMs", out var endMs)
+            || endMs <= startMs)
+        {
+            return true;
+        }
+
+        return DateTimeOffset.FromUnixTimeMilliseconds((long)startMs) <= windowEnd
+            && DateTimeOffset.FromUnixTimeMilliseconds((long)endMs) >= windowStart;
+    }
+
     private sealed record FrameMetrics(
         int SampleCount,
         double MedianFrameTime,
@@ -1953,6 +2252,21 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         /// lowers this rather than flattering it. Null when there were no spikes at all.
         /// </summary>
         public double? CpuBoundTimeShare => TotalSpikeMs > 0 ? CpuBoundSpikeMs / TotalSpikeMs : null;
+
+        /// <summary>
+        /// How many refresh slots the game itself lost in this window.
+        /// </summary>
+        /// <remarks>
+        /// The denominator OBS's skipped render frames have to be read against. A capture source cannot
+        /// render a frame the game never produced, so an OBS counter that rose by roughly what the game
+        /// lost is a witness to the stall rather than a party to it — and on 1 September that
+        /// distinction was the difference between blaming the stream and finding the cause: OBS skipped
+        /// 280 render frames during a nine-second freeze in which the game lost more than that on its
+        /// own, and the incident was ranked OBS contention at 80% while the card sat at 92%.
+        /// </remarks>
+        public double LostFrameSlots => BaselineFrameTime > 0
+            ? Math.Max(0, (TotalSpikeMs / BaselineFrameTime) - SpikeCount)
+            : 0;
     }
 
     /// <summary>

@@ -252,6 +252,35 @@ public sealed class VramBudgetMonitorTests
         Assert.Equal(7.95, report.GameHeadroomBytes / (double)Gigabyte, 2);
     }
 
+    /// <summary>
+    /// The budget a setting is chosen against is the measured edge, not the card's physical size.
+    /// </summary>
+    /// <remarks>
+    /// Two sessions put that edge at 88% occupancy: above it the hitch rate multiplies, and on
+    /// 1 September 76% of every frame over 100 ms fell inside the 17% of the evening spent there. The
+    /// line as it read that night offered the game 8.2 GB of a 10 GB card while the measured ceiling was
+    /// 6.9, and it is this line that answers "can I keep Very High".
+    /// </remarks>
+    [Fact]
+    public void TheBudgetIsQuotedAgainstTheMeasuredEdgeAndNotTheCardsSize()
+    {
+        var monitor = new VramBudgetMonitor();
+        monitor.Observe(Adapter(Start, usedGigabytes: 8.37));
+
+        var report = monitor.Observe(Sample(Start, gameGigabytes: 6.32, obsGigabytes: 1.02));
+
+        Assert.NotNull(report);
+
+        // 88% of 10 GB is 8.8, less the 2.05 GB the desktop and the stream stack hold.
+        Assert.Equal(8.8 - 2.05, report!.GameBandHeadroomBytes / (double)Gigabyte, 2);
+        Assert.True(
+            report.GameBandHeadroomBytes < report.GameHeadroomBytes,
+            "the measured edge has to be tighter than the card's physical size, or it says nothing");
+
+        Assert.Contains("ryms utan tryck upp till", report.Message, StringComparison.Ordinal);
+        Assert.Contains("88 %", report.Message, StringComparison.Ordinal);
+    }
+
     /// <summary>The ordinary case says nothing about it, because there is nothing to say.</summary>
     [Fact]
     public void AnUntruncatedTableIsNotAnnotated()

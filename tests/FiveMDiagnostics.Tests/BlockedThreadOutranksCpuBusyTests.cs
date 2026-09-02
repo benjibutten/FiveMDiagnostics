@@ -31,7 +31,7 @@ public sealed class BlockedThreadOutranksCpuBusyTests
         var resource = analysis.Hypotheses.FirstOrDefault(item => item.Category == RootCauseCategory.FiveMResourceSpike);
 
         Assert.NotNull(resource);
-        Assert.DoesNotContain(resource!.Evidence, item => item.Contains("var CPU-bundna", StringComparison.Ordinal));
+        Assert.DoesNotContain(resource!.Evidence, item => item.Contains("på pipelinens CPU-sida", StringComparison.Ordinal));
         Assert.Contains(resource.Evidence, item => item.Contains("BORTSETT", StringComparison.Ordinal));
     }
 
@@ -84,7 +84,7 @@ public sealed class BlockedThreadOutranksCpuBusyTests
         var resource = analysis.Hypotheses.FirstOrDefault(item => item.Category == RootCauseCategory.FiveMResourceSpike);
 
         Assert.NotNull(resource);
-        Assert.Contains(resource!.Evidence, item => item.Contains("var CPU-bundna", StringComparison.Ordinal));
+        Assert.Contains(resource!.Evidence, item => item.Contains("på pipelinens CPU-sida", StringComparison.Ordinal));
         Assert.DoesNotContain(resource.Evidence, item => item.Contains("NEDVIKTAD", StringComparison.Ordinal));
         Assert.True(resource.Confidence > 0.3, $"an uncontradicted script verdict was discarded ({resource.Confidence:P0})");
     }
@@ -238,7 +238,7 @@ public sealed class BlockedThreadOutranksCpuBusyTests
         var resource = analysis.Hypotheses.FirstOrDefault(item => item.Category == RootCauseCategory.FiveMResourceSpike);
 
         Assert.NotNull(resource);
-        Assert.Contains(resource!.Evidence, item => item.Contains("var CPU-bundna", StringComparison.Ordinal));
+        Assert.Contains(resource!.Evidence, item => item.Contains("på pipelinens CPU-sida", StringComparison.Ordinal));
         Assert.DoesNotContain(resource.Evidence, item => item.Contains("NEDVIKTAD", StringComparison.Ordinal));
     }
 

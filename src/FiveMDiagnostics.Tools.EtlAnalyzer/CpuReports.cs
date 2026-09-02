@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Tools.EtlAnalyzer;
+﻿namespace FiveMDiagnostics.Tools.EtlAnalyzer;
 
 using Microsoft.Windows.EventTracing.Cpu;
 
@@ -62,6 +62,62 @@ internal static class CpuReports
             Console.WriteLine($"    {window.Cores(group.Count()),6:F3} cores  {100.0 * group.Count() / target.Length,5:F1}%  {group.Key}");
         }
     }
+
+    /// <summary>
+    /// Per-second rate of the video memory manager, next to what the target process was doing.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Windows pages video memory on a System worker thread inside <c>dxgmms2.sys</c>, so a card that
+    /// has run out of room shows up here and nowhere else — not in the game's threads, which go quiet,
+    /// and not on the GPU, which idles. Across the four captures of 1 September the module tracked the
+    /// card's fill exactly: 0.05 cores at 84% VRAM, 0.18 at 88%, 0.41 during a hitch at 91% and 0.91
+    /// during a nine-second freeze at 92%, while the game fell from 3.93 to 3.22 cores in the same
+    /// seconds.
+    /// </para>
+    /// <para>
+    /// Printed as a series rather than an average because the average of a thirty-second trace holding
+    /// a six-second freeze is neither number. The column that matters is the pair: the driver climbing
+    /// while the game falls is waiting, both climbing together is work.
+    /// </para>
+    /// </remarks>
+    public static void VideoMemory(TraceWindow window, string targetProcess, int bucketMs)
+    {
+        var origin = window.StartRelativeMilliseconds;
+        var buckets = new SortedDictionary<int, (int Driver, int Target, int Total)>();
+
+        foreach (var sample in window.Samples)
+        {
+            var bucket = (int)((sample.Timestamp.RelativeTimestamp.TotalMilliseconds - origin) / bucketMs);
+            var entry = buckets.GetValueOrDefault(bucket);
+            var module = TraceWindow.ModuleName(sample);
+            buckets[bucket] = (
+                entry.Driver + (module.Equals(VideoMemoryManagerModule, StringComparison.OrdinalIgnoreCase) ? 1 : 0),
+                entry.Target + (Matches(sample, targetProcess) ? 1 : 0),
+                entry.Total + 1);
+        }
+
+        // Cores inside one bucket, not across the window: window.Cores divides by the whole sampled
+        // span, which would flatten a one-second spike into the thirty seconds around it.
+        double BucketCores(int samples) => samples * 1000d / bucketMs / window.SamplesPerCoreSecond;
+
+        Console.WriteLine();
+        Console.WriteLine($"  {"ms",8}  {VideoMemoryManagerModule,12}  {Truncate(targetProcess, 12),12}  {"all",8}");
+        foreach (var (bucket, counts) in buckets)
+        {
+            Console.WriteLine($"  {bucket * bucketMs,8}  {BucketCores(counts.Driver),12:F2}"
+                + $"  {BucketCores(counts.Target),12:F2}  {BucketCores(counts.Total),8:F2}");
+        }
+
+        var driverTotal = window.Samples.Count(sample =>
+            TraceWindow.ModuleName(sample).Equals(VideoMemoryManagerModule, StringComparison.OrdinalIgnoreCase));
+        Console.WriteLine();
+        Console.WriteLine($"  {VideoMemoryManagerModule} over the whole window: {window.Cores(driverTotal):F2} cores");
+        Console.WriteLine("  above ~0.40 cores in a second the driver is evacuating the card, and the frames that");
+        Console.WriteLine("  look CPU-bound in PresentMon are the game waiting for it.");
+    }
+
+    private const string VideoMemoryManagerModule = "dxgmms2.sys";
 
     /// <summary>
     /// Module breakdown for a single thread, in cores rather than percentages.

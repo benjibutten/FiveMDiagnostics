@@ -27,7 +27,7 @@ using FiveMDiagnostics.Core;
 /// straight after a capture, which is why automatic incidents do not save traces.
 /// </para>
 /// </remarks>
-public sealed class WprDeepCaptureService : IDeepCaptureService, IDisposable
+public sealed class WprDeepCaptureService : IDeepCaptureService, IStallAwareDeepCapture, IDisposable
 {
     /// <summary>
     /// WPR records into a single machine-wide session, so nothing here may overlap. Without this gate a
@@ -35,6 +35,12 @@ public sealed class WprDeepCaptureService : IDeepCaptureService, IDisposable
     /// it — and destroy the trace the first marker was still collecting.
     /// </summary>
     private readonly SemaphoreSlim _captureGate = new(1, 1);
+
+    /// <summary>How often the tail asks whether the stall is over. Half a second is a few frames.</summary>
+    private const double RecoveryPollMs = 500;
+
+    /// <inheritdoc />
+    public Func<bool>? StallInProgress { get; set; }
 
     /// <summary>
     /// The <c>-start</c> arguments the running ring buffer session was started with, or null when no
@@ -206,16 +212,11 @@ public sealed class WprDeepCaptureService : IDeepCaptureService, IDisposable
         DiagnosticsSettings settings,
         CancellationToken cancellationToken)
     {
-        var tail = settings.DeepCapture.PostMarkerTail;
-
         try
         {
             // The run-up is already in the buffer; this waits only for the recovery, which is why a
             // marker costs seconds rather than the old fifteen.
-            if (tail > TimeSpan.Zero)
-            {
-                await Task.Delay(tail, cancellationToken).ConfigureAwait(false);
-            }
+            var tail = await WaitForRecoveryAsync(settings.DeepCapture, cancellationToken).ConfigureAwait(false);
 
             var stop = await RunWprAsync(wprPath, $"-stop \"{capturePath}\"", cancellationToken).ConfigureAwait(false);
             _ringBufferArguments = null;
@@ -254,6 +255,52 @@ public sealed class WprDeepCaptureService : IDeepCaptureService, IDisposable
             _ringBufferArguments = null;
             throw;
         }
+    }
+
+    /// <summary>
+    /// Waits out the tail, extending it for as long as frames are still arriving late.
+    /// </summary>
+    /// <remarks>
+    /// Polled rather than event-driven because the only question is "is it over yet", asked a handful of
+    /// times against a probe the caller already keeps updated. Without a probe this is the fixed delay
+    /// it has always been.
+    /// </remarks>
+    private Task<TimeSpan> WaitForRecoveryAsync(DeepCaptureOptions options, CancellationToken cancellationToken)
+    {
+        return WaitForRecoveryAsync(options, StallInProgress, Task.Delay, cancellationToken);
+    }
+
+    /// <param name="delay">
+    /// How the wait is spent. Injected so the loop can be tested without spending twelve real seconds
+    /// per case, and because the thing worth testing is how long it decides to wait, not that
+    /// <see cref="Task.Delay(TimeSpan, CancellationToken)"/> works.
+    /// </param>
+    internal static async Task<TimeSpan> WaitForRecoveryAsync(
+        DeepCaptureOptions options,
+        Func<bool>? stallInProgress,
+        Func<TimeSpan, CancellationToken, Task> delay,
+        CancellationToken cancellationToken)
+    {
+        var tail = options.PostMarkerTail;
+        if (tail > TimeSpan.Zero)
+        {
+            await delay(tail, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (stallInProgress is not { } stillStalling)
+        {
+            return tail;
+        }
+
+        var maximum = options.MaxPostMarkerTail;
+        while (tail < maximum && stillStalling())
+        {
+            var step = TimeSpan.FromMilliseconds(Math.Min(RecoveryPollMs, (maximum - tail).TotalMilliseconds));
+            await delay(step, cancellationToken).ConfigureAwait(false);
+            tail += step;
+        }
+
+        return tail;
     }
 
     /// <summary>
@@ -697,6 +744,22 @@ public sealed class EtlArtifactParser : IArtifactParser
                 foreach (var module in attribution.BusiestThreadModules)
                 {
                     metrics[$"cpuBusiestThreadCores_{module.Module}"] = Math.Round(module.Cores, 4);
+                }
+
+                if (attribution.VideoMemory is { } videoMemory)
+                {
+                    // The one measurement that tells a full card from a busy one, so the correlation
+                    // engine gets it as a number and not only inside the prose summary.
+                    metrics["videoMemoryManagerPeakCores"] = Math.Round(videoMemory.PeakCores, 3);
+                    metrics["videoMemoryManagerBaselineCores"] = Math.Round(videoMemory.BaselineCores, 3);
+                    metrics["videoMemoryManagerPressured"] = videoMemory.IsPressured ? 1 : 0;
+
+                    if (videoMemory.SubjectCoresAtPeak is { } atPeak && videoMemory.SubjectBaselineCores is { } baselineCores)
+                    {
+                        metrics["videoMemorySubjectCoresAtPeak"] = Math.Round(atPeak, 3);
+                        metrics["videoMemorySubjectBaselineCores"] = Math.Round(baselineCores, 3);
+                        metrics["videoMemorySubjectWentQuiet"] = videoMemory.SubjectWentQuiet ? 1 : 0;
+                    }
                 }
             }
 

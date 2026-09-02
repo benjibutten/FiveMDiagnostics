@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 
 namespace FiveMDiagnostics.Collectors;
 
@@ -66,12 +66,16 @@ public sealed class FiveMProcessTelemetryCollector : ITelemetryCollector
                     // The process ended between the resolver handing out the id and this read. Not a
                     // fault of its own — the next poll re-resolves — so it is worth exactly one line.
                     _previousSnapshot = null;
-                    ReportOnce(context, target.ProcessId, $"FiveM-processen (PID {target.ProcessId}) kördes inte längre när metrics skulle läsas.");
+                    ReportOnce(
+                        context,
+                        target.ProcessId,
+                        StatusLevel.Info,
+                        $"FiveM-processen (PID {target.ProcessId}) fanns inte kvar när metrics skulle läsas — spelet hade avslutats.");
                 }
                 catch (Exception ex)
                 {
                     _previousSnapshot = null;
-                    ReportOnce(context, target.ProcessId, $"Kunde inte läsa FiveM-processens metrics: {ex.Message}");
+                    ReportOnce(context, target.ProcessId, StatusLevel.Warning, $"Kunde inte läsa FiveM-processens metrics: {ex.Message}");
                 }
             }
             else
@@ -84,7 +88,11 @@ public sealed class FiveMProcessTelemetryCollector : ITelemetryCollector
         }
     }
 
-    private void ReportOnce(CollectorContext context, int processId, string message)
+    /// <param name="level">
+    /// Info for the process simply having exited, which is how every evening ends and is not something
+    /// anybody can act on; Warning for a read that failed while the process was still there.
+    /// </param>
+    private void ReportOnce(CollectorContext context, int processId, StatusLevel level, string message)
     {
         if (_reportedFailurePid == processId)
         {
@@ -92,6 +100,6 @@ public sealed class FiveMProcessTelemetryCollector : ITelemetryCollector
         }
 
         _reportedFailurePid = processId;
-        context.StatusSink.Report(StatusLevel.Warning, Name, message);
+        context.StatusSink.Report(level, Name, message);
     }
 }

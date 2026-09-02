@@ -1,5 +1,6 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 
 namespace FiveMDiagnostics.Collectors;
@@ -51,6 +52,11 @@ public sealed class NetworkTelemetryCollector : ITelemetryCollector, IDisposable
     private string? _suspendedProbeHost;
 
     /// <summary>
+    /// Local reference host probed once the server has been given up on, or null when there is none.
+    /// </summary>
+    private string? _referenceProbeHost;
+
+    /// <summary>
     /// Consecutive failures against one host before probing it is given up for the session.
     /// </summary>
     /// <remarks>
@@ -72,6 +78,7 @@ public sealed class NetworkTelemetryCollector : ITelemetryCollector, IDisposable
         _failingProbeHost = null;
         _consecutiveProbeFailures = 0;
         _suspendedProbeHost = null;
+        _referenceProbeHost = null;
 
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -91,9 +98,18 @@ public sealed class NetworkTelemetryCollector : ITelemetryCollector, IDisposable
                 if (!string.IsNullOrWhiteSpace(probeHost)
                     && !string.Equals(probeHost, _suspendedProbeHost, StringComparison.OrdinalIgnoreCase))
                 {
-                    var probeSample = await ProbeAsync(probeHost, timestamp).ConfigureAwait(false);
+                    var probeSample = await ProbeAsync(probeHost, timestamp, isReference: false).ConfigureAwait(false);
                     NoteProbeOutcome(context, probeHost, probeSample);
                     await context.Writer.WriteAsync(probeSample, cancellationToken).ConfigureAwait(false);
+                }
+                else if (_referenceProbeHost is { } reference)
+                {
+                    // The server refuses ICMP, which four sessions running has meant no network
+                    // measurement of any kind. The gateway cannot speak for the path to the server, but
+                    // it separates "the whole connection stalled" from "we measured nothing", and that
+                    // is the difference between an unanswerable question and a narrowed one.
+                    var referenceSample = await ProbeAsync(reference, timestamp, isReference: true).ConfigureAwait(false);
+                    await context.Writer.WriteAsync(referenceSample, cancellationToken).ConfigureAwait(false);
                 }
             }
 
@@ -293,7 +309,13 @@ public sealed class NetworkTelemetryCollector : ITelemetryCollector, IDisposable
         }
 
         _suspendedProbeHost = host;
+        _referenceProbeHost = TryFindDefaultGateway();
         var configured = !string.IsNullOrWhiteSpace(context.Settings.ServerProfile.ProbeHost);
+
+        var fallback = _referenceProbeHost is { } gateway
+            ? $" I stället probas nätets egen gateway ({gateway}) som referens. Den säger ingenting om vägen "
+                + "till spelservern, men den skiljer ’hela anslutningen hackade’ från ’vi mätte ingenting’."
+            : " Ingen gateway hittades att proba som referens, så sessionen har ingen nätmätning alls.";
 
         context.StatusSink.Report(
             StatusLevel.Info,
@@ -304,21 +326,52 @@ public sealed class NetworkTelemetryCollector : ITelemetryCollector, IDisposable
                 ? "ProbeHost är satt manuellt, så kontrollera att adressen svarar på ICMP."
                 : "Hosten härleddes från spelets anslutning, och många spelservrar svarar inte på ICMP alls. "
                     + "Sätt ServerProfile.ProbeHost till en adress som svarar om RTT ska mätas.")
-            + " Incidentrapporterna slutar därmed upprepa att RTT saknas.");
+            + fallback);
     }
 
-    private async Task<NetworkProbeSample> ProbeAsync(string host, DateTimeOffset timestamp)
+    /// <summary>
+    /// Finds the default gateway to use as a reference host.
+    /// </summary>
+    /// <remarks>
+    /// The first operational, non-loopback interface with an IPv4 gateway. Good enough: a machine with
+    /// two default routes has a routing question this measurement was never going to answer anyway, and
+    /// a wrong guess here costs one unanswered ping every poll rather than a wrong conclusion — the
+    /// sample is flagged as a reference either way.
+    /// </remarks>
+    private static string? TryFindDefaultGateway()
+    {
+        try
+        {
+            return NetworkInterface.GetAllNetworkInterfaces()
+                .Where(item => item.OperationalStatus == OperationalStatus.Up
+                    && item.NetworkInterfaceType != NetworkInterfaceType.Loopback)
+                .SelectMany(item => item.GetIPProperties().GatewayAddresses)
+                .Select(item => item.Address)
+                .FirstOrDefault(address => address is not null
+                    && address.AddressFamily == AddressFamily.InterNetwork
+                    && !address.Equals(IPAddress.Any))
+                ?.ToString();
+        }
+        catch (NetworkInformationException)
+        {
+            return null;
+        }
+    }
+
+    private async Task<NetworkProbeSample> ProbeAsync(string host, DateTimeOffset timestamp, bool isReference)
     {
         try
         {
             var reply = await _ping.SendPingAsync(host, 300).ConfigureAwait(false);
             return reply.Status == IPStatus.Success
-                ? new NetworkProbeSample(timestamp, host, reply.RoundtripTime, Success: true)
-                : new NetworkProbeSample(timestamp, host, null, Success: false, reply.Status.ToString());
+                ? new NetworkProbeSample(timestamp, host, reply.RoundtripTime, Success: true, IsReferenceHost: isReference)
+                : new NetworkProbeSample(timestamp, host, null, Success: false, reply.Status.ToString(), isReference);
         }
         catch (Exception ex)
         {
-            return new NetworkProbeSample(timestamp, host, null, Success: false, ex.Message);
+            // isReference travels with the failure too. A gateway that stops answering is a fact about
+            // the local network, and dropping the flag here files it under the game server instead.
+            return new NetworkProbeSample(timestamp, host, null, Success: false, ex.Message, isReference);
         }
     }
 

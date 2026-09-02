@@ -98,6 +98,17 @@ public sealed class AutoDeepCaptureBudget
     private DateTimeOffset? _lastCaptureAt;
 
     /// <summary>
+    /// When the previous capture reported its file written, if it has.
+    /// </summary>
+    /// <remarks>
+    /// Reserving is not capturing. Everything else here is timed from the reservation, which is all the
+    /// budget can see on its own, and the extreme path is the one place where that is not good enough:
+    /// what it has to clear is the previous capture still recording, and the only party that knows when
+    /// that stopped is the caller that awaited it.
+    /// </remarks>
+    private DateTimeOffset? _lastCaptureWrittenAt;
+
+    /// <summary>
     /// The frame time the previous capture was taken for, or zero when it was taken for something with
     /// no frame time — saturation, or a run of dropped frames.
     /// </summary>
@@ -117,6 +128,18 @@ public sealed class AutoDeepCaptureBudget
 
     /// <summary>Captures the detector has spent so far this session.</summary>
     public int Spent => _spent;
+
+    /// <summary>
+    /// Notes that the capture reserved most recently has finished writing its file.
+    /// </summary>
+    /// <remarks>
+    /// Optional: a caller that never says so is treated as one whose capture may still be running, and
+    /// gets <see cref="DeepCaptureOptions.ExtremeCaptureSpacing"/> in full.
+    /// </remarks>
+    public void NoteCaptureWritten(DateTimeOffset timestamp)
+    {
+        _lastCaptureWrittenAt = timestamp;
+    }
 
     /// <summary>Captures still available, for the UI to show rather than leaving the user to guess.</summary>
     public int Remaining => Math.Max(0, _options.MaxAutoCapturesPerSession - _spent);
@@ -353,6 +376,24 @@ public sealed class AutoDeepCaptureBudget
     /// its write rather than the buffer filling again — starting a capture inside that produces two
     /// files describing the same seconds and neither of them complete.
     /// </param>
+    /// <summary>
+    /// What an extreme frame still has to wait for, given what is known about the previous capture.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="DeepCaptureOptions.ExtremeCaptureSpacing"/> is the worst case: a tail held open to
+    /// <see cref="DeepCaptureOptions.MaxPostMarkerTail"/> by a stall that would not end, plus the write.
+    /// That is the right bound while a capture is unaccounted for, and the wrong one the moment it has
+    /// reported its file on disk — nothing is recording then, and the frame in hand is the largest
+    /// of the evening. Waiting out a worst case that has already been observed not to happen is how the
+    /// 356 ms frame of 31 August was lost.
+    /// </remarks>
+    private TimeSpan ExtremeSpacingFrom(DateTimeOffset lastCaptureAt)
+    {
+        return _lastCaptureWrittenAt is { } written && written >= lastCaptureAt
+            ? TimeSpan.Zero
+            : _options.ExtremeCaptureSpacing;
+    }
+
     private bool TryReserveCore(
         DateTimeOffset timestamp,
         string description,
@@ -396,7 +437,7 @@ public sealed class AutoDeepCaptureBudget
         {
             var elapsed = timestamp - last;
             var cooldown = mayOverrideRefill
-                ? _options.ExtremeCaptureSpacing
+                ? ExtremeSpacingFrom(last)
                 : mayOverrideCooldown
                     ? _options.AutoCaptureOverrideCooldown
                     : _options.AutoCaptureCooldown;

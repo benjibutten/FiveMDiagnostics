@@ -65,7 +65,37 @@ public sealed record GameGraphicsSettings(
                 + string.Join("; ", olderCandidates.Select(item => $"{item.Path} ({Local(item.LastWriteTimeUtc)})"))
                 + ". Den nyaste är den som lästes.";
 
-        return $"Spelets grafikinställningar ({Path}, {written}): {Summary}.{WindowModeNote}{others}";
+        var stale = IsStale(sessionStartUtc)
+            ? $" VARNING: filen är {DescribeAge(sessionStartUtc)} gammal och beskriver därför inte den här "
+                + "sessionen. Värdena ovan ska inte användas som facit i någon jämförelse — läs av "
+                + "inställningarna i spelets meny i stället."
+            : string.Empty;
+
+        return $"Spelets grafikinställningar ({Path}, {written}): {Summary}.{WindowModeNote}{stale}{others}";
+    }
+
+    /// <summary>
+    /// Age beyond which the file is describing some other evening entirely.
+    /// </summary>
+    /// <remarks>
+    /// A file written before the session but during the same week is the ordinary case — the settings
+    /// were changed and the game has not been restarted since. A week is where that stops being the
+    /// explanation. On 1 September the only copy on the machine was written 2025-06-04, fifteen months
+    /// earlier, and the app reported its values as this session's settings; three consecutive reviews
+    /// compared evenings against a file from the summer before.
+    /// </remarks>
+    public static readonly TimeSpan StaleAfter = TimeSpan.FromDays(7);
+
+    /// <summary>Whether the file is too old to describe the session that read it.</summary>
+    public bool IsStale(DateTimeOffset? sessionStartUtc)
+    {
+        return sessionStartUtc is { } start && start - LastWriteTimeUtc > StaleAfter;
+    }
+
+    private string DescribeAge(DateTimeOffset? sessionStartUtc)
+    {
+        var days = sessionStartUtc is { } start ? (start - LastWriteTimeUtc).TotalDays : 0;
+        return days >= 60 ? $"{days / 30.44:F0} månader" : $"{days:F0} dagar";
     }
 
     internal static string Local(DateTimeOffset timestamp) => $"{timestamp.ToLocalTime():yyyy-MM-dd HH:mm}";
@@ -301,11 +331,20 @@ public static class GameGraphicsSettingsReader
     /// every one of these that exists is a candidate and the newest of them wins.
     /// </summary>
     /// <remarks>
-    /// FiveM runs the game's own settings code, so it writes the same file a plain GTA V install does.
+    /// <para>
     /// The Documents folder is the ordinary place for it; the two OneDrive paths are there because
     /// Documents is redirected into OneDrive on a great many machines, including the one this app was
     /// written for — and on such a machine the non-redirected path usually still holds a copy from
     /// before the redirection, which is exactly the file that must not be picked.
+    /// </para>
+    /// <para>
+    /// FiveM was assumed to write the same file a plain GTA V install does, and on the machine this app
+    /// was written for it does not. The only copy under Documents there was last written in June 2025
+    /// while the settings were demonstrably changed in August 2026, so the client is keeping its
+    /// configuration under its own data directories — which is why those are searched too. They are
+    /// listed after the Rockstar paths only for readability: order carries no priority any more, the
+    /// newest file wins whichever root it came from.
+    /// </para>
     /// </remarks>
     private static IEnumerable<string> CandidatePaths()
     {
@@ -327,6 +366,40 @@ public static class GameGraphicsSettingsReader
 
             // The redirected case nests Documents inside the OneDrive root.
             yield return Path.Combine(root, "Documents", "Rockstar Games", "GTA V", "settings.xml");
+        }
+
+        foreach (var path in FiveMCandidatePaths())
+        {
+            yield return path;
+        }
+    }
+
+    /// <summary>
+    /// Where the FiveM client keeps a copy of the game's settings under its own data directories.
+    /// </summary>
+    /// <remarks>
+    /// Several layouts, because the client has used more than one and an installation moved to another
+    /// drive keeps none of them. A path that does not exist costs one <c>File.Exists</c>, so the list is
+    /// allowed to be generous; what is not allowed is the previous behaviour, which searched none of
+    /// them and reported a fifteen-month-old file as the session's settings.
+    /// </remarks>
+    private static IEnumerable<string> FiveMCandidatePaths()
+    {
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var roamingAppData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+
+        if (!string.IsNullOrWhiteSpace(localAppData))
+        {
+            yield return Path.Combine(localAppData, "FiveM", "FiveM.app", "citizen", "settings.xml");
+            yield return Path.Combine(localAppData, "FiveM", "FiveM.app", "data", "game-storage", "settings.xml");
+            yield return Path.Combine(localAppData, "FiveM", "FiveM.app", "data", "cache", "settings.xml");
+            yield return Path.Combine(localAppData, "FiveM", "FiveM.app", "settings.xml");
+        }
+
+        if (!string.IsNullOrWhiteSpace(roamingAppData))
+        {
+            yield return Path.Combine(roamingAppData, "CitizenFX", "settings.xml");
+            yield return Path.Combine(roamingAppData, "CitizenFX", "Rockstar Games", "GTA V", "settings.xml");
         }
     }
 }

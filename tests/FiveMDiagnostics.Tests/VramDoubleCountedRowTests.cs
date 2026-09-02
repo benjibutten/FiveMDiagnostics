@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Tests;
+﻿namespace FiveMDiagnostics.Tests;
 
 using FiveMDiagnostics.Core;
 
@@ -28,7 +28,7 @@ public sealed class VramDoubleCountedRowTests
 
         var annotated = monitor.Annotate(Sample(Start, dwmGigabytes: 6.08), out var proven);
 
-        Assert.Equal("dwm", Assert.Single(proven).ProcessName);
+        Assert.Equal("dwm", Assert.Single(proven).Process.ProcessName);
         Assert.Equal("FiveM_b3407_GTAProcess", annotated.Top(1).Single().ProcessName);
     }
 

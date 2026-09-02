@@ -1,4 +1,4 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 
 namespace FiveMDiagnostics.Collectors;
 
@@ -15,6 +15,18 @@ public sealed class FiveMTargetProcessResolver : ITargetProcessResolver
     /// perfectly good candidate and the whole session ends up profiling the diagnostics tool itself.
     /// </summary>
     private static readonly string[] ExcludedTokens = ["FiveMDiagnostics"];
+
+    /// <summary>
+    /// Score a candidate has to reach to be treated as the game at all.
+    /// </summary>
+    /// <remarks>
+    /// Set at the <c>GTA5</c> tier, so the two processes that actually render frames qualify and nothing
+    /// else does. Below it lies the FiveM launcher, which shares the name and none of the behaviour: it
+    /// presents nothing, its CPU and memory describe a downloader, and it lingers after the game exits.
+    /// Returning null instead is the honest answer — there is no game running — and it is what lets the
+    /// app say "the game closed" once rather than warn about each process it briefly finds.
+    /// </remarks>
+    internal const int MinimumTargetScore = 80;
 
     private readonly object _sync = new();
     private readonly TimeSpan _activeCacheDuration = TimeSpan.FromMilliseconds(750);
@@ -87,6 +99,16 @@ public sealed class FiveMTargetProcessResolver : ITargetProcessResolver
             }
             while (Process32Next(snapshotHandle, ref entry));
 
+            // The launcher is not the game. It is named FiveM, it outlives the game process, and it is
+            // still there for a while after the game closes — so accepting it means every consumer
+            // chases a process that presents no frames and reads no useful metrics. On 1 September the
+            // game exited at 01:14:14 and the app immediately raised two warnings about a PID 33540 it
+            // had just picked up, which was the launcher shutting down in its turn.
+            if (bestMatch is null || !IsRenderingProcess(bestMatch.ProcessName))
+            {
+                return null;
+            }
+
             // Stamped on the winner only: the start time is what later tells this process apart from a
             // different one that inherited its id, and reading it costs an OpenProcess per candidate.
             return bestMatch is null
@@ -131,6 +153,12 @@ public sealed class FiveMTargetProcessResolver : ITargetProcessResolver
         }
 
         return processName.StartsWith("FiveM", StringComparison.OrdinalIgnoreCase) ? 20 : 10;
+    }
+
+    /// <summary>Whether a candidate is one of the processes that actually presents frames.</summary>
+    internal static bool IsRenderingProcess(string? processName)
+    {
+        return IsCandidate(processName) && Score(processName!) >= MinimumTargetScore;
     }
 
     [DllImport("kernel32.dll", SetLastError = true)]

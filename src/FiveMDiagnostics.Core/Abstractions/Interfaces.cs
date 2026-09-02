@@ -1,4 +1,4 @@
-using System.Threading.Channels;
+﻿using System.Threading.Channels;
 
 namespace FiveMDiagnostics.Core;
 
@@ -60,6 +60,31 @@ public interface IDeepCaptureService
 
     /// <summary>Tears the ring buffer session down. Tracing costs the machine performance until it does.</summary>
     Task StopRingBufferAsync(CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// A deep capture service that can keep recording while the stall it was started for is still going on.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Optional, and asked for with a type test rather than folded into <see cref="IDeepCaptureService"/>,
+/// because a capture backend that records a fixed window is a perfectly good one — it simply cannot
+/// offer this.
+/// </para>
+/// <para>
+/// The tail exists to show the recovery, and a fixed two seconds shows it only when the stall is
+/// shorter than two seconds. On 1 September a freeze ran for nine, the capture stopped after four, and
+/// the three largest frames of the whole evening fell outside the file that was attached to the
+/// incident naming them.
+/// </para>
+/// </remarks>
+public interface IStallAwareDeepCapture
+{
+    /// <summary>
+    /// Returns true while frames are still arriving late, so the tail should keep running. Null leaves
+    /// the fixed tail in place.
+    /// </summary>
+    Func<bool>? StallInProgress { get; set; }
 }
 
 public interface IDiagnosticStatusSink

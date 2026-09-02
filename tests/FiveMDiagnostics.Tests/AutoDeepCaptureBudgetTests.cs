@@ -128,7 +128,10 @@ public sealed class AutoDeepCaptureBudgetTests
 
         Assert.True(budget.TryReserve(Start, frameTimeMs: 160, out _));
 
-        // Inside the 60 s refill spacing, and past the seconds the previous capture needs to write.
+        // That capture reported its file on disk after the ordinary two second tail and the write.
+        budget.NoteCaptureWritten(Start.AddSeconds(32));
+
+        // Inside the 60 s refill spacing, and past the seconds the previous capture needed to write.
         Assert.True(budget.TryReserve(Start.AddSeconds(40), frameTimeMs: 356, out var refusal));
         Assert.Null(refusal);
         Assert.Equal(2, budget.Spent);
@@ -136,6 +139,34 @@ public sealed class AutoDeepCaptureBudgetTests
         // But not while that file is still being written.
         Assert.False(budget.TryReserve(Start.AddSeconds(45), frameTimeMs: 420, out refusal));
         Assert.Contains("skrivit klart", refusal!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A capture that has not reported its file is assumed to still be recording, and the tail it may
+    /// be holding is the longest the options allow rather than the nominal one.
+    /// </summary>
+    /// <remarks>
+    /// The tail is decided by the stall and not by the setting: a freeze that keeps producing late
+    /// frames holds it open to <see cref="DeepCaptureOptions.MaxPostMarkerTail"/>. Sized on the nominal
+    /// two seconds, this gate hands out a reservation while WPR is still recording — the budget is
+    /// spent, and the capture gate, which admits one capture at a time, then turns away the capture that
+    /// was paid for. A refusal here is the same frame lost with the budget intact.
+    /// </remarks>
+    [Fact]
+    public void AnUnfinishedCaptureHoldsTheExtremePathForTheLongestTail()
+    {
+        var options = Options();
+        var budget = new AutoDeepCaptureBudget(options);
+
+        Assert.Equal(options.MaxPostMarkerTail + TimeSpan.FromSeconds(30), options.ExtremeCaptureSpacing);
+        Assert.True(budget.TryReserve(Start, frameTimeMs: 160, out _));
+
+        // Nothing has said the file is written, so the twelve second tail is still in play.
+        Assert.False(budget.TryReserve(Start.AddSeconds(40), frameTimeMs: 356, out var refusal));
+        Assert.Contains("skrivit klart", refusal!, StringComparison.Ordinal);
+        Assert.Equal(1, budget.Spent);
+
+        Assert.True(budget.TryReserve(Start.AddSeconds(43), frameTimeMs: 356, out _));
     }
 
     /// <summary>

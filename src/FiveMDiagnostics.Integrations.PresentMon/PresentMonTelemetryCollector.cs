@@ -397,12 +397,17 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
         }
 
         _reportedStaleTargetPid = target.ProcessId;
+
+        // Info rather than Warning. This is what the ordinary end of an evening looks like from here —
+        // the game closed between the resolver handing out its id and the capture starting — and raising
+        // it as something to act on filled the app's alert banner with three lines about a process that
+        // had simply exited, none of which could ever be cleared.
         context.StatusSink.Report(
-            StatusLevel.Warning,
+            StatusLevel.Info,
             Name,
-            $"{target.ProcessName} (PID {target.ProcessId}) var inte längre samma process när capturen skulle startas — "
-            + "den hade avslutats, eller så hade PID:n återanvänts. Ingen PresentMon startades mot den; väntar på att "
-            + "processen hittas igen.");
+            $"{target.ProcessName} (PID {target.ProcessId}) fanns inte kvar när capturen skulle startas — "
+            + "spelet hade avslutats, eller så hade PID:n återanvänts. Ingen PresentMon startades mot den; "
+            + "väntar på att spelet startas igen.");
     }
 
     private static string TryGetExitCode(Process process)

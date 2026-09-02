@@ -119,6 +119,51 @@ public sealed class GameGraphicsSettingsReaderTests
     }
 
     /// <summary>
+    /// A file old enough to describe a different year has to say so, not merely carry a date.
+    /// </summary>
+    /// <remarks>
+    /// The clause "alltså före den här sessionen" reads the same for a file written yesterday afternoon
+    /// and for the one this app actually found on 1 September, which was last written on 2025-06-04 —
+    /// fifteen months earlier. Its values went into three consecutive reviews as though they described
+    /// the evening being reviewed. A file that old is not a stale reading of the settings; it is a
+    /// reading of somebody else's settings.
+    /// </remarks>
+    [Fact]
+    public void AFileOlderThanAWeekIsCalledOutAsNotDescribingTheSession()
+    {
+        using var install = new FakeInstall(Fixture(windowed: "2"));
+        install.SetWritten(new DateTime(2025, 6, 4, 15, 38, 0, DateTimeKind.Utc));
+
+        var described = GameGraphicsSettingsReader.Describe(
+            [install.FilePath],
+            sessionStartUtc: new DateTimeOffset(2026, 9, 1, 21, 11, 0, TimeSpan.Zero));
+
+        Assert.NotNull(described);
+        Assert.Contains("VARNING", described!, StringComparison.Ordinal);
+        Assert.Contains("15 månader gammal", described, StringComparison.Ordinal);
+        Assert.Contains("ska inte användas som facit", described, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A file written a few days ago is the ordinary case — the settings were changed and the game has
+    /// not been restarted since — and warning about it would train the reader to ignore the warning.
+    /// </summary>
+    [Fact]
+    public void AFileFromEarlierThisWeekIsNotCalledStale()
+    {
+        using var install = new FakeInstall(Fixture(windowed: "2"));
+        install.SetWritten(new DateTime(2026, 8, 30, 19, 11, 0, DateTimeKind.Utc));
+
+        var described = GameGraphicsSettingsReader.Describe(
+            [install.FilePath],
+            sessionStartUtc: new DateTimeOffset(2026, 9, 1, 21, 11, 0, TimeSpan.Zero));
+
+        Assert.NotNull(described);
+        Assert.Contains("alltså före den här sessionen", described!, StringComparison.Ordinal);
+        Assert.DoesNotContain("VARNING", described, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// The computer is switched off rather than stopped, so a change has to be noticed while the session
     /// runs. Telemetry either side of it describes two different configurations.
     /// </summary>

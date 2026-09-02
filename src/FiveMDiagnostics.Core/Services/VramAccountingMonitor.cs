@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Core;
+﻿namespace FiveMDiagnostics.Core;
 
 /// <summary>
 /// Compares the per-process VRAM table against the adapter's own figure, and says so in the session log.
@@ -36,6 +36,17 @@ public sealed class VramAccountingMonitor
     public const long ImplausibleOvershootBytes = 512L * 1024 * 1024;
 
     /// <summary>
+    /// Consecutive samples the residual proof has to hold before a row is called a double counter.
+    /// </summary>
+    /// <remarks>
+    /// Three samples is fifteen seconds at the process collector's interval. Long enough that a game
+    /// allocating a gigabyte between the two collectors' reads cannot produce the verdict, short enough
+    /// that the exclusion is in place within the first minute of a session — which is the whole point,
+    /// since the row it was written for stood in every incident of a two-hour evening.
+    /// </remarks>
+    private const int SurplusProofSamples = 3;
+
+    /// <summary>
     /// How close in time the two readings have to be for the comparison to be about the accounting
     /// rather than about two clocks.
     /// </summary>
@@ -66,6 +77,23 @@ public sealed class VramAccountingMonitor
     /// keeps it, which is the case that matters — the compositor restarting is still the compositor.
     /// </remarks>
     private readonly Dictionary<int, string> _doubleCounted = [];
+
+    /// <summary>
+    /// Consecutive samples in which one row alone has explained the whole surplus, keyed by process id.
+    /// </summary>
+    /// <remarks>
+    /// The residual proof below is arithmetic on two collectors that never sample at the same instant,
+    /// so a single agreeing sample is not a proof. Requiring it to repeat costs fifteen seconds and
+    /// removes the whole class of false positives where the game happened to allocate between the two
+    /// reads.
+    /// </remarks>
+    /// <remarks>
+    /// Held against the name the id had, for the same reason <see cref="_doubleCounted"/> is: an id
+    /// recycled between two samples would otherwise hand its predecessor's half-finished proof to an
+    /// unrelated program, and the streak is the only thing standing between one agreeing sample and a
+    /// verdict.
+    /// </remarks>
+    private readonly Dictionary<int, (string Name, int Count)> _surplusStreak = [];
 
     private GpuTelemetrySample? _lastAdapter;
     private DateTimeOffset? _lastReportAt;
@@ -116,7 +144,7 @@ public sealed class VramAccountingMonitor
     /// hardware rather than an accusation against a process.
     /// </para>
     /// </remarks>
-    public GpuProcessMemorySample Annotate(GpuProcessMemorySample sample, out IReadOnlyList<GpuProcessMemoryUsage> newlyProven)
+    public GpuProcessMemorySample Annotate(GpuProcessMemorySample sample, out IReadOnlyList<DoubleCountedRow> newlyProven)
     {
         newlyProven = [];
 
@@ -129,7 +157,7 @@ public sealed class VramAccountingMonitor
             && (sample.Timestamp - adapter.Timestamp).Duration() <= AdapterFreshness)
         {
             var ceiling = adapterBytes + ImplausibleOvershootBytes;
-            List<GpuProcessMemoryUsage>? proven = null;
+            List<DoubleCountedRow>? proven = null;
 
             foreach (var process in sample.Processes)
             {
@@ -146,7 +174,18 @@ public sealed class VramAccountingMonitor
                 }
 
                 _doubleCounted[process.ProcessId] = process.ProcessName;
-                (proven ??= []).Add(process);
+                (proven ??= []).Add(new DoubleCountedRow(process, DoubleCountProof.ExceedsAdapter));
+            }
+
+            // Only the first time. The surplus does not go away once the row that explains it has been
+            // named — the collector keeps reporting the same table — so without this the residual proof
+            // re-fires on every sample and the warning is written once per five seconds for the rest of
+            // the evening. The verdict is already held in _doubleCounted; newlyProven means new.
+            if (ProveBySurplus(sample, adapterBytes) is { } surplusRow
+                && !_doubleCounted.ContainsKey(surplusRow.ProcessId))
+            {
+                _doubleCounted[surplusRow.ProcessId] = surplusRow.ProcessName;
+                (proven ??= []).Add(new DoubleCountedRow(surplusRow, DoubleCountProof.ExplainsSurplus));
             }
 
             if (proven is not null)
@@ -158,6 +197,85 @@ public sealed class VramAccountingMonitor
         return _doubleCounted.Count == 0
             ? sample
             : sample with { DoubleCountedProcessIds = _doubleCounted.Keys.ToArray() };
+    }
+
+    /// <summary>
+    /// Names the row that accounts for the whole surplus, when exactly one row does and removing it
+    /// leaves a table the card's own figure agrees with.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The per-row ceiling above only fires once a single process claims more than the entire card is
+    /// using, and the compositor's row does not: on 1 September <c>dwm</c> reported a flat 3.5 GB on a
+    /// 10 GB card that was 82–94% full, stood as second largest holder in all 48 incidents of the
+    /// evening, and was only caught at 01:14:38 — after the game had exited and the card's figure fell
+    /// underneath it. Two hours too late, and only because the session happened to keep running.
+    /// </para>
+    /// <para>
+    /// What settles it earlier is the shape of the residual rather than the size of the row. A process
+    /// table is expected to land a little <em>under</em> the adapter, because VRAM also holds
+    /// framebuffers and allocations owned by nothing still running. So among the rows whose removal
+    /// would resolve a surplus, the double counter is the one whose removal lands the sum back on the
+    /// adapter's own figure; a row whose removal undershoots by gigabytes was holding memory that is
+    /// really there. The evening's first sample: 11.95 GB summed against 8.16 GB reported. Removing the
+    /// compositor leaves 8.41 — a quarter gigabyte over, which is the expected shape. Removing the game
+    /// leaves 5.66, two and a half gigabytes short, which is not.
+    /// </para>
+    /// <para>
+    /// Deliberately still written against the arithmetic and not against a name. The next
+    /// compositor-shaped process will not be called dwm, and a rule keyed on <c>dwm.exe</c> would say
+    /// nothing at all about it.
+    /// </para>
+    /// </remarks>
+    private GpuProcessMemoryUsage? ProveBySurplus(GpuProcessMemorySample sample, ulong adapterBytes)
+    {
+        var accounted = sample.AccountedDedicatedBytes;
+        if (accounted <= adapterBytes + (ulong)ImplausibleOvershootBytes)
+        {
+            _surplusStreak.Clear();
+            return null;
+        }
+
+        GpuProcessMemoryUsage? candidate = null;
+        foreach (var process in sample.Processes)
+        {
+            if (sample.IsUnbelievable(process) || process.DedicatedBytes > accounted)
+            {
+                continue;
+            }
+
+            var residual = (long)(accounted - process.DedicatedBytes) - (long)adapterBytes;
+            if (Math.Abs(residual) > ImplausibleOvershootBytes)
+            {
+                continue;
+            }
+
+            if (candidate is not null)
+            {
+                // More than one row would fit. The arithmetic cannot say which, and guessing here would
+                // exclude a process that really is holding the memory it reports.
+                _surplusStreak.Clear();
+                return null;
+            }
+
+            candidate = process;
+        }
+
+        if (candidate is null)
+        {
+            _surplusStreak.Clear();
+            return null;
+        }
+
+        var previous = _surplusStreak.GetValueOrDefault(candidate.ProcessId);
+        var streak = string.Equals(previous.Name, candidate.ProcessName, StringComparison.OrdinalIgnoreCase)
+            ? previous.Count + 1
+            : 1;
+
+        _surplusStreak.Clear();
+        _surplusStreak[candidate.ProcessId] = (candidate.ProcessName, streak);
+
+        return streak >= SurplusProofSamples ? candidate : null;
     }
 
     /// <summary>
@@ -256,3 +374,23 @@ public sealed record VramAccountingReport(
     ulong ProcessSumBytes,
     ulong AdapterUsedBytes,
     long DifferenceBytes);
+
+/// <summary>How a row was proved to be counting somebody else's memory.</summary>
+public enum DoubleCountProof
+{
+    /// <summary>The row alone claimed more than the card reported as used.</summary>
+    ExceedsAdapter,
+
+    /// <summary>
+    /// The table exceeded the card, and removing this one row landed it back on the card's own figure.
+    /// </summary>
+    ExplainsSurplus,
+}
+
+/// <summary>A row this session has proved is double counting, and the proof that settled it.</summary>
+/// <remarks>
+/// The two proofs need different sentences. "More than the whole card" is self-evident once stated;
+/// "removing this row reconciles the table" is not, and a reader shown the first wording for the second
+/// case would go looking for a number that is not there.
+/// </remarks>
+public sealed record DoubleCountedRow(GpuProcessMemoryUsage Process, DoubleCountProof Proof);

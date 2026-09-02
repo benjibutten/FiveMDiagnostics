@@ -928,6 +928,25 @@ public sealed class MainWindowViewModel : ObservableObject
             return false;
         }
 
+        // The evening ended. Everything the live-process collectors were complaining about was about a
+        // process that no longer exists, and none of it can be cleared the ordinary way — the clearing
+        // line would have to come from a collector that has nothing left to look at. Before this the
+        // banner sat on three such lines indefinitely, which is what "needs attention" looked like on a
+        // machine where nothing did.
+        if (string.Equals(status.Source, TargetProcessSource, StringComparison.OrdinalIgnoreCase))
+        {
+            var cleared = false;
+            foreach (var source in LiveProcessAlertSources)
+            {
+                if (_activeAlerts.TryGetValue(source, out var alert) && !OutlivesTheGame(alert))
+                {
+                    cleared |= _activeAlerts.Remove(source);
+                }
+            }
+
+            return cleared;
+        }
+
         if (status.Level is StatusLevel.Warning or StatusLevel.Error)
         {
             _activeAlerts[status.Source] = status;
@@ -936,6 +955,65 @@ public sealed class MainWindowViewModel : ObservableObject
 
         return _activeAlerts.Remove(status.Source);
     }
+
+    /// <summary>Source of the line that says the game has closed.</summary>
+    private const string TargetProcessSource = "Spelprocess";
+
+    /// <summary>
+    /// Whether a live-process collector's last line is still true with the game gone.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Not everything PresentMon complains about is about the process. "PresentMon hittades inte" is a
+    /// path that was never configured, "kunde inte startas" is a launch that failed, and the suspension
+    /// line says automatic restarts have stopped — all three are still true at 01:14, and all three
+    /// are the answer to the question the reader asks immediately afterwards, which is why the session
+    /// has no frame data. Clearing them with the stale-PID warnings takes the explanation off the banner
+    /// at the moment it is finally being looked for.
+    /// </para>
+    /// <para>
+    /// Matched on the text, which is not where this belongs: the collector knows whether its complaint
+    /// describes the running process, and the status sink carries level, source and message and no room
+    /// to say so. Moving the judgement to the collector means a flag on
+    /// <see cref="DiagnosticStatusEntry"/> and a signature every sink in the solution implements, and
+    /// that is the change to make if a fourth line joins this list.
+    /// </para>
+    /// </remarks>
+    private static bool OutlivesTheGame(DiagnosticStatusEntry alert)
+    {
+        return Array.Exists(
+            SessionScopedAlertMarkers,
+            marker => alert.Message.Contains(marker, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Phrases that mark a live-process collector's line as a fact about the session rather than about
+    /// the process.
+    /// </summary>
+    private static readonly string[] SessionScopedAlertMarkers =
+    [
+        "hittades inte",
+        "kunde inte startas",
+        "omstarter pausas",
+        "frame-datat för sessionen",
+    ];
+
+    /// <summary>
+    /// Collectors whose warnings usually describe the running game, and are therefore candidates for
+    /// clearing once it exits.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately not "all of them", and — by way of <see cref="OutlivesTheGame"/> — not
+    /// unconditionally either. The VRAM accounting warnings outlive the game on purpose: a counter
+    /// proved to double count is a fact about the evening's whole table, and the reader still needs it
+    /// when reading the export afterwards.
+    /// </remarks>
+    private static readonly string[] LiveProcessAlertSources =
+    [
+        "PresentMon",
+        "FiveMProcessTelemetry",
+        "FiveMProcess",
+    ];
 
     private void RefreshSessionAlerts()
     {

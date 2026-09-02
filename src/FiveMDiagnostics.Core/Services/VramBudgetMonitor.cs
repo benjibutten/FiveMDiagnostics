@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Core;
+﻿namespace FiveMDiagnostics.Core;
 
 /// <summary>
 /// Turns the three VRAM figures the session already logs into the budget they add up to.
@@ -193,13 +193,22 @@ public sealed class VramBudgetMonitor
             totalBytes > reservedBytes ? totalBytes - reservedBytes : 0,
             gameBytes + freeNowBytes);
 
+        // The card's physical size is not where the trouble starts. Two sessions measured the same
+        // edge: above 88% occupancy the hitch rate multiplies, and on 1 September 76% of every frame
+        // over 100 ms fell inside the 17% of the evening spent there. A budget quoted against 10.0 GB
+        // therefore offers room the machine cannot use — 8.2 GB for the game on an evening whose
+        // measured ceiling was 6.9 — and it is this line that a texture setting gets chosen against.
+        var bandBytes = (ulong)(totalBytes * VramPressureBandMonitor.BandPercent / 100);
+        var bandHeadroomBytes = bandBytes > reservedBytes ? bandBytes - reservedBytes : 0;
+
         var message =
             $"{transition}VRAM-budget: skrivbordet håller {Gigabytes(desktopBytes)} och streamstacken "
-            + $"{Gigabytes(streamBytes)}. Spelet håller nu {Gigabytes(gameBytes)} och kan växa till "
-            + $"{Gigabytes(headroomBytes)}; kortet rapporterar {Gigabytes(usedBytes)} av "
-            + $"{Gigabytes(totalBytes)} använt, alltså {Gigabytes(freeNowBytes)} ledigt just nu. "
-            + "Spelets tak sätts av texturinställningen; utrymme för ett steg upp tas ur de två första "
-            + "posterna, inte ur kortet.";
+            + $"{Gigabytes(streamBytes)}. Spelet håller nu {Gigabytes(gameBytes)} och ryms utan tryck upp till "
+            + $"{Gigabytes(bandHeadroomBytes)}; kortets fysiska tak ger {Gigabytes(headroomBytes)}, men mätningarna "
+            + $"säger att det börjar hacka redan när kortet passerar {VramPressureBandMonitor.BandPercent:F0} %. "
+            + $"Kortet rapporterar {Gigabytes(usedBytes)} av {Gigabytes(totalBytes)} använt, alltså "
+            + $"{Gigabytes(freeNowBytes)} ledigt just nu. Spelets tak sätts av texturinställningen; utrymme för "
+            + "ett steg upp tas ur de två första posterna, inte ur kortet.";
 
         if (streamUnmeasurable)
         {
@@ -222,6 +231,7 @@ public sealed class VramBudgetMonitor
             streamBytes,
             gameBytes,
             headroomBytes,
+            bandHeadroomBytes,
             totalBytes,
             usedBytes,
             freeNowBytes,
@@ -321,6 +331,15 @@ public sealed class VramBudgetMonitor
 /// Total minus the card's own used figure. The budget may never report more room than this, however the
 /// per-process table splits it.
 /// </param>
+/// <param name="GameHeadroomBytes">
+/// What the game could hold before the card is physically full. Kept because it is the number the
+/// hardware imposes, but it is not the number to choose a texture setting against.
+/// </param>
+/// <param name="GameBandHeadroomBytes">
+/// What the game can hold before the card enters the measured pressure band. Two sessions put that edge
+/// at <see cref="VramPressureBandMonitor.BandPercent"/>, and above it the hitch rate multiplies — so
+/// this, and not the physical ceiling, is the budget a setting is chosen against.
+/// </param>
 /// <param name="StreamStackDerived">
 /// True when the stream stack was measured by difference because its own rows could not be believed.
 /// </param>
@@ -330,6 +349,7 @@ public sealed record VramBudgetReport(
     ulong StreamStackBytes,
     ulong GameBytes,
     ulong GameHeadroomBytes,
+    ulong GameBandHeadroomBytes,
     ulong AdapterTotalBytes,
     ulong AdapterUsedBytes,
     ulong FreeBytes,

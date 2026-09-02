@@ -68,8 +68,59 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// </remarks>
     private DateTimeOffset _nextGameSettingsCheck = DateTimeOffset.MaxValue;
 
+    /// <summary>When the running summaries are next due.</summary>
+    private DateTimeOffset _nextInterimSummary = DateTimeOffset.MaxValue;
+
+    /// <summary>
+    /// The last line written for each summary source, so an unchanged summary is not repeated.
+    /// </summary>
+    /// <remarks>
+    /// The summaries are written on a cadence now, and most of them say the same thing for stretches at
+    /// a time. Repeating an identical sentence every quarter of an hour would bury the ones that moved.
+    /// </remarks>
+    private readonly Dictionary<string, string> _lastSummaryLine = new(StringComparer.Ordinal);
+
+    /// <summary>Wall clock of the most recent frame long enough to count as a stall in progress.</summary>
+    /// <remarks>
+    /// Received time rather than the frame's own timestamp: the question a deep capture's tail asks is
+    /// "is it still happening now", and PresentMon's clock answers a different one.
+    /// </remarks>
+    private DateTimeOffset? _lastStallFrameAtUtc;
+
+    private double _stallFrameThresholdMs = DefaultStallFrameMs;
+
+    /// <summary>Whether the game has been seen at all, and whether its exit has been reported.</summary>
+    private bool _targetProcessSeen;
+    private bool _reportedTargetProcessExit;
+
     /// <summary>How often the graphics settings file is compared against what the session started with.</summary>
     private static readonly TimeSpan GameSettingsCheckInterval = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// How often the session's running summaries are written to the journal.
+    /// </summary>
+    /// <remarks>
+    /// They used to be written only by <c>StopSession</c>, and this machine's sessions do not stop: the
+    /// computer is switched off with one still running. On 1 September the game exited at 01:14 with the
+    /// session open, and all five summaries — the VRAM band, the slow-frame wait profile, the verdict
+    /// tally, the capture cost and the display cadence — were simply never written, on the evening whose
+    /// review needed every one of them. The journal is append-only, so writing them repeatedly costs a
+    /// few lines an hour and the last one written is the one that counts.
+    /// </remarks>
+    private static readonly TimeSpan InterimSummaryInterval = TimeSpan.FromMinutes(15);
+
+    /// <summary>
+    /// Quiet period after a large frame before the stall is considered over.
+    /// </summary>
+    /// <remarks>
+    /// Long enough to bridge the gap between two frames of a stuttering sequence — the 1 September freeze
+    /// produced late frames roughly every half second for nine seconds — and short enough that an
+    /// isolated hitch does not hold a capture open.
+    /// </remarks>
+    private static readonly TimeSpan StallQuietPeriod = TimeSpan.FromMilliseconds(1500);
+
+    /// <summary>Frame time from which a stall counts as still running, before the session has a level.</summary>
+    private const double DefaultStallFrameMs = 60;
 
     /// <summary>
     /// Trace evidence that arrived before the incident it belongs to had been published.
@@ -246,6 +297,23 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _verdicts = new IncidentVerdictTally();
             _liveVram = new LiveVramTracker();
 
+            _lastSummaryLine.Clear();
+            _lastStallFrameAtUtc = null;
+            _targetProcessSeen = false;
+            _reportedTargetProcessExit = false;
+
+            // Half the capture threshold: a frame that large is unambiguously part of a stall, while an
+            // ordinary two-refresh hitch is not, and holding a trace open for those would keep every
+            // capture running to its ceiling.
+            _stallFrameThresholdMs = Math.Max(DefaultStallFrameMs, _settings.DeepCapture.AutoCaptureFrameTimeMs / 2);
+
+            // Lets a capture keep recording while frames are still arriving late. Optional: a capture
+            // backend that cannot do it simply keeps the fixed tail.
+            if (_deepCaptureService is IStallAwareDeepCapture stallAware)
+            {
+                stallAware.StallInProgress = IsStallInProgress;
+            }
+
             // A capture whose incident never published — the session was stopped while it was still
             // being written — would otherwise wait here for a marker id the next session cannot produce.
             lock (_sync)
@@ -304,6 +372,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         var sessionStartedAt = DateTimeOffset.UtcNow;
         _gameSettings = new GameGraphicsSettingsMonitor(sessionStartedAt);
         _nextGameSettingsCheck = sessionStartedAt + GameSettingsCheckInterval;
+        _nextInterimSummary = sessionStartedAt + InterimSummaryInterval;
         if (_gameSettings.DescribeInitial() is { } graphics)
         {
             Report(StatusLevel.Info, "GameSettings", graphics);
@@ -356,8 +425,14 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         _verdicts = null;
         _gameSettings = null;
         _nextGameSettingsCheck = DateTimeOffset.MaxValue;
+        _nextInterimSummary = DateTimeOffset.MaxValue;
         _collectorTasks = [];
         _isSessionActive = false;
+
+        if (_deepCaptureService is IStallAwareDeepCapture stallAware)
+        {
+            stallAware.StallInProgress = null;
+        }
 
         FinalizeFramePacing();
         CloseJournal();
@@ -436,12 +511,14 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         _collectorTasks = [];
         _isSessionActive = false;
 
+        _nextInterimSummary = DateTimeOffset.MaxValue;
+        if (_deepCaptureService is IStallAwareDeepCapture stopStallAware)
+        {
+            stopStallAware.StallInProgress = null;
+        }
+
         FinalizeFramePacing();
-        FinalizeDisplayCadence();
-        FinalizeCaptureCost();
-        FinalizeVramPressure();
-        FinalizeSlowFrameWaits();
-        FinalizeVerdicts();
+        WriteSessionSummaries(final: true);
         FinalizeGameSettings();
         Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), "Session stopped.");
         CloseJournal();
@@ -584,9 +661,9 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// were produced on time and this says whether they were shown on time, and for eight sessions the
     /// first said yes while nobody asked the second.
     /// </remarks>
-    private void FinalizeDisplayCadence()
+    private void FinalizeDisplayCadence(bool final)
     {
-        if (_displayCadence?.Snapshot() is { } report)
+        if (_displayCadence?.Snapshot() is { } report && ShouldWriteSummary("DisplayCadence", report.Message))
         {
             Report(
                 report.IsOffCadence ? StatusLevel.Warning : StatusLevel.Info,
@@ -598,12 +675,16 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         // session knows whether the condition it stated was true. Only withdrawn, never repeated: the
         // warning that still applies has already been read, and the cadence line above measures it.
         if (_displayCadence?.ComposedShare is { } composedShare
-            && RefreshRateMismatch.DescribeWithdrawal(Environment?.Displays, composedShare) is { } withdrawal)
+            && RefreshRateMismatch.DescribeWithdrawal(Environment?.Displays, composedShare) is { } withdrawal
+            && ShouldWriteSummary("DisplayCadence.Withdrawal", withdrawal))
         {
             Report(StatusLevel.Info, "DisplayCadence", withdrawal);
         }
 
-        _displayCadence = null;
+        if (final)
+        {
+            _displayCadence = null;
+        }
     }
 
     /// <summary>
@@ -614,14 +695,17 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// explained at all — but two evenings are not comparable without it, and a reader who does not know
     /// one of them took ten captures and the other took two will read the difference as the machine.
     /// </remarks>
-    private void FinalizeCaptureCost()
+    private void FinalizeCaptureCost(bool final)
     {
-        if (_captureCost?.Summary() is { } report)
+        if (_captureCost?.Summary() is { } report && ShouldWriteSummary("DeepCapture.Cost", report.Message))
         {
             Report(StatusLevel.Info, "DeepCapture.Cost", report.Message);
         }
 
-        _captureCost = null;
+        if (final)
+        {
+            _captureCost = null;
+        }
     }
 
     /// <summary>
@@ -633,9 +717,9 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// processes whose VRAM grew, which is silent on the evening where the memory was taken before the
     /// game started — and that was the evening.
     /// </remarks>
-    private void FinalizeVramPressure()
+    private void FinalizeVramPressure(bool final)
     {
-        if (_vramPressure?.Summary() is { } report)
+        if (_vramPressure?.Summary() is { } report && ShouldWriteSummary("GpuVram.Pressure", report.Message))
         {
             Report(
                 report.IsPressured ? StatusLevel.Warning : StatusLevel.Info,
@@ -643,39 +727,88 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 report.Message);
         }
 
-        _vramPressure = null;
+        if (final)
+        {
+            _vramPressure = null;
+        }
     }
 
     /// <summary>
     /// Writes how many of the session's largest frames still had CPU slack, which is the line that
     /// separates a blocked thread from a pipeline working flat out.
     /// </summary>
-    private void FinalizeSlowFrameWaits()
+    private void FinalizeSlowFrameWaits(bool final)
     {
-        if (_slowFrameWaits?.Summary() is { } report)
+        if (_slowFrameWaits?.Summary() is { } report && ShouldWriteSummary("FramePacing.Wait", report.Message))
         {
             Report(StatusLevel.Info, "FramePacing.Wait", report.Message);
         }
 
-        _slowFrameWaits = null;
+        if (final)
+        {
+            _slowFrameWaits = null;
+        }
     }
 
     /// <summary>
     /// Writes what the engine concluded across the whole session, with the VRAM verdict on its own line.
     /// </summary>
-    private void FinalizeVerdicts()
+    private void FinalizeVerdicts(bool final)
     {
         if (_verdicts?.Summary() is { } report)
         {
-            if (report.VramPressureMessage is { } vram)
+            if (report.VramPressureMessage is { } vram && ShouldWriteSummary("Analysis.Verdicts.Vram", vram))
             {
                 Report(StatusLevel.Warning, "Analysis.Verdicts", vram);
             }
 
-            Report(StatusLevel.Info, "Analysis.Verdicts", report.Message);
+            if (ShouldWriteSummary("Analysis.Verdicts", report.Message))
+            {
+                Report(StatusLevel.Info, "Analysis.Verdicts", report.Message);
+            }
         }
 
-        _verdicts = null;
+        if (final)
+        {
+            _verdicts = null;
+        }
+    }
+
+    /// <summary>
+    /// Writes the session's running summaries, and on the final pass releases the monitors behind them.
+    /// </summary>
+    /// <remarks>
+    /// Called on a cadence, when the game exits, and once more if the session is stopped properly. The
+    /// three occasions exist because only the last one used to, and it is the one that happens least
+    /// often on the machine this app was written for.
+    /// </remarks>
+    private void WriteSessionSummaries(bool final)
+    {
+        FinalizeDisplayCadence(final);
+        FinalizeCaptureCost(final);
+        FinalizeVramPressure(final);
+        FinalizeSlowFrameWaits(final);
+        FinalizeVerdicts(final);
+    }
+
+    /// <summary>Whether this summary says anything its own last line did not.</summary>
+    private bool ShouldWriteSummary(string source, string message)
+    {
+        if (_lastSummaryLine.TryGetValue(source, out var previous) && string.Equals(previous, message, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        _lastSummaryLine[source] = message;
+        return true;
+    }
+
+    /// <summary>
+    /// True while frames are still arriving late, which is what keeps a deep capture's tail running.
+    /// </summary>
+    private bool IsStallInProgress()
+    {
+        return _lastStallFrameAtUtc is { } at && DateTimeOffset.UtcNow - at <= StallQuietPeriod;
     }
 
     private void CloseJournal()
@@ -1161,16 +1294,23 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
         var annotated = accounting.Annotate(sample, out var newlyProven);
 
-        foreach (var process in newlyProven)
+        foreach (var row in newlyProven)
         {
+            var process = row.Process;
+            var proof = row.Proof == DoubleCountProof.ExceedsAdapter
+                ? $"rapporterar {process.DedicatedGigabytes:F1} GB VRAM, vilket är mer än kortet självt anger som "
+                    + "använt. En enskild process kan inte hålla mer än hela kortet, så raden dubbelräknar minne som "
+                    + "tillhör någon annan"
+                : $"håller {process.DedicatedGigabytes:F1} GB enligt räknaren, och det är precis den post som gör att "
+                    + "processtabellen summerar högre än vad kortet rapporterar som använt. Räknar man bort just den "
+                    + "raden stämmer tabellen mot kortet igen, så den dubbelräknar minne som tillhör någon annan";
+
             Report(
                 StatusLevel.Warning,
                 "GpuProcessMemory.Accounting",
-                $"{process.ProcessName} rapporterar {process.DedicatedGigabytes:F1} GB VRAM, vilket är mer än "
-                + "kortet självt anger som använt. En enskild process kan inte hålla mer än hela kortet, så "
-                + "raden dubbelräknar minne som tillhör någon annan — typiskt kompositorn som håller en "
-                + "referens till spelets ytor. Raden loggas men utesluts ur rapporternas topplistor för "
-                + "resten av sessionen, så att den process som faktiskt växer syns.");
+                $"{process.ProcessName} {proof} — typiskt kompositorn som håller en referens till spelets ytor. "
+                + "Raden loggas men utesluts ur rapporternas topplistor och ur VRAM-budgeten för resten av "
+                + "sessionen, så att den process som faktiskt växer syns.");
         }
 
         return annotated;
@@ -1274,6 +1414,12 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                     // that already crossed a threshold would describe the threshold rather than the
                     // evening.
                     _autoCaptureBudget?.Observe(frameSample.Timestamp, frameSample.FrameTimeMs);
+
+                    if (frameSample.FrameTimeMs >= _stallFrameThresholdMs)
+                    {
+                        _lastStallFrameAtUtc = DateTimeOffset.UtcNow;
+                    }
+
                     _displayCadence?.Observe(frameSample);
                     _captureCost?.Observe(frameSample);
                     _vramPressure?.Observe(frameSample);
@@ -1318,6 +1464,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             var now = DateTimeOffset.UtcNow;
             await FlushPendingIncidentsAsync(now).ConfigureAwait(false);
             CheckGameSettings(now);
+            CheckTargetProcess();
+            CheckInterimSummaries(now);
         }
     }
 
@@ -1330,6 +1478,55 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// A settings change mid-session splits the telemetry into two configurations, and a reader
     /// comparing the evening against another one needs to know that before doing the arithmetic.
     /// </remarks>
+    /// <summary>
+    /// Writes the running summaries when they are due.
+    /// </summary>
+    private void CheckInterimSummaries(DateTimeOffset now)
+    {
+        if (now < _nextInterimSummary)
+        {
+            return;
+        }
+
+        _nextInterimSummary = now + InterimSummaryInterval;
+        WriteSessionSummaries(final: false);
+    }
+
+    /// <summary>
+    /// Says once that the game has closed, and writes the summaries while the evening's numbers are
+    /// still in memory.
+    /// </summary>
+    /// <remarks>
+    /// The moment the session's measurements stop changing, and therefore the last moment at which they
+    /// are worth writing down. Before this the app said nothing about it as such: three collectors each
+    /// reported a process that had gone away, from their own point of view, none of which reads as
+    /// "the evening is over".
+    /// </remarks>
+    private void CheckTargetProcess()
+    {
+        var target = _processResolver.TryGetTargetProcess();
+        if (target is not null)
+        {
+            _targetProcessSeen = true;
+            _reportedTargetProcessExit = false;
+            return;
+        }
+
+        if (!_targetProcessSeen || _reportedTargetProcessExit)
+        {
+            return;
+        }
+
+        _reportedTargetProcessExit = true;
+        Report(
+            StatusLevel.Info,
+            "Spelprocess",
+            "Spelet avslutades. Mätningen pausas här och sessionen fortsätter tills du stoppar den; "
+            + "sammanfattningarna nedan gäller det som hann mätas.");
+
+        WriteSessionSummaries(final: false);
+    }
+
     private void CheckGameSettings(DateTimeOffset now)
     {
         if (_gameSettings is not { } monitor || now < _nextGameSettingsCheck)
@@ -1614,6 +1811,10 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 // Timed here rather than when the capture was requested: what disturbs the game is the
                 // flush of the ring buffer to disk, which is what has just finished.
                 _captureCost?.RecordCaptureWritten(DateTimeOffset.UtcNow);
+
+                // And the budget, which otherwise has to assume this capture is still recording and
+                // holds the next extreme frame off for the longest tail the options allow.
+                _autoCaptureBudget?.NoteCaptureWritten(DateTimeOffset.UtcNow);
 
                 lock (_sync)
                 {

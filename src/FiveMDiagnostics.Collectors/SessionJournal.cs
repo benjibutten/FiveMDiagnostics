@@ -1,4 +1,5 @@
-﻿using System.Text;
+﻿using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -49,7 +50,7 @@ public sealed class SessionJournal : IDisposable
 
         // Numeric enums make the file depend on declaration order, and this one is meant to still be
         // readable after the code that wrote it has moved on.
-        Converters = { new JsonStringEnumConverter() },
+        Converters = { new JsonStringEnumConverter(), new UtcDateTimeOffsetConverter() },
     };
 
     private readonly object _sync = new();
@@ -406,4 +407,28 @@ public sealed class SessionJournal : IDisposable
     }
 
     private sealed record JournalLine(string Type, DateTimeOffset Timestamp, object Payload);
+
+    /// <summary>Writes every timestamp in the journal as UTC, whatever offset it arrived with.</summary>
+    /// <remarks>
+    /// The file used to carry both. Status entries were stamped by the collectors in local time and
+    /// incidents and pacing windows in UTC, so a reader scrolling one evening's journal saw 01:14 and
+    /// 23:14 alternating on adjacent lines for the same two minutes, and every comparison had to begin
+    /// by working out which line was in which zone. Both forms were valid ISO-8601 and neither was
+    /// wrong; the mixture was. Normalising on the way out is one place rather than a rule every
+    /// collector has to remember, and it covers payload timestamps as well as the envelope.
+    /// </remarks>
+    private sealed class UtcDateTimeOffsetConverter : JsonConverter<DateTimeOffset>
+    {
+        public override DateTimeOffset Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+        {
+            return reader.GetDateTimeOffset();
+        }
+
+        public override void Write(Utf8JsonWriter writer, DateTimeOffset value, JsonSerializerOptions options)
+        {
+            // UtcDateTime rather than ToUniversalTime, so the line ends in Z instead of +00:00. Both are
+            // UTC; only one of them says so at a glance, and being read at a glance is the whole point.
+            writer.WriteStringValue(value.UtcDateTime.ToString("O", CultureInfo.InvariantCulture));
+        }
+    }
 }
