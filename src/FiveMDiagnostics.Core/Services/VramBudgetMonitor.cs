@@ -69,9 +69,57 @@ public sealed class VramBudgetMonitor
 
     private static readonly TimeSpan AdapterFreshness = TimeSpan.FromSeconds(10);
 
+    /// <summary>
+    /// Share of its own streaming budget the game has to reach before the approach line is written.
+    /// </summary>
+    /// <remarks>
+    /// The game fills its budget and does not give it back — measured over five hours on 2 September,
+    /// 5.2 GB to 7.0 GB against a streaming budget of 5.6 — so the interesting moment is not when it
+    /// arrives but when it is clearly going to. Nine tenths is late enough that a session which never
+    /// approaches its budget says nothing, and early enough to be hours before the worst frame.
+    /// </remarks>
+    private const double BudgetApproachShare = 0.90;
+
+    /// <summary>
+    /// How far past the budget the game has to be before the overhead is worth a line of its own.
+    /// </summary>
+    /// <remarks>
+    /// The two collectors sample at different instants and the budget is computed from a config file,
+    /// so a few tens of megabytes over is noise. A quarter of a gigabyte is not: it is a frame buffer
+    /// and a browser, and it is the term that decides how far the slider actually has to come down.
+    /// </remarks>
+    private const ulong MaterialOverheadBytes = 256UL * 1024 * 1024;
+
     private GpuTelemetrySample? _lastAdapter;
+    private FiveMClientConfig? _clientConfig;
     private bool _reported;
+    private bool _budgetApproachReported;
+    private bool _budgetOverheadReported;
     private bool _streamStackPresent;
+
+    /// <summary>
+    /// The largest amount the game has been seen holding beyond its streaming budget this session.
+    /// </summary>
+    /// <remarks>
+    /// The whole correction of 3 September in one field. <c>vid_budgetScale</c> governs streaming and
+    /// nothing else, so the game's video memory is the budget plus NUI, render targets and the frame
+    /// buffers that come with 1440p and 2× MSAA — a measured 1.0 GB median and 2.0 GB peak on the very
+    /// evening whose report blamed the whole plateau on the slider. Taken as a running maximum rather
+    /// than a median because it is what advice is given against: a recommendation that fits the median
+    /// hour and not the worst one sends somebody back to the pause menu a second time.
+    /// </remarks>
+    private ulong _overheadBytes;
+
+    /// <summary>
+    /// The last split that was computed, kept whether or not it was worth a line.
+    /// </summary>
+    /// <remarks>
+    /// The budget line is written twice an evening; the approach warning has to be able to fire on any
+    /// sample in between, so the numbers outlive the decision not to print them.
+    /// </remarks>
+    private ulong _lastGameBytes;
+    private ulong _lastReservedBytes;
+    private ulong _lastTotalBytes;
 
     /// <summary>The state the recent samples agree on, which becomes the reported one once it holds.</summary>
     private bool _candidatePresent;
@@ -94,6 +142,147 @@ public sealed class VramBudgetMonitor
         {
             _lastAdapter = sample;
         }
+    }
+
+    /// <summary>
+    /// Supplies the texture budget the client was configured with, so the game's half of the split can
+    /// be stated against a ceiling instead of only against the card.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Optional. On a machine with no <c>fivem.cfg</c> — or a build of the client that does not write
+    /// the convar — the budget line reads exactly as it did before.
+    /// </para>
+    /// <para>
+    /// A new ceiling retires everything that was said against the old one. Both warnings fire once per
+    /// session and the overhead is a running maximum, so a slider moved mid-session — which is the
+    /// entire reason the settings are re-read at all — used to leave the monitor silent about the budget
+    /// it now had, still holding an overhead measured as the distance above a budget that no longer
+    /// existed. Lowering the slider by two steps would have <em>raised</em> the recorded overhead by the
+    /// difference and then never mentioned it. Reset on the ceiling rather than on
+    /// <see cref="FiveMClientConfig.Matches"/>: a file rewritten with the same value changes nothing
+    /// here, and re-arming on it would let a client that rewrites its configuration repeat the same
+    /// warning all evening.
+    /// </para>
+    /// </remarks>
+    public void SetTextureBudget(FiveMClientConfig? config)
+    {
+        var before = _clientConfig;
+        _clientConfig = config;
+
+        var ceilingUnchanged = (before, config) switch
+        {
+            (null, null) => true,
+            ({ } was, { } now) => was.TextureBudgetBytes == now.TextureBudgetBytes,
+            _ => false,
+        };
+
+        if (ceilingUnchanged)
+        {
+            return;
+        }
+
+        _budgetApproachReported = false;
+        _budgetOverheadReported = false;
+        _overheadBytes = 0;
+    }
+
+    /// <summary>
+    /// What the game holds beyond its streaming budget, or zero before it has ever exceeded it.
+    /// </summary>
+    public ulong OverheadBytes => _overheadBytes;
+
+    /// <summary>
+    /// The line to write when the game is closing on the budget it was given, or has passed it, or null.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// At most two lines per session, and they answer different questions. The first says the game is
+    /// about to reach the budget it was configured with — a prediction, written hours before the worst
+    /// frame, which is the whole point of writing it rather than reporting the plateau afterwards. The
+    /// second says the game went past that budget anyway, and by how much.
+    /// </para>
+    /// <para>
+    /// The second line exists because of what 2 September got wrong. <c>vid_budgetScale</c> governs
+    /// streaming only, and the game's memory was a gigabyte above its budget all evening — so a monitor
+    /// that only ever compared the two would have reported "at 100 % of its budget" while the real
+    /// figure kept climbing, and the advice that followed would have been given against a ceiling the
+    /// game had already left behind.
+    /// </para>
+    /// <para>
+    /// Two claims either way, and they are separate. That the game is at its own budget is a fact about
+    /// the configuration; that the card will be in the pressure band before it gets there is a fact
+    /// about this machine, and only the second one is worth acting on.
+    /// </para>
+    /// </remarks>
+    public string? DescribeBudgetApproach()
+    {
+        if (_clientConfig is not { } config || _lastTotalBytes == 0)
+        {
+            return null;
+        }
+
+        var budgetBytes = config.TextureBudgetBytes;
+        if (budgetBytes == 0)
+        {
+            return null;
+        }
+
+        var roomForGame = FiveMClientConfig.RoomForGame(
+            _lastTotalBytes,
+            _lastReservedBytes,
+            VramPressureBandMonitor.BandPercent);
+
+        if (!_budgetOverheadReported && _overheadBytes >= MaterialOverheadBytes)
+        {
+            // Past the budget, with something real measured on top of it. Said once, and it retires the
+            // approach line too: the approach has happened.
+            _budgetOverheadReported = true;
+            _budgetApproachReported = true;
+
+            var over = $"Spelet håller {Gigabytes(_lastGameBytes)}, alltså "
+                + $"{Gigabytes(_overheadBytes)} mer än sin streamingbudget på "
+                + $"{Gigabytes(budgetBytes)}. Skillnaden är det budgeten inte styr — NUI, render "
+                + "targets och bildbuffertar — och den ligger kvar oavsett var reglaget står.";
+
+            return over + Verdict(config, _overheadBytes, roomForGame);
+        }
+
+        if (_budgetApproachReported || _lastGameBytes < budgetBytes * BudgetApproachShare)
+        {
+            return null;
+        }
+
+        _budgetApproachReported = true;
+
+        var line = $"Spelet håller {Gigabytes(_lastGameBytes)} av sin streamingbudget på "
+            + $"{Gigabytes(budgetBytes)} och kommer inte att sluta växa förrän den är full — och den "
+            + "är inte hela dess minne: NUI, render targets och bildbuffertar ligger ovanpå.";
+
+        return line + Verdict(config, _overheadBytes, roomForGame);
+    }
+
+    /// <summary>
+    /// Whether what the game needs fits under the band, and what to do when it does not.
+    /// </summary>
+    /// <param name="overheadBytes">
+    /// What the game holds outside the budget. Added before the comparison and subtracted before the
+    /// recommendation — never left out, which is the omission that made a slider at 55 % look like the
+    /// evening's cause.
+    /// </param>
+    private static string Verdict(FiveMClientConfig config, ulong overheadBytes, ulong roomForGame)
+    {
+        var needBytes = config.TextureBudgetBytes + overheadBytes;
+
+        if (needBytes <= roomForGame)
+        {
+            return $" Det ryms: kortet har plats för {Gigabytes(roomForGame)} spel under "
+                + $"{VramPressureBandMonitor.BandPercent:F0} %.";
+        }
+
+        return $" Kortet har bara plats för {Gigabytes(roomForGame)} under "
+            + $"{VramPressureBandMonitor.BandPercent:F0} %, alltså {Gigabytes(needBytes - roomForGame)} "
+            + $"för lite. {config.SuggestScale(roomForGame, overheadBytes)}";
     }
 
     /// <summary>
@@ -172,6 +361,20 @@ public sealed class VramBudgetMonitor
             desktopBytes = otherBytes - streamBytes;
         }
 
+        // Kept before the early return: the approach warning reads these on samples that produce no
+        // line of their own, which is all but two of them.
+        _lastGameBytes = gameBytes;
+        _lastReservedBytes = desktopBytes + streamBytes;
+        _lastTotalBytes = totalBytes;
+
+        // What the slider does not reach, measured rather than assumed. Only observable once the game
+        // has actually passed its streaming budget; before that it is zero because nothing has been
+        // seen, not because there is none.
+        if (_clientConfig?.TextureBudgetBytes is { } budgetBytes && gameBytes > budgetBytes)
+        {
+            _overheadBytes = Math.Max(_overheadBytes, gameBytes - budgetBytes);
+        }
+
         var transition = TrackStreamStack(streamUnmeasurable ? null : streamMeasuredBytes >= StreamStackPresentBytes);
         if (_reported && transition is null)
         {
@@ -209,6 +412,19 @@ public sealed class VramBudgetMonitor
             + $"Kortet rapporterar {Gigabytes(usedBytes)} av {Gigabytes(totalBytes)} använt, alltså "
             + $"{Gigabytes(freeNowBytes)} ledigt just nu. Spelets tak sätts av texturinställningen; utrymme för "
             + "ett steg upp tas ur de två första posterna, inte ur kortet.";
+
+        // The ceiling the game was configured with, said next to the room it has. Six sessions inferred
+        // this number from a plateau hours after the fact; it is a line in fivem.cfg and it can be
+        // stated on the first process sample.
+        if (_clientConfig is { } config)
+        {
+            message += $" {config.Describe()}";
+
+            if (config.DescribeAgainstCard(totalBytes, reservedBytes, VramPressureBandMonitor.BandPercent, _overheadBytes) is { } verdict)
+            {
+                message += $" {verdict}";
+            }
+        }
 
         if (streamUnmeasurable)
         {

@@ -33,16 +33,58 @@ public sealed class SessionSummaryMeasurementTests
         var report = monitor.Summary();
 
         Assert.NotNull(report);
-        Assert.Equal(13, report!.MeasuredMinutes);
-        Assert.Equal(3, report.MinutesInBand);
-        Assert.Equal(3, report.MinutesInDeepBand);
+        Assert.Equal(13, report!.MeasuredMinutes, 1);
+        Assert.Equal(3, report.MinutesInBand, 1);
+        Assert.Equal(3, report.MinutesInDeepBand, 1);
         Assert.True(report.IsPressured);
+
+        // Neither stretch crosses the band inside an interval, so the split is exact.
+        Assert.Equal(0, report.MixedIntervals);
 
         // Ten an hour outside, six hundred inside.
         Assert.NotNull(report.HitchRatio);
         Assert.Equal(10, report.HitchRatio!.Value, 1);
         Assert.Contains("hitchfrekvensen", report.Message, StringComparison.Ordinal);
-        Assert.Contains("3 av 13 minuter", report.Message, StringComparison.Ordinal);
+        Assert.Contains("3,0 av 13 minuter", report.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The failure the interval was shortened for: a card that crosses the band for half a minute at a
+    /// time, which a minute-long bucket filed entirely as "outside" along with every hitch in it.
+    /// </summary>
+    /// <remarks>
+    /// Built to the shape of 2 September, where 125 of 351 minutes touched the band without a single one
+    /// of them counting as inside it. Those minutes carried 654 of the session's 1 246 hitches, and the
+    /// report came out at 1.4× against 3.4× measured per sample. Here the arithmetic is exact: half of
+    /// every minute is spent at 92% carrying twenty times the hitches of the half at 70%, and a monitor
+    /// that cannot see it reports no pressure at all.
+    /// </remarks>
+    [Fact]
+    public void HalfMinuteExcursionsIntoTheBandAreNotFiledAsTimeOutsideIt()
+    {
+        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+
+        for (var minute = 0; minute < 20; minute++)
+        {
+            var start = Start.AddMinutes(minute);
+
+            // Thirty seconds at 70%, then thirty at 92%.
+            Play(monitor, start, minutes: 1, vramPercent: 70, hitchesPerMinute: 0, seconds: 30);
+            Play(monitor, start.AddSeconds(30), minutes: 1, vramPercent: 92, hitchesPerMinute: 10, seconds: 30);
+        }
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report);
+        Assert.True(report!.IsPressured);
+
+        // Half the evening, seen as half the evening rather than as none of it.
+        Assert.Equal(10, report.MinutesInBand, 1);
+        Assert.Equal(20, report.MeasuredMinutes, 1);
+
+        // All of the hitches are inside the band, and none of them are attributed outside it.
+        Assert.Equal(0, report.OutsideHitches);
+        Assert.Contains("hitchade sessionen inte alls", report.Message, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -216,25 +258,30 @@ public sealed class SessionSummaryMeasurementTests
     /// Feeds one minute per minute of adapter readings and frames, at the given VRAM level and hitch
     /// rate. The frame times are the session's own cadence, so the hitch threshold settles at 33 ms.
     /// </summary>
+    /// <param name="seconds">
+    /// How long each "minute" of the fixture actually runs, so a stretch shorter than a minute can be
+    /// played. Readings and frames stay at their per-second rate, which is what the monitor buckets.
+    /// </param>
     private static void Play(
         VramPressureBandMonitor monitor,
         DateTimeOffset from,
         int minutes,
         double vramPercent,
-        int hitchesPerMinute)
+        int hitchesPerMinute,
+        int seconds = 60)
     {
         for (var minute = 0; minute < minutes; minute++)
         {
-            var minuteStart = from.AddMinutes(minute);
+            var minuteStart = from.AddSeconds(minute * seconds);
 
-            for (var reading = 0; reading < 12; reading++)
+            for (var reading = 0; reading * 5 < seconds; reading++)
             {
                 monitor.Observe(Adapter(minuteStart.AddSeconds(reading * 5), vramPercent));
             }
 
-            // Sixty frames a minute is enough to settle the cadence without making the fixture a
-            // hundred thousand samples; the threshold only needs the median.
-            for (var frame = 0; frame < 60; frame++)
+            // A frame a second is enough to settle the cadence without making the fixture a hundred
+            // thousand samples; the threshold only needs the median.
+            for (var frame = 0; frame < seconds; frame++)
             {
                 var isHitch = frame < hitchesPerMinute;
                 monitor.Observe(Frame(minuteStart.AddSeconds(frame), isHitch ? 90 : 16.7, cpuWaitMs: 6));

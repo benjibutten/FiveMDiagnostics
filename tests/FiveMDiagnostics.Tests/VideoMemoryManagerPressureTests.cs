@@ -36,11 +36,53 @@ public sealed class VideoMemoryManagerPressureTests
         Assert.True(pressure.IsPressured);
         Assert.True(pressure.SubjectWentQuiet);
 
-        var described = pressure.Describe();
+        var described = pressure.Describe(adapterVramPercent: 92);
         Assert.Contains("0,91 kärnor", described, StringComparison.Ordinal);
         Assert.Contains("0,18", described, StringComparison.Ordinal);
-        Assert.Contains("evakuerade ytor", described, StringComparison.Ordinal);
+        Assert.Contains("92 %", described, StringComparison.Ordinal);
+        Assert.Contains("eviction", described, StringComparison.Ordinal);
         Assert.Contains("vänta, inte till att räkna", described, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The same driver rate on a card that was half empty, which is not memory pressure and was reported
+    /// as such for a whole session.
+    /// </summary>
+    /// <remarks>
+    /// The 2 145 ms freeze of 2 September, nine minutes into the evening: 0.42 cores in the driver with
+    /// the card at 54%, and the analysis wrote "so much movement means the card was full and the driver
+    /// was evacuating surfaces over PCIe" underneath it. The trace was right about the driver and had no
+    /// way to check the rest of the sentence — the real cause was Windows Search hammering the file
+    /// system, which the card's own reading would have pointed away from immediately.
+    /// </remarks>
+    [Fact]
+    public void TheSameRateOnAHalfEmptyCardIsNotCalledMemoryPressure()
+    {
+        var pressure = new VideoMemoryPressure(0.03, 0.42, "FiveM_b3407_GTAProcess.exe", 6.12, 2.75);
+
+        var described = pressure.Describe(adapterVramPercent: 54);
+
+        Assert.Contains("0,42 kärnor", described, StringComparison.Ordinal);
+        Assert.Contains("54 %", described, StringComparison.Ordinal);
+        Assert.Contains("inte minnestryck", described, StringComparison.Ordinal);
+
+        // The claim that was made about this trace, and must not be made again.
+        Assert.DoesNotContain("flyttningen är eviction", described, StringComparison.Ordinal);
+        Assert.DoesNotContain("kortet var fullt", described, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Without a reading of the card the sentence states the measurement and defers the conclusion,
+    /// rather than asserting the half of it the trace cannot see.
+    /// </summary>
+    [Fact]
+    public void WithoutTheCardsOwnReadingTheConclusionIsDeferred()
+    {
+        var described = new VideoMemoryPressure(0.18, 0.91, "FiveM_b3407_GTAProcess.exe", null, null)
+            .Describe();
+
+        Assert.Contains("0,91 kärnor", described, StringComparison.Ordinal);
+        Assert.Contains("ingen avläsning av kortets fyllnadsgrad", described, StringComparison.Ordinal);
     }
 
     /// <summary>

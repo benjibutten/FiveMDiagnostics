@@ -426,7 +426,16 @@ internal sealed class CpuSampleAttribution
             || name.Contains("FiveM", StringComparison.OrdinalIgnoreCase);
     }
 
-    private string Name(int processId)
+    /// <summary>
+    /// The process's image name, or a pid when the trace never named it.
+    /// </summary>
+    /// <remarks>
+    /// Public because the file system attribution needs the same table. The kernel's FileIO events carry
+    /// a process id and no name, and a report that says "pid 5672 made 125 000 operations a second" is
+    /// one lookup short of being usable — that pid is Windows Search, and nobody reading the line can
+    /// know it.
+    /// </remarks>
+    public string Name(int processId)
     {
         return _processNames.TryGetValue(processId, out var name) ? name : $"pid {processId}";
     }
@@ -508,7 +517,21 @@ internal sealed record VideoMemoryPressure(
         && baseline > 0
         && atPeak < baseline * 0.9;
 
-    public string Describe()
+    /// <summary>
+    /// The band above which the card's own occupancy corroborates an eviction reading.
+    /// </summary>
+    /// <remarks>
+    /// The same 88% three sessions of frame data put the edge at. Below it the driver's work is
+    /// something else — a resolution change, a mode switch, a level load handing over surfaces — and
+    /// saying "the card was full" about it is simply false.
+    /// </remarks>
+    private const double CorroboratingVramPercent = 88;
+
+    /// <param name="adapterVramPercent">
+    /// How full the card was, when the session knows. The trace does not contain it, and the conclusion
+    /// depends on it: 0.42 cores at 92% occupancy is eviction, and the same 0.42 cores at 54% is not.
+    /// </param>
+    public string Describe(double? adapterVramPercent = null)
     {
         if (!IsPressured)
         {
@@ -521,9 +544,26 @@ internal sealed record VideoMemoryPressure(
                 + "i spårets övriga sekunder — tiden gick åt till att vänta, inte till att räkna."
             : string.Empty;
 
-        return $"Videominne: {ModuleGlossary.Annotate("dxgmms2.sys")} höll {PeakCores:F2} kärnor som mest under en sekund, "
-            + $"mot {BaselineCores:F2} i spårets lugna sekunder. Så mycket flyttning betyder att kortet var fullt och "
-            + $"att drivrutinen evakuerade ytor över PCIe.{quiet}";
+        var measurement = $"Videominne: {ModuleGlossary.Annotate("dxgmms2.sys")} höll {PeakCores:F2} kärnor som mest "
+            + $"under en sekund, mot {BaselineCores:F2} i spårets lugna sekunder.";
+
+        var meaning = adapterVramPercent switch
+        {
+            { } percent when percent >= CorroboratingVramPercent =>
+                $" Kortet låg samtidigt på {percent:F0} %, så flyttningen är eviction: drivrutinen "
+                + "gjorde plats genom att skyffla ytor över PCIe.",
+
+            { } percent =>
+                $" Men kortet låg bara på {percent:F0} %, alltså under {CorroboratingVramPercent:F0} % "
+                + "där eviction börjar. Drivrutinen flyttade minne av något annat skäl — en inladdning "
+                + "eller ett lägesbyte — och det här var inte minnestryck.",
+
+            _ => " Så mycket flyttning brukar betyda att kortet är fullt och att drivrutinen evakuerar "
+                + "ytor över PCIe, men spåret innehåller ingen avläsning av kortets fyllnadsgrad — "
+                + "läs den mot GPU-raden i incidenten innan slutsatsen dras.",
+        };
+
+        return measurement + meaning + quiet;
     }
 }
 
@@ -541,13 +581,17 @@ internal sealed record CpuAttributionSummary(
     /// <summary>
     /// The sentence the investigation actually needed, in the form it was written by hand three times.
     /// </summary>
-    public string Describe()
+    /// <param name="adapterVramPercent">
+    /// The card's occupancy, passed through to the video memory sentence, which cannot be concluded
+    /// without it. Null leaves that sentence saying only what the trace measured.
+    /// </param>
+    public string Describe(double? adapterVramPercent = null)
     {
         var modules = BusiestThreadModules.Count > 0
             ? " – " + string.Join(", ", BusiestThreadModules.Select(item => $"{item.Share:P0} {ModuleGlossary.Annotate(item.Module)}"))
             : string.Empty;
 
-        var videoMemory = VideoMemory is { } pressure ? " " + pressure.Describe() : string.Empty;
+        var videoMemory = VideoMemory is { } pressure ? " " + pressure.Describe(adapterVramPercent) : string.Empty;
 
         return $"CPU-sampling: {TotalCores:F2} kärnor upptagna totalt. {SubjectProcess} höll {SubjectProcessCores:F2} kärnor, "
             + $"och dess hetaste tråd (tid {BusiestThreadId}) {BusiestThreadCores:F2} kärnor{modules}.{videoMemory}";

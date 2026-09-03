@@ -579,7 +579,7 @@ public sealed class WprDeepCaptureService : IDeepCaptureService, IStallAwareDeep
     private sealed record CommandResult(bool Success, bool RequiresElevation, string Message);
 }
 
-public sealed class EtlArtifactParser : IArtifactParser
+public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
 {
     /// <summary>
     /// A DPC that runs longer than this blocks everything at its IRQL, including the scheduler, and is
@@ -594,6 +594,9 @@ public sealed class EtlArtifactParser : IArtifactParser
     /// </summary>
     private const double CoverageWarningRatio = 0.9;
 
+    /// <inheritdoc />
+    public Func<double?>? AdapterVramPercent { get; set; }
+
     public bool CanParse(string path)
     {
         return Path.GetExtension(path).Equals(".etl", StringComparison.OrdinalIgnoreCase);
@@ -601,6 +604,10 @@ public sealed class EtlArtifactParser : IArtifactParser
 
     public Task<ArtifactParseResult?> ParseAsync(string path, CancellationToken cancellationToken)
     {
+        // Read before the parse rather than after it: an ETL takes tens of seconds to walk, and the
+        // reading that matters is the card's state around the capture, not around the analysis.
+        var vramPercent = AdapterVramPercent?.Invoke();
+
         return Task.Run<ArtifactParseResult?>(() =>
         {
             var dpc = new LatencyAccumulator();
@@ -608,6 +615,7 @@ public sealed class EtlArtifactParser : IArtifactParser
             var contextSwitches = new CoverageTracker();
             var stacks = new CoverageTracker();
             var cpu = new CpuSampleAttribution();
+            var fileOperations = new FileOperationAttribution();
             var threadWaits = new ThreadWaitAttribution();
             var samples = new CoverageTracker();
             long eventCount = 0;
@@ -662,6 +670,14 @@ public sealed class EtlArtifactParser : IArtifactParser
                 eventCount++;
                 firstTimestamp ??= traceEvent.TimeStamp;
                 lastTimestamp = traceEvent.TimeStamp;
+
+                // Counted off the raw stream: the FileIO keywords emit a dozen opcodes and this wants
+                // every one of them, which is one string comparison against a name that is already
+                // being read.
+                if (traceEvent.ProviderName is "FileIO" || traceEvent.TaskName is "FileIO")
+                {
+                    fileOperations.OnEvent(traceEvent);
+                }
             };
 
             source.Process();
@@ -763,6 +779,37 @@ public sealed class EtlArtifactParser : IArtifactParser
                 }
             }
 
+            // Operations rather than megabytes, because the traffic that contends for the file system is
+            // small in bytes and enormous in count — and the analysis has only ever weighed the bytes.
+            var fileSummary = fileOperations.Summarize(cpu.IsGameProcess, cpu.Name);
+            if (fileSummary is not null)
+            {
+                metrics["fileOperations"] = fileSummary.TotalOperations;
+                metrics["fileOperationsPerSecond"] = Math.Round(fileSummary.TotalOperations / fileSummary.CoveredSeconds, 1);
+
+                if (fileSummary.BusiestNeighbour is { } neighbour)
+                {
+                    metrics["fileOperationsNeighbourPerSecond"] = Math.Round(neighbour.OperationsPerSecond, 1);
+                    metrics["fileOperationsNeighbourContending"] = fileSummary.HasContendingNeighbour ? 1 : 0;
+
+                    // When it was over the bar, not merely that it was somewhere in this file. The rate
+                    // above is an average over the whole retained window, and the analysis was reading
+                    // it as evidence about whichever incident the trace happened to overlap — a ring
+                    // buffer of tens of seconds against an incident window of ninety overlaps almost
+                    // always. Written like the thread-wait intervals, indexed and flat, because a
+                    // metrics dictionary of doubles is what an ArtifactEvidence carries.
+                    metrics["fileOperationsNeighbourIntervalCount"] = fileSummary.NeighbourContendingIntervals.Count;
+
+                    for (var index = 0; index < fileSummary.NeighbourContendingIntervals.Count; index++)
+                    {
+                        var interval = fileSummary.NeighbourContendingIntervals[index];
+                        metrics[$"fileOperationsNeighbourInterval{index}StartUnixMs"] = ToUnixTimeMilliseconds(interval.Start);
+                        metrics[$"fileOperationsNeighbourInterval{index}EndUnixMs"] = ToUnixTimeMilliseconds(interval.End);
+                        metrics[$"fileOperationsNeighbourInterval{index}PerSecond"] = Math.Round(interval.PeakOperationsPerSecond, 1);
+                    }
+                }
+            }
+
             if (threadWait is not null)
             {
                 metrics["gameThreadWaitThreadId"] = threadWait.ThreadId;
@@ -785,7 +832,8 @@ public sealed class EtlArtifactParser : IArtifactParser
 
             var summary = BuildSummary(dpc, isr, durationSeconds, eventCount)
                 + BuildSpanSummary(coveredStart, coveredEnd, durationSeconds, fileSpanSeconds)
-                + (attribution is not null ? " " + attribution.Describe() : string.Empty)
+                + (attribution is not null ? " " + attribution.Describe(vramPercent) : string.Empty)
+                + (fileSummary is not null ? " " + fileSummary.Describe() : string.Empty)
                 + (threadWait is not null ? " " + threadWait.Describe() : string.Empty)
                 + BuildCoverageSummary(contextSwitches, stacks, coveredStart, durationSeconds, source.EventsLost);
 

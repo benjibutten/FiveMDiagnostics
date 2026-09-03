@@ -19,23 +19,47 @@ namespace FiveMDiagnostics.Core;
 /// separates.
 /// </para>
 /// <para>
-/// A minute, not a sample, is the unit. Frame times and adapter readings arrive at wildly different
+/// An interval, not a sample, is the unit. Frame times and adapter readings arrive at wildly different
 /// rates and from two different clocks — PresentMon's anchor runs about a second behind the wall clock
 /// — so pairing them per sample would compare a frame against whichever reading happened to be nearest.
-/// A minute is far longer than that skew and short enough that a bad patch does not average away.
+/// The interval has to be far longer than that skew and short enough that a bad patch does not average
+/// away.
+/// </para>
+/// <para>
+/// It was a minute, and a minute was too long. The card crosses the band in bursts of twenty or thirty
+/// seconds, so most of the minutes it spent there were minutes it spent partly there — and the majority
+/// rule below then filed every one of them as "outside", with their hitches. Measured over 350 minutes
+/// on 2 September: 22 minutes in the band, 125 minutes that touched it and were counted as outside, and
+/// those 125 carried 654 of the session's 1 246 hitches. The report came out at 1.4× where the same
+/// data, matched per sample, says 3.4×; at fifteen seconds it says 2.5× and discards nothing. A ratio
+/// of 1.4 reads as noise and this one is not noise, so the interval is the difference between a line
+/// somebody acts on and a line somebody skips.
 /// </para>
 /// </remarks>
 public sealed class VramPressureBandMonitor
 {
     /// <summary>
-    /// Share of a minute's adapter readings that has to be inside the band before the minute counts.
+    /// The bucket both series are folded into.
     /// </summary>
     /// <remarks>
-    /// A minute in which the card touched the band once is not a minute spent in it. Half is the point
-    /// at which the minute is more inside than outside, which is what the comparison below needs it to
-    /// mean.
+    /// Fifteen seconds is fifteen times the clock skew between the two collectors and about half the
+    /// length of the shortest excursion into the band that the sessions show. Shorter would start to
+    /// pair frames against the wrong side of a crossing; longer is what this class already tried.
     /// </remarks>
-    private const double MinuteShareInBand = 0.5;
+    private const int IntervalSeconds = 15;
+
+    /// <summary>
+    /// Share of an interval's adapter readings that has to be inside the band before it counts.
+    /// </summary>
+    /// <remarks>
+    /// An interval in which the card touched the band once is not an interval spent in it. Half is the
+    /// point at which it is more inside than outside, which is what the comparison below needs it to
+    /// mean. Intervals that are genuinely split are still counted on the side they lean to rather than
+    /// discarded — <see cref="VramPressureBandReport.MixedIntervals"/> says how many there were, so a
+    /// reader can see how sharp the split was without any of the session being thrown away to make it
+    /// look sharper.
+    /// </remarks>
+    private const double IntervalShareInBand = 0.5;
 
     /// <summary>
     /// Frames held back before the hitch threshold is fixed, so it follows the cadence the session
@@ -55,7 +79,7 @@ public sealed class VramPressureBandMonitor
     public const double DeepBandPercent = 91;
 
     private readonly object _sync = new();
-    private readonly Dictionary<long, Minute> _minutes = [];
+    private readonly Dictionary<long, Interval> _intervals = [];
     private readonly List<(DateTimeOffset At, double FrameTimeMs)> _warmup = new(CadenceWarmupFrames);
     private readonly double _refreshIntervalMs;
 
@@ -80,21 +104,21 @@ public sealed class VramPressureBandMonitor
 
         lock (_sync)
         {
-            var minute = MinuteOf(sample.Timestamp);
-            minute.AdapterReadings++;
+            var interval = IntervalOf(sample.Timestamp);
+            interval.AdapterReadings++;
             if (percent >= BandPercent)
             {
-                minute.ReadingsInBand++;
+                interval.ReadingsInBand++;
             }
 
             if (percent >= DeepBandPercent)
             {
-                minute.ReadingsInDeepBand++;
+                interval.ReadingsInDeepBand++;
             }
 
-            if (percent > minute.PeakPercent)
+            if (percent > interval.PeakPercent)
             {
-                minute.PeakPercent = percent;
+                interval.PeakPercent = percent;
             }
         }
     }
@@ -136,52 +160,54 @@ public sealed class VramPressureBandMonitor
                 SettleThreshold();
             }
 
-            var measured = _minutes.Values.Where(minute => minute.AdapterReadings > 0).ToArray();
+            var measured = _intervals.Values.Where(interval => interval.AdapterReadings > 0).ToArray();
             if (measured.Length == 0)
             {
                 return null;
             }
 
-            var inBand = measured.Where(minute => minute.IsInBand).ToArray();
-            var outside = measured.Where(minute => !minute.IsInBand).ToArray();
-            var deepMinutes = measured.Count(minute => minute.IsInDeepBand);
+            var inBand = measured.Where(interval => interval.IsInBand).ToArray();
+            var outside = measured.Where(interval => !interval.IsInBand).ToArray();
 
-            // Only minutes that carried frames can carry a hitch rate; a minute where the capture was
-            // down is a minute about PresentMon rather than about the card.
-            var inBandWithFrames = inBand.Where(minute => minute.Frames > 0).ToArray();
-            var outsideWithFrames = outside.Where(minute => minute.Frames > 0).ToArray();
+            // Only intervals that carried frames can carry a hitch rate; one where the capture was down
+            // is an interval about PresentMon rather than about the card.
+            var inBandWithFrames = inBand.Where(interval => interval.Frames > 0).ToArray();
+            var outsideWithFrames = outside.Where(interval => interval.Frames > 0).ToArray();
 
+            var perHour = 3600d / IntervalSeconds;
             double? inBandRate = inBandWithFrames.Length > 0
-                ? inBandWithFrames.Sum(minute => minute.Hitches) * 60d / inBandWithFrames.Length
+                ? inBandWithFrames.Sum(interval => interval.Hitches) * perHour / inBandWithFrames.Length
                 : null;
             double? outsideRate = outsideWithFrames.Length > 0
-                ? outsideWithFrames.Sum(minute => minute.Hitches) * 60d / outsideWithFrames.Length
+                ? outsideWithFrames.Sum(interval => interval.Hitches) * perHour / outsideWithFrames.Length
                 : null;
 
             return new VramPressureBandReport(
+                IntervalSeconds,
                 measured.Length,
                 inBand.Length,
-                deepMinutes,
-                measured.Max(minute => minute.PeakPercent),
+                measured.Count(interval => interval.IsInDeepBand),
+                measured.Count(interval => interval.IsMixed),
+                measured.Max(interval => interval.PeakPercent),
                 _hitchThresholdMs,
-                inBandWithFrames.Sum(minute => minute.Hitches),
-                outsideWithFrames.Sum(minute => minute.Hitches),
+                inBandWithFrames.Sum(interval => interval.Hitches),
+                outsideWithFrames.Sum(interval => interval.Hitches),
                 inBandRate,
                 outsideRate);
         }
     }
 
     /// <summary>Called under the lock.</summary>
-    private Minute MinuteOf(DateTimeOffset timestamp)
+    private Interval IntervalOf(DateTimeOffset timestamp)
     {
-        var key = timestamp.ToUnixTimeSeconds() / 60;
-        if (!_minutes.TryGetValue(key, out var minute))
+        var key = timestamp.ToUnixTimeSeconds() / IntervalSeconds;
+        if (!_intervals.TryGetValue(key, out var interval))
         {
-            minute = new Minute();
-            _minutes[key] = minute;
+            interval = new Interval();
+            _intervals[key] = interval;
         }
 
-        return minute;
+        return interval;
     }
 
     /// <summary>
@@ -206,18 +232,18 @@ public sealed class VramPressureBandMonitor
         _warmup.TrimExcess();
     }
 
-    /// <summary>Counts one frame into its minute. Called under the lock.</summary>
+    /// <summary>Counts one frame into its interval. Called under the lock.</summary>
     private void Count(DateTimeOffset at, double frameTimeMs)
     {
-        var minute = MinuteOf(at);
-        minute.Frames++;
+        var interval = IntervalOf(at);
+        interval.Frames++;
         if (frameTimeMs >= _hitchThresholdMs)
         {
-            minute.Hitches++;
+            interval.Hitches++;
         }
     }
 
-    private sealed class Minute
+    private sealed class Interval
     {
         public int AdapterReadings;
         public int ReadingsInBand;
@@ -226,20 +252,30 @@ public sealed class VramPressureBandMonitor
         public int Hitches;
         public double PeakPercent;
 
-        public bool IsInBand => AdapterReadings > 0 && ReadingsInBand >= AdapterReadings * MinuteShareInBand;
+        public bool IsInBand => AdapterReadings > 0 && ReadingsInBand >= AdapterReadings * IntervalShareInBand;
 
-        public bool IsInDeepBand => AdapterReadings > 0 && ReadingsInDeepBand >= AdapterReadings * MinuteShareInBand;
+        public bool IsInDeepBand => AdapterReadings > 0 && ReadingsInDeepBand >= AdapterReadings * IntervalShareInBand;
+
+        /// <summary>The card crossed the band inside this interval rather than spending it on one side.</summary>
+        public bool IsMixed => ReadingsInBand > 0 && ReadingsInBand < AdapterReadings;
     }
 }
 
 /// <summary>What the session spent inside the VRAM band, and what it cost while it was there.</summary>
+/// <param name="IntervalSeconds">The bucket the two series were folded into, so the minutes below can be derived.</param>
+/// <param name="MixedIntervals">
+/// Intervals in which the card was on both sides of the band. They are counted on whichever side they
+/// lean to rather than discarded; this figure is how the reader judges how clean the split was.
+/// </param>
 /// <param name="InBandHitchesPerHour">
-/// Null when no minute inside the band carried frames, which is the only honest answer then.
+/// Null when no interval inside the band carried frames, which is the only honest answer then.
 /// </param>
 public sealed record VramPressureBandReport(
-    int MeasuredMinutes,
-    int MinutesInBand,
-    int MinutesInDeepBand,
+    int IntervalSeconds,
+    int MeasuredIntervals,
+    int IntervalsInBand,
+    int IntervalsInDeepBand,
+    int MixedIntervals,
     double PeakPercent,
     double HitchThresholdMs,
     int InBandHitches,
@@ -247,8 +283,17 @@ public sealed record VramPressureBandReport(
     double? InBandHitchesPerHour,
     double? OutsideHitchesPerHour)
 {
+    /// <summary>The measured session in minutes, which is the unit the line is read in.</summary>
+    public double MeasuredMinutes => MeasuredIntervals * IntervalSeconds / 60d;
+
+    /// <summary>Minutes spent inside the band.</summary>
+    public double MinutesInBand => IntervalsInBand * IntervalSeconds / 60d;
+
+    /// <summary>Minutes spent inside the deeper band.</summary>
+    public double MinutesInDeepBand => IntervalsInDeepBand * IntervalSeconds / 60d;
+
     /// <summary>Share of the measured session spent inside the band.</summary>
-    public double InBandShare => MeasuredMinutes > 0 ? (double)MinutesInBand / MeasuredMinutes : 0;
+    public double InBandShare => MeasuredIntervals > 0 ? (double)IntervalsInBand / MeasuredIntervals : 0;
 
     /// <summary>
     /// How much worse the band was, or null when there is no finite ratio to state.
@@ -264,27 +309,29 @@ public sealed record VramPressureBandReport(
         : null;
 
     /// <summary>True once the band was occupied enough to be worth acting on rather than noting.</summary>
-    public bool IsPressured => MinutesInBand > 0 && (MinutesInDeepBand > 0 || InBandShare >= 0.05);
+    public bool IsPressured => IntervalsInBand > 0 && (IntervalsInDeepBand > 0 || InBandShare >= 0.05);
 
     public string Message
     {
         get
         {
-            if (MinutesInBand == 0)
+            if (IntervalsInBand == 0)
             {
                 return $"VRAM-tryck: kortet höll sig under {VramPressureBandMonitor.BandPercent:F0} % hela sessionen "
-                    + $"({MeasuredMinutes} mätta minuter, högst {PeakPercent:F1} %). Texturinställningen har marginal.";
+                    + $"({MeasuredMinutes:F0} mätta minuter, högst {PeakPercent:F1} %). Texturinställningen har marginal.";
             }
 
-            var deep = MinutesInDeepBand > 0
-                ? $" och över {VramPressureBandMonitor.DeepBandPercent:F0} % i {MinutesInDeepBand} minuter"
+            var deep = IntervalsInDeepBand > 0
+                ? $" och över {VramPressureBandMonitor.DeepBandPercent:F0} % i {MinutesInDeepBand:F1} minuter"
                 : string.Empty;
 
             var gradient = DescribeGradient();
 
-            return $"VRAM-tryck: kortet låg över {VramPressureBandMonitor.BandPercent:F0} % i {MinutesInBand} av "
-                + $"{MeasuredMinutes} minuter ({InBandShare:P0}){deep}; högst {PeakPercent:F1} %.{gradient} "
-                + "Bandet är den här sessionens egna minuter jämförda mot varandra, inte en gissad gräns.";
+            return $"VRAM-tryck: kortet låg över {VramPressureBandMonitor.BandPercent:F0} % i {MinutesInBand:F1} av "
+                + $"{MeasuredMinutes:F0} minuter ({InBandShare:P0}){deep}; högst {PeakPercent:F1} %.{gradient} "
+                + $"Mätt i {IntervalSeconds}-sekundersintervall, varav {MixedIntervals} låg på båda sidor om "
+                + "gränsen och räknats dit de lutar. Bandet är den här sessionens egen tid jämförd mot sig "
+                + "själv, inte en gissad gräns.";
         }
     }
 

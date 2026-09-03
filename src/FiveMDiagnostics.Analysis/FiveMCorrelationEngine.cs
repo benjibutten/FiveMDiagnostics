@@ -2,8 +2,11 @@
 
 using FiveMDiagnostics.Core;
 
-public sealed class FiveMCorrelationEngine : IAnalysisEngine
+public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAnalysis
 {
+    /// <inheritdoc />
+    public Func<DateTimeOffset, bool>? ComposedPresentExplainedAt { get; set; }
+
     /// <summary>
     /// Stutter is deviation from the cadence the machine is actually achieving, not absolute frame time.
     /// A fixed 25 ms threshold misses every hitch on a 120 Hz display and fires constantly on a 30 fps
@@ -235,7 +238,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         AddGpuHypothesis(hypotheses, metrics, obsSamples, systemSamples, gpu, correlatedThreadWait);
         AddResourceHypothesis(hypotheses, metrics, processSamples, artifacts, obsSamples, systemSamples, cores, correlatedThreadWait);
         AddNetworkHypothesis(hypotheses, metrics, networkProbes, networkEndpoints, artifacts, systemSamples, obsSamples);
-        AddDiskHypothesis(hypotheses, metrics, processSamples, systemSamples, artifacts, correlatedThreadWait);
+        AddDiskHypothesis(hypotheses, metrics, processSamples, systemSamples, artifacts, correlatedThreadWait, incident.WindowStart, incident.WindowEnd);
         AddExternalProcessHypothesis(hypotheses, suspectedProcesses, processSamples, systemSamples);
         AddOsLatencyHypothesis(hypotheses, metrics, artifacts, systemSamples, obsSamples);
         AddCorruptionHypothesis(hypotheses, artifacts);
@@ -256,9 +259,13 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                 ["Det fanns inte tillräckligt med samstämmig telemetry för en säker klassificering."]));
         }
 
-        var highlights = BuildHighlights(incident, metrics, hypotheses.First(), artifacts, obsSamples, gpu, networkProbes, suspectedProcesses, gpuProcessMemory);
+        // Asked about the moment the incident was marked, not about now. The analysis runs off a queue
+        // and the window mode can have moved twice since these frames were presented.
+        var composedPresentExplained = ComposedPresentExplainedAt?.Invoke(incident.Marker.MarkedAt) ?? false;
+
+        var highlights = BuildHighlights(incident, metrics, hypotheses.First(), artifacts, obsSamples, gpu, networkProbes, suspectedProcesses, gpuProcessMemory, composedPresentExplained);
         var top = hypotheses[0];
-        var summary = BuildSummary(top, runnerUp, metrics, obsSamples, gpu, artifacts, networkProbes, suspectedProcesses, gpuProcessMemory);
+        var summary = BuildSummary(top, runnerUp, metrics, obsSamples, gpu, artifacts, networkProbes, suspectedProcesses, gpuProcessMemory, composedPresentExplained);
 
         return new IncidentAnalysis(
             hypotheses,
@@ -1125,7 +1132,9 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         IReadOnlyList<ProcessTelemetrySample> processSamples,
         IReadOnlyList<SystemTelemetrySample> systemSamples,
         IReadOnlyList<ArtifactEvidence> artifacts,
-        CorrelatedThreadWait? correlatedThreadWait)
+        CorrelatedThreadWait? correlatedThreadWait,
+        DateTimeOffset windowStart,
+        DateTimeOffset windowEnd)
     {
         var evidence = new List<string>();
         double confidence = 0;
@@ -1158,6 +1167,30 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         {
             confidence += 0.25;
             evidence.Add($"En konkurrerande process låg på {ToMegabytes(maxCompetingIo):F1} MB/s disk-I/O.");
+        }
+
+        // Operations, not megabytes. The traffic that actually contends for the file system is metadata
+        // — opens, closes, small reads against an index or a cache — and it is invisible in throughput:
+        // Windows Search cost the worst non-VRAM frame of 2 September at twelve megabytes a second and
+        // 48 000 operations a second, and every threshold above it is a byte count.
+        var fileContention = FindFileOperationContention(artifacts, windowStart, windowEnd);
+        if (fileContention is { IsContending: true } contention)
+        {
+            // Half weight when the trace could only give an average over everything it recorded. The
+            // signal is then "this happened somewhere in a file that overlaps the incident", which is a
+            // lead and not a measurement of these seconds.
+            confidence += contention.MeasuredDuringIncident ? 0.3 : 0.15;
+
+            var when = contention.MeasuredDuringIncident
+                ? "under incidentfönstret"
+                : "någon gång i spårets fönster — spåret tidsbestämmer inte trafiken, så den behöver inte "
+                    + "ha pågått under de tappade framesen";
+
+            evidence.Add(
+                $"ETL-spåret mätte {contention.NeighbourOperationsPerSecond:N0} filsystemsoperationer i sekunden "
+                + $"från en annan process än spelet, {when}. Det är trängsel i filsystemet snarare än på disken, "
+                + "och den syns inte i MB/s — samma trafik var bara ett tiotal megabyte i sekunden. Vilken volym "
+                + "operationerna gick mot mäts inte, så det är inte belagt att de träffade samma disk som spelet.");
         }
 
         if (streamingHints.Length > 0)
@@ -1226,9 +1259,14 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         // per-frame attribution below, because only these observe latency rather than volume.
         var hasMeasuredStallSignal = maxLatency >= 20 || maxQueue >= 2 || maxHardFaultPages >= 100;
 
+        // File system contention counts as a storage signal in its own right. It is measured per process
+        // out of a trace rather than inferred from a throughput counter, and it is the only signal here
+        // that fires for the workload that actually cost a frame on 2 September — where latency, queue
+        // depth and megabytes were all unremarkable and the operation rate was 48 000 a second.
         var hasStorageStallSignal = hasMeasuredStallSignal
             || streamingHints.Length > 0
-            || hasStrongIoFallback;
+            || hasStrongIoFallback
+            || fileContention is { IsContending: true };
         if (confidence > 0 && hasStorageStallSignal)
         {
             // Without counters the evidence is throughput plus the fact that frames were slow, and that
@@ -1312,7 +1350,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
 
         var evidence = suspectedProcesses
             .Take(3)
-            .Select(item => $"{item.ProcessName} misstänks störa med {item.Reason.ToLowerInvariant()} (peak CPU {item.PeakCpuPercent:F0}%, disk {item.PeakIoMegabytesPerSecond:F1} MB/s).")
+            .Select(item => $"{item.DisplayName} misstänks störa med {item.Reason.ToLowerInvariant()} (peak CPU {item.PeakCpuPercent:F0}%, disk {item.PeakIoMegabytesPerSecond:F1} MB/s).")
             .ToList();
 
         var confidence = 0.45 + (suspectedProcesses.Count * 0.06);
@@ -1500,7 +1538,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         GpuMetrics gpu,
         IReadOnlyList<NetworkProbeSample> probes,
         IReadOnlyList<SuspectedProcessImpact> suspectedProcesses,
-        GpuProcessMemorySample? gpuProcessMemory)
+        GpuProcessMemorySample? gpuProcessMemory,
+        bool composedPresentExplained)
     {
         var highlights = new List<TimelineHighlight>
         {
@@ -1518,7 +1557,9 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                 + "CPU-sidan mäts som väggklocktid före present och betyder inte att processorn räknade."));
         }
 
-        if (metrics.PresentMode.HasData)
+        // Silent when the mode is composed, uniform and already explained by the window mode: that is
+        // three ways of saying the game is running borderless, which the session header says once.
+        if (metrics.PresentMode.HasData && !IsExplainedComposedMode(metrics.PresentMode, composedPresentExplained))
         {
             var mode = metrics.PresentMode;
             var note = mode.IsComposed
@@ -1580,7 +1621,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         var suspect = suspectedProcesses.FirstOrDefault();
         if (suspect is not null)
         {
-            highlights.Add(new(incident.Marker.MarkedAt, "Processes", $"Misstänkt sidoprocess: {suspect.ProcessName} ({suspect.Reason}, peak CPU {suspect.PeakCpuPercent:F0}%, disk {suspect.PeakIoMegabytesPerSecond:F1} MB/s)."));
+            highlights.Add(new(incident.Marker.MarkedAt, "Processes", $"Misstänkt sidoprocess: {suspect.DisplayName} ({suspect.Reason}, peak CPU {suspect.PeakCpuPercent:F0}%, disk {suspect.PeakIoMegabytesPerSecond:F1} MB/s)."));
         }
 
         highlights.AddRange(artifacts.Take(3).Select(item => new TimelineHighlight(item.Timestamp, item.Kind.ToString(), item.Summary)));
@@ -1614,20 +1655,23 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
         IReadOnlyList<ArtifactEvidence> artifacts,
         IReadOnlyList<NetworkProbeSample> probes,
         IReadOnlyList<SuspectedProcessImpact> suspectedProcesses,
-        GpuProcessMemorySample? gpuProcessMemory)
+        GpuProcessMemorySample? gpuProcessMemory,
+        bool composedPresentExplained)
     {
         // Both are observations rather than conclusions, so they belong in the summary whether or not
         // the engine managed to classify anything. An unclassified window is precisely where "every
         // frame was composed" or "every probe failed" is the most useful thing anyone can be told.
-        var presentModeHint = metrics.PresentMode switch
-        {
-            { IsComposed: true } composed =>
-                $" Present mode var \"{composed.DominantMode}\" för {composed.DominantShare:P0} av frames — inga oberoende flips, "
-                + "allt gick via kompositorn.",
-            { IsUniform: true } uniform => $" Present mode var \"{uniform.DominantMode}\" genom hela fönstret.",
-            { HasData: true } mixed => $" Present mode växlade; vanligast var \"{mixed.DominantMode}\" ({mixed.DominantShare:P0}).",
-            _ => string.Empty,
-        };
+        var presentModeHint = IsExplainedComposedMode(metrics.PresentMode, composedPresentExplained)
+            ? string.Empty
+            : metrics.PresentMode switch
+            {
+                { IsComposed: true } composed =>
+                    $" Present mode var \"{composed.DominantMode}\" för {composed.DominantShare:P0} av frames — inga oberoende flips, "
+                    + "allt gick via kompositorn.",
+                { IsUniform: true } uniform => $" Present mode var \"{uniform.DominantMode}\" genom hela fönstret.",
+                { HasData: true } mixed => $" Present mode växlade; vanligast var \"{mixed.DominantMode}\" ({mixed.DominantShare:P0}).",
+                _ => string.Empty,
+            };
         var probeHint = BuildProbeHint(probes);
 
         var obsActive = obsSamples.Any(item => item.IsStreaming)
@@ -1650,7 +1694,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             : string.Empty;
         var artifactHint = artifacts.Count > 0 ? $" {artifacts.Count} importerade artifacts bidrog till bedömningen." : string.Empty;
         var suspectHint = suspectedProcesses.FirstOrDefault() is { } suspect
-            ? $" Mest avvikande bakgrundsprocess: {suspect.ProcessName} ({suspect.Reason.ToLowerInvariant()})."
+            ? $" Mest avvikande bakgrundsprocess: {suspect.DisplayName} ({suspect.Reason.ToLowerInvariant()})."
             : string.Empty;
 
         // Everything above this line is measurement, and measurement does not depend on the engine
@@ -1791,6 +1835,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
 
     private static IReadOnlyList<SuspectedProcessImpact> AnalyzeSuspiciousProcesses(IReadOnlyList<SystemTelemetrySample> systemSamples)
     {
+        var cpuFloor = SuspectCpuFloorPercent(systemSamples);
+
         return systemSamples
             .SelectMany(item => item.TopCpuProcesses.Concat(item.TopDiskProcesses))
             .Where(item => IsRelevantExternalProcess(item.ProcessName))
@@ -1799,6 +1845,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             {
                 var peakCpu = group.Max(entry => entry.CpuPercent);
                 var peakIoMegabytes = group.Max(entry => ToMegabytes(entry.IoBytesPerSecond));
+                var isService = group.Any(entry => entry.IsSystemService);
 
                 return new
                 {
@@ -1808,11 +1855,12 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                         Math.Round(peakCpu, 1),
                         Math.Round(peakIoMegabytes, 1),
                         group.Count(),
-                        DescribeProcessReason(group.Key.ProcessName, peakCpu, peakIoMegabytes)),
+                        DescribeProcessReason(group.Key.ProcessName, peakCpu, peakIoMegabytes),
+                        isService),
                     Score = peakCpu + (peakIoMegabytes * 1.5) + (IsKnownOverlayOrHook(group.Key.ProcessName) ? 20 : 0),
                 };
             })
-            .Where(item => item.Impact.PeakCpuPercent >= 12 || item.Impact.PeakIoMegabytesPerSecond >= 12)
+            .Where(item => item.Impact.PeakCpuPercent >= cpuFloor || item.Impact.PeakIoMegabytesPerSecond >= 12)
             .OrderByDescending(item => item.Score)
             .ThenByDescending(item => item.Impact.ObservedSamples)
             .Select(item => item.Impact)
@@ -1820,8 +1868,48 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
             .ToArray();
     }
 
+    /// <summary>
+    /// The CPU share a neighbour has to reach before it is worth naming, expressed so that it means the
+    /// same thing on machines of different widths.
+    /// </summary>
+    /// <remarks>
+    /// Twelve percent of the machine was the rule, and on a sixteen-thread processor that is two whole
+    /// cores — a bar nothing in eleven sessions of background noise ever cleared. The process that cost
+    /// the worst non-VRAM frame of 2 September held one core, which is 6.3% there and 12.5% on the eight
+    /// -thread machine the number was presumably chosen on. One held core is the claim worth making, so
+    /// the floor follows the core count and is never raised above the old fixed value: a narrow machine
+    /// behaves exactly as it did, a wide one stops hiding a saturated core behind a percentage.
+    /// </remarks>
+    private static double SuspectCpuFloorPercent(IReadOnlyList<SystemTelemetrySample> systemSamples)
+    {
+        var cores = systemSamples
+            .Select(sample => sample.PerCoreUsagePercent.Count)
+            .DefaultIfEmpty(0)
+            .Max();
+
+        return cores > 0 ? Math.Min(12d, 100d / cores) : 12d;
+    }
+
+    /// <summary>
+    /// FiveM's own CEF host, which draws the server's interface — phone, tablet, inventory, HUD.
+    /// </summary>
+    /// <remarks>
+    /// Excluded by the "FiveM" rule below for as long as that rule has existed, and it should not have
+    /// been: it is a separate process with a cost of its own, it went from 0.32 to 1.23 cores over the
+    /// evening of 2 September, and it was named in none of that session's 154 incidents. The game's own
+    /// process is rightly not a suspect in its own stutter; a browser hosting a dozen server resources
+    /// is a neighbour like any other.
+    /// </remarks>
+    private static bool IsNuiBrowser(string processName) =>
+        processName.Contains("ChromeBrowser", StringComparison.OrdinalIgnoreCase);
+
     private static bool IsRelevantExternalProcess(string processName)
     {
+        if (IsNuiBrowser(processName))
+        {
+            return true;
+        }
+
         var baseName = Path.GetFileNameWithoutExtension(processName);
         return !processName.Contains("FiveM", StringComparison.OrdinalIgnoreCase)
             && !processName.Contains("GTA", StringComparison.OrdinalIgnoreCase)
@@ -2167,6 +2255,113 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
     }
 
     /// <summary>
+    /// What a deep capture measured about a neighbour hammering the file system.
+    /// </summary>
+    /// <param name="IsContending">
+    /// Whether the busiest non-game process passed the rate at which it is contending rather than
+    /// merely working. The parser owns that threshold, because it owns the baseline the game itself
+    /// runs at.
+    /// </param>
+    /// <param name="MeasuredDuringIncident">
+    /// True when the trace named the seconds the neighbour was over the bar and at least one of them
+    /// fell inside the incident window. False when the trace only reported an average over everything it
+    /// recorded, which is the older form and cannot say when the work happened.
+    /// </param>
+    private sealed record TraceFileOperationContention(
+        double NeighbourOperationsPerSecond,
+        bool IsContending,
+        bool MeasuredDuringIncident);
+
+    /// <summary>
+    /// The heaviest file system contention any trace in the window saw, or null when none measured it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Restricted to the traces that were looking at this incident, for the same reason
+    /// <see cref="FindVideoMemoryPressure"/> is. An incident window can carry a capture taken for a
+    /// hitch a minute earlier, and Windows Search indexing through that capture says nothing about the
+    /// frames under examination now — while forty thousand operations a second is exactly what puts
+    /// three tenths on the disk hypothesis and sends the incident to the wrong category.
+    /// </para>
+    /// <para>
+    /// Overlapping the trace was never enough on its own, and that was the remaining half of the same
+    /// mistake. The rate the parser wrote was an average over the whole retained window: a ring buffer
+    /// holding forty seconds against an incident window of ninety overlaps almost every time, so an
+    /// indexer that ran through the first ten seconds of a capture and stopped was read as evidence
+    /// about frames lost thirty seconds later. The parser now names the seconds it was over the bar, and
+    /// this asks for one of them inside the window. A trace from before that — or one whose neighbour
+    /// never sustained a contending second — falls back to the average it does carry, which is what the
+    /// analysis had before and no worse than it.
+    /// </para>
+    /// </remarks>
+    private static TraceFileOperationContention? FindFileOperationContention(
+        IReadOnlyList<ArtifactEvidence> artifacts,
+        DateTimeOffset windowStart,
+        DateTimeOffset windowEnd)
+    {
+        return artifacts
+            .Where(item => item.Kind == ArtifactKind.EtlTrace
+                && item.Metrics.ContainsKey("fileOperationsNeighbourPerSecond")
+                && OverlapsWindow(item, windowStart, windowEnd))
+            .Select(item => ReadContention(item, windowStart, windowEnd))
+            .OfType<TraceFileOperationContention>()
+            .OrderByDescending(item => item.IsContending)
+            .ThenByDescending(item => item.NeighbourOperationsPerSecond)
+            .FirstOrDefault();
+    }
+
+    /// <summary>
+    /// What one trace says about file system contention during this incident, or null when it recorded
+    /// contending seconds and none of them were these.
+    /// </summary>
+    private static TraceFileOperationContention? ReadContention(
+        ArtifactEvidence trace,
+        DateTimeOffset windowStart,
+        DateTimeOffset windowEnd)
+    {
+        // The key's presence is the question, not its value. A parser that timed the traffic writes the
+        // count whether or not it found a contending second, so a zero means "looked, found none" and
+        // its absence means a trace from before the traffic was timed at all.
+        if (!trace.Metrics.TryGetValue("fileOperationsNeighbourIntervalCount", out var intervalCountValue))
+        {
+            // All it has is the average over everything it recorded, and the overlap check above is the
+            // only thing standing between that and the incident.
+            return new TraceFileOperationContention(
+                trace.Metrics.GetValueOrDefault("fileOperationsNeighbourPerSecond"),
+                trace.Metrics.GetValueOrDefault("fileOperationsNeighbourContending") >= 0.5,
+                MeasuredDuringIncident: false);
+        }
+
+        var intervalCount = (int)intervalCountValue;
+
+        double? peakDuringIncident = null;
+        for (var index = 0; index < intervalCount; index++)
+        {
+            if (!trace.Metrics.TryGetValue($"fileOperationsNeighbourInterval{index}StartUnixMs", out var startMs)
+                || !trace.Metrics.TryGetValue($"fileOperationsNeighbourInterval{index}EndUnixMs", out var endMs))
+            {
+                continue;
+            }
+
+            var start = DateTimeOffset.FromUnixTimeMilliseconds((long)startMs);
+            var end = DateTimeOffset.FromUnixTimeMilliseconds((long)endMs);
+            if (start > windowEnd || end < windowStart)
+            {
+                continue;
+            }
+
+            var rate = trace.Metrics.GetValueOrDefault($"fileOperationsNeighbourInterval{index}PerSecond");
+            peakDuringIncident = Math.Max(peakDuringIncident ?? 0, rate);
+        }
+
+        // Every second in an interval is over the parser's bar, so an overlap is contention during the
+        // incident and the absence of one is a trace with nothing to say about these frames.
+        return peakDuringIncident is { } peak
+            ? new TraceFileOperationContention(peak, IsContending: true, MeasuredDuringIncident: true)
+            : null;
+    }
+
+    /// <summary>
     /// Whether the span a trace says it covers touches the incident window at all.
     /// </summary>
     /// <remarks>
@@ -2299,6 +2494,18 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine
                 && OverlappingSlowFrameMs >= cpuBoundSpikeMs * DecisiveAttributionShare;
         }
     }
+
+    /// <summary>
+    /// True when the present path is composed, uniform, and the window mode already accounts for it.
+    /// </summary>
+    /// <remarks>
+    /// All three conditions matter. A window that is only mostly composed has switched paths during the
+    /// incident, which is a real observation; a composed path on a machine whose window mode was never
+    /// read is unexplained and has to keep saying so. Only the third case — every frame composed, on a
+    /// game the settings file says is running borderless — is a restatement of the configuration.
+    /// </remarks>
+    private static bool IsExplainedComposedMode(PresentModeMetrics mode, bool explained) =>
+        explained && mode is { HasData: true, IsComposed: true, IsUniform: true };
 
     private sealed record PresentModeMetrics(
         bool HasData,

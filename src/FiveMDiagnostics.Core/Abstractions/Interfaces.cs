@@ -87,6 +87,57 @@ public interface IStallAwareDeepCapture
     Func<bool>? StallInProgress { get; set; }
 }
 
+/// <summary>
+/// Lets a trace analyser ask how full the card was, which is the one thing a trace cannot see.
+/// </summary>
+/// <remarks>
+/// The video memory manager's rate says the driver was moving surfaces; only the adapter says whether
+/// it was moving them because the card was full. On 2 September the analyser wrote "so much movement
+/// means the card was full and the driver was evacuating surfaces over PCIe" about a trace taken while
+/// the card stood at 54%, because it had the first half of that sentence and no way to check the
+/// second. Same shape as <see cref="IStallAwareDeepCapture"/>: a probe the session fills in, and a
+/// null that leaves the analyser saying only what it measured.
+/// </remarks>
+public interface IVramAwareTraceAnalysis
+{
+    /// <summary>
+    /// The card's occupancy in percent around the time of the capture, or null when it is not known.
+    /// </summary>
+    Func<double?>? AdapterVramPercent { get; set; }
+}
+
+/// <summary>
+/// Lets the session tell the analysis that the present mode has already been accounted for.
+/// </summary>
+/// <remarks>
+/// "Composed: Copy with GPU GDI for 100% of frames — no independent flips, everything went through the
+/// compositor" has been written into every incident of eleven sessions, 154 of them in one evening, and
+/// it has never once been the answer. It is not a finding: it is what a game running in a borderless
+/// window does, every frame, by definition. Once the settings file says the window mode, the sentence
+/// belongs in the session header with the measurement that says it costs nothing — 0.50% of 1.25
+/// million frames off cadence — and not on every incident as though it were evidence.
+/// </remarks>
+public interface IWindowModeAwareAnalysis
+{
+    /// <summary>
+    /// Answers, for a given moment, whether the window mode in force then explains a composed present
+    /// path — so the per-incident explanation can be dropped for the incidents it covers and kept for
+    /// the ones it does not. Null, or false, leaves every incident carrying it, which is right when
+    /// nothing has established why the compositor is in the way.
+    /// </summary>
+    /// <remarks>
+    /// A function of time rather than a flag, for the same reason
+    /// <see cref="IVramAwareTraceAnalysis.AdapterVramPercent"/> is a function at all. Incidents are
+    /// analysed on a worker off a bounded queue, minutes after the window they describe closed, and the
+    /// settings file is re-read on a cadence while they wait — so a flag read at analysis time answers
+    /// the question with whichever window mode the game happens to be in now. Alt-Enter into exclusive
+    /// fullscreen and every incident still queued from the borderless hour loses the present-mode
+    /// evidence that was the only thing explaining it; alt-Enter the other way and an hour of incidents
+    /// that really were unexplained get told they are accounted for.
+    /// </remarks>
+    Func<DateTimeOffset, bool>? ComposedPresentExplainedAt { get; set; }
+}
+
 public interface IDiagnosticStatusSink
 {
     void Report(StatusLevel level, string source, string message);

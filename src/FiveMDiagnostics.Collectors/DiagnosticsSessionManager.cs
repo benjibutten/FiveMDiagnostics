@@ -7,6 +7,18 @@ using FiveMDiagnostics.Core;
 public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDisposable
 {
     private readonly object _sync = new();
+
+    /// <summary>
+    /// How far back the adapter occupancy is kept for a finished trace to be interpreted against.
+    /// </summary>
+    /// <remarks>
+    /// A capture's tail, the write of most of a gigabyte and the parse of it add up to a minute or two,
+    /// so this has to reach back past all three to cover the seconds the trace actually holds.
+    /// </remarks>
+    private static readonly TimeSpan AdapterVramWindow = TimeSpan.FromMinutes(3);
+
+    private readonly object _adapterVramSync = new();
+    private readonly List<(DateTimeOffset At, double Percent)> _adapterVram = [];
     private readonly DiagnosticsSettings _settings;
     private readonly IEnvironmentMetadataProvider _environmentMetadataProvider;
     private readonly IAnalysisEngine _analysisEngine;
@@ -57,6 +69,27 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private SlowFrameWaitProfile? _slowFrameWaits;
     private IncidentVerdictTally? _verdicts;
     private GameGraphicsSettingsMonitor? _gameSettings;
+
+    /// <summary>
+    /// Every window mode this session has been in, and when each of them started.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// One entry per change, which over an evening is one or two. It exists because the analysis engine
+    /// outlives the session and runs off a queue: an incident marked at 21:14 is classified when the
+    /// worker reaches it, and asking "is the compositor explained?" then answers about the window mode
+    /// at classification time. Alt-Enter is one keystroke and this machine's user does it.
+    /// </para>
+    /// <para>
+    /// Stamped when the change is <em>noticed</em> rather than when the file was written, which is up to
+    /// one settings-check interval late. That is a known and bounded inaccuracy on a signal that only
+    /// decides whether one explanatory sentence is printed; the alternative is to trust a file's write
+    /// time as the moment the game changed mode, which it is not.
+    /// </para>
+    /// </remarks>
+    private readonly List<(DateTimeOffset At, bool Explained)> _windowModeHistory = [];
+
+    private readonly object _windowModeSync = new();
 
     /// <summary>
     /// When the graphics settings file is next re-read.
@@ -265,6 +298,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         // on an external process — would therefore leave the journal open, the channels alive and
         // possibly a WPR session recording, with nothing left that would ever clean them up. So the
         // start undoes its own work before it lets the exception out.
+        IReadOnlyList<string> initialGameSettingsLines = [];
         try
         {
             _ringBuffer = new TimeWindowRingBuffer<TelemetryEvent>(_settings.RingBufferRetention, item => item.Timestamp);
@@ -314,6 +348,27 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 stallAware.StallInProgress = IsStallInProgress;
             }
 
+            // Lets the trace analysis tell eviction from any other reason the driver moves memory. The
+            // trace holds the driver's rate and nothing about how full the card was, and the conclusion
+            // needs both.
+            foreach (var vramAware in _artifactParsers.OfType<IVramAwareTraceAnalysis>())
+            {
+                vramAware.AdapterVramPercent = RecentAdapterVramPercent;
+            }
+
+            // Lets each incident be judged against the window mode it happened in rather than the one
+            // the game is in when the queue reaches it. Attached before any incident can be marked, and
+            // detached in DetachWindowModeHistory once the queue has drained.
+            lock (_windowModeSync)
+            {
+                _windowModeHistory.Clear();
+            }
+
+            if (_analysisEngine is IWindowModeAwareAnalysis startWindowAware)
+            {
+                startWindowAware.ComposedPresentExplainedAt = ComposedPresentExplainedAt;
+            }
+
             // A capture whose incident never published — the session was stopped while it was still
             // being written — would otherwise wait here for a marker id the next session cannot produce.
             lock (_sync)
@@ -344,6 +399,19 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             // spent starting up is history a marker cannot use.
             await StartDeepCaptureRingBufferAsync(_sessionCts.Token).ConfigureAwait(false);
 
+            // Read before the collectors run rather than after they have been started. The budget
+            // monitor is handed the game's ceiling here, and a monitor that gets it a moment later has
+            // already seen process samples without it: the first budget line of the session is then
+            // written against the card alone, which is the one line somebody picks a graphics preset
+            // from. The lines themselves are still written below, after the session-start line, where
+            // they read as the header they are.
+            var sessionStartedAt = DateTimeOffset.UtcNow;
+            _gameSettings = new GameGraphicsSettingsMonitor(sessionStartedAt);
+            _nextGameSettingsCheck = sessionStartedAt + GameSettingsCheckInterval;
+            _nextInterimSummary = sessionStartedAt + InterimSummaryInterval;
+            initialGameSettingsLines = _gameSettings.DescribeInitial();
+            ApplyGameSettingsToMonitors();
+
             _analysisTask = Task.Run(() => AnalysisLoopAsync(_analysisChannel.Reader));
             _pumpTask = Task.Run(() => PumpAsync(_channel.Reader, _sessionCts.Token));
             _finalizeTask = Task.Run(() => FinalizeLoopAsync(_sessionCts.Token));
@@ -369,13 +437,23 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         // not where it is looked for, which costs nothing that was not already missing. The session
         // start is passed in so the line can say whether the file predates it, which is the difference
         // between "these are the settings" and "these are the settings from some evening in August".
-        var sessionStartedAt = DateTimeOffset.UtcNow;
-        _gameSettings = new GameGraphicsSettingsMonitor(sessionStartedAt);
-        _nextGameSettingsCheck = sessionStartedAt + GameSettingsCheckInterval;
-        _nextInterimSummary = sessionStartedAt + InterimSummaryInterval;
-        if (_gameSettings.DescribeInitial() is { } graphics)
+        foreach (var line in initialGameSettingsLines)
         {
-            Report(StatusLevel.Info, "GameSettings", graphics);
+            Report(StatusLevel.Info, "GameSettings", line);
+        }
+
+        // Said once here instead of on every incident. Eleven sessions carried "everything went through
+        // the compositor" as though it were a finding; it is what a borderless window does, and the
+        // measurement that matters is that it costs nothing.
+        if (_gameSettings?.ExplainsComposedPresent == true)
+        {
+            Report(
+                StatusLevel.Info,
+                "GameSettings",
+                "Spelet kör i fönsterläge, så varje frame komponeras av DWM i stället för att få en egen flip "
+                + "— present-läget kommer att stå på \"Composed\" hela sessionen och är förklarat av den "
+                + "inställningen, inte ett fel. Kadensen mot skärmen mäts separat i DisplayCadence-raden; "
+                + "det är den som säger vad kompositorn faktiskt kostar.");
         }
         OnStateChanged();
     }
@@ -429,10 +507,15 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         _collectorTasks = [];
         _isSessionActive = false;
 
+        _vramBudget?.SetTextureBudget(null);
+
         if (_deepCaptureService is IStallAwareDeepCapture stallAware)
         {
             stallAware.StallInProgress = null;
         }
+
+        DetachAdapterVramHistory();
+        DetachWindowModeHistory();
 
         FinalizeFramePacing();
         CloseJournal();
@@ -516,6 +599,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         {
             stopStallAware.StallInProgress = null;
         }
+
+        // The parsers outlive the session, and an ETL imported by hand afterwards would otherwise be
+        // told how full the card was during an evening that has already ended. The probe is detached
+        // and the history dropped together: either alone leaves the other able to answer.
+        DetachAdapterVramHistory();
 
         FinalizeFramePacing();
         WriteSessionSummaries(final: true);
@@ -1337,11 +1425,113 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// and the game has allocated something, and again when the stream stack starts or stops, which is
     /// the only term of it that moves during an evening.
     /// </remarks>
+    /// <summary>
+    /// Keeps the recent adapter occupancy so a finished trace can be told what the card was doing.
+    /// </summary>
+    /// <remarks>
+    /// Trimmed to <see cref="AdapterVramWindow"/> on every sample, which at a two hertz cadence is a few
+    /// hundred entries and never grows.
+    /// </remarks>
+    private void RecordAdapterVram(GpuTelemetrySample sample)
+    {
+        // The same guard the budget monitor keeps, and for the same reason. NVML reports device index 0
+        // for the whole session while the trace describes whichever adapter the game renders on, so on a
+        // machine with a second NVIDIA device this history would answer "how full was the card during
+        // that trace" with a different card's occupancy — and the answer decides whether the driver's
+        // paging is read as eviction. Unconfirmed counts are treated as multi-adapter: the parser
+        // already says only what it measured when the probe returns null.
+        if (!sample.IsAvailable || !sample.IsSingleAdapterMachine || sample.VramUsagePercent is not { } percent)
+        {
+            return;
+        }
+
+        lock (_adapterVramSync)
+        {
+            _adapterVram.Add((sample.Timestamp, percent));
+
+            var cutoff = sample.Timestamp - AdapterVramWindow;
+            var stale = 0;
+            while (stale < _adapterVram.Count && _adapterVram[stale].At < cutoff)
+            {
+                stale++;
+            }
+
+            if (stale > 0)
+            {
+                _adapterVram.RemoveRange(0, stale);
+            }
+        }
+    }
+
+    /// <summary>
+    /// How full the card has been over the last few minutes, or null when nothing was measured.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The median rather than the latest reading, and a window rather than an instant, because of when
+    /// this is asked. A deep capture runs its tail, writes several hundred megabytes and is then parsed,
+    /// so the question "how full was the card during that trace" arrives a minute or two after the
+    /// trace ended. A single reading taken at parse time can easily belong to a different part of the
+    /// evening; the median of the window the capture sits inside cannot.
+    /// </para>
+    /// <para>
+    /// The median also refuses to be moved by the capture's own cost. Writing the file evicts nothing,
+    /// but the game keeps allocating while it is written, and the last sample before the parse is the
+    /// one most likely to have drifted.
+    /// </para>
+    /// </remarks>
+    private double? RecentAdapterVramPercent()
+    {
+        double[] readings;
+        lock (_adapterVramSync)
+        {
+            if (_adapterVram.Count == 0)
+            {
+                return null;
+            }
+
+            readings = _adapterVram.Select(entry => entry.Percent).ToArray();
+        }
+
+        Array.Sort(readings);
+        return readings[readings.Length / 2];
+    }
+
+    /// <summary>
+    /// Takes the adapter occupancy away from the trace parsers and forgets it, so nothing outside a
+    /// running session can be interpreted against it.
+    /// </summary>
+    /// <remarks>
+    /// Both halves matter. The parsers are constructed once and outlive every session on them, so a
+    /// probe left attached answers an ETL imported an hour later with whatever the last session
+    /// measured — and a history left behind answers the next session's first trace with the previous
+    /// one's card. Either produces an eviction verdict about an evening that is over.
+    /// </remarks>
+    private void DetachAdapterVramHistory()
+    {
+        foreach (var vramAware in _artifactParsers.OfType<IVramAwareTraceAnalysis>())
+        {
+            vramAware.AdapterVramPercent = null;
+        }
+
+        lock (_adapterVramSync)
+        {
+            _adapterVram.Clear();
+        }
+    }
+
     private void ReportVramBudget(GpuProcessMemorySample sample)
     {
         if (_vramBudget?.Observe(sample) is { } report)
         {
             Report(StatusLevel.Info, "GpuProcessMemory.Budget", report.Message);
+        }
+
+        // A warning rather than an Info: it says the card will enter the band before the game stops
+        // growing, which is a prediction somebody can still act on while the evening is running.
+        if (_vramBudget?.DescribeBudgetApproach() is { } approach)
+        {
+            Report(StatusLevel.Warning, "GpuProcessMemory.Budget", approach);
         }
     }
 
@@ -1391,6 +1581,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 }
                 else if (telemetryEvent is GpuTelemetrySample gpuSample)
                 {
+                    RecordAdapterVram(gpuSample);
                     _vramAccounting?.Observe(gpuSample);
                     _vramBudget?.Observe(gpuSample);
                     _vramPressure?.Observe(gpuSample);
@@ -1540,6 +1731,102 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         {
             Report(StatusLevel.Warning, "GameSettings", change);
         }
+
+        // The re-read is what makes this check worth doing, and until now only the log saw it. A texture
+        // budget raised between two attempts, or a window put into fullscreen, changed the line written
+        // here and nothing that reasons about either — the budget monitor kept advising against the
+        // ceiling the session started with, for hours.
+        ApplyGameSettingsToMonitors();
+    }
+
+    /// <summary>
+    /// Pushes the settings as last read into the parts of the session that reason about them.
+    /// </summary>
+    /// <remarks>
+    /// Called at start and after every re-read, and it assigns rather than sets: the window mode can
+    /// stop explaining the compositor as well as start, and the analysis engine outlives the session, so
+    /// a flag that is only ever raised carries the last session that ran windowed into every one after
+    /// it and quietly drops present-mode evidence from incidents nothing has explained.
+    /// </remarks>
+    private void ApplyGameSettingsToMonitors()
+    {
+        // The budget monitor states the game's ceiling against the card, and the ceiling is a number in
+        // a config file rather than something to be inferred from a plateau three hours later.
+        _vramBudget?.SetTextureBudget(_gameSettings?.ClientConfig);
+
+        RecordWindowMode(_gameSettings?.ExplainsComposedPresent == true);
+    }
+
+    /// <summary>
+    /// Notes the window mode as it stands now, so an incident can later be asked about its own moment.
+    /// </summary>
+    private void RecordWindowMode(bool explained)
+    {
+        lock (_windowModeSync)
+        {
+            if (_windowModeHistory.Count > 0 && _windowModeHistory[^1].Explained == explained)
+            {
+                return;
+            }
+
+            _windowModeHistory.Add((DateTimeOffset.UtcNow, explained));
+        }
+    }
+
+    /// <summary>
+    /// Whether the window mode in force at a given moment explained a composed present path.
+    /// </summary>
+    /// <remarks>
+    /// A timestamp before the first reading gets that reading's answer. The first entry is written at
+    /// session start, and the events an incident is built from come out of a ring buffer that reaches
+    /// back before it — so the alternative is to tell the session's first incident that nothing was
+    /// known, which is false: the settings file was read before a single frame was collected.
+    /// </remarks>
+    private bool ComposedPresentExplainedAt(DateTimeOffset at)
+    {
+        lock (_windowModeSync)
+        {
+            if (_windowModeHistory.Count == 0)
+            {
+                return false;
+            }
+
+            var explained = _windowModeHistory[0].Explained;
+            foreach (var entry in _windowModeHistory)
+            {
+                if (entry.At > at)
+                {
+                    break;
+                }
+
+                explained = entry.Explained;
+            }
+
+            return explained;
+        }
+    }
+
+    /// <summary>
+    /// Takes the window mode away from the analysis engine and forgets it.
+    /// </summary>
+    /// <remarks>
+    /// Same reasoning as <see cref="DetachAdapterVramHistory"/>, and the same pair of halves: the engine
+    /// is the instance the next session will use, so a delegate left attached would answer that session
+    /// with this evening's window modes — and a history left behind would answer it even after the
+    /// delegate was replaced. Safe here because the analysis queue is drained and its worker awaited
+    /// before this runs, so no incident is still waiting for an answer.
+    /// </remarks>
+    private void DetachWindowModeHistory()
+    {
+        if (_analysisEngine is IWindowModeAwareAnalysis windowAware)
+        {
+            windowAware.ComposedPresentExplainedAt = null;
+        }
+
+        lock (_windowModeSync)
+        {
+            _windowModeHistory.Clear();
+        }
     }
 
     /// <summary>
@@ -1554,6 +1841,13 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
         _gameSettings = null;
         _nextGameSettingsCheck = DateTimeOffset.MaxValue;
+
+        // With no settings behind it there is nothing to explain a compositor or measure a budget
+        // against, and the analysis engine is the same instance the next session will use. The history
+        // is dropped rather than extended with a "no longer known" entry: every incident that could ask
+        // about it has already been analysed by the time this runs.
+        _vramBudget?.SetTextureBudget(null);
+        DetachWindowModeHistory();
     }
 
     private async Task FlushPendingIncidentsAsync(DateTimeOffset now)

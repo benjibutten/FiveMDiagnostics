@@ -16,6 +16,31 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
     /// </summary>
     private const int SamplesBeforeYieldReport = 20;
 
+    /// <summary>
+    /// CPU a process outside the interactive session has to be using before it is worth listing.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Session 0 was skipped outright for eleven sessions, and that is where every Windows service
+    /// lives: Search indexing, Defender, SysMain, Windows Update, BITS. On 2 September the game lost a
+    /// 2 145 ms frame while <c>SearchIndexer.exe</c> held a full core and made 48 000 file operations a
+    /// second against its own database on the same disk as the game's cache — and the incident recorded
+    /// an empty suspect list, because none of that was in a session the collector would look at. Every
+    /// "external process interference" verdict the app has ever reached was drawn from the interactive
+    /// session alone.
+    /// </para>
+    /// <para>
+    /// A floor rather than a whitelist, because the population is large and mostly idle: a machine runs
+    /// well over a hundred services and two or three of them are ever doing anything. Two percent of one
+    /// machine is a fifth of a core on eight, which is below anything that has ever mattered and above
+    /// the noise of a service waking up to poll something.
+    /// </para>
+    /// </remarks>
+    private const double ServiceCpuFloorPercent = 2;
+
+    /// <summary>Disk traffic that earns a service a row on its own, at five megabytes a second.</summary>
+    private const long ServiceIoFloorBytesPerSecond = 5L * 1024 * 1024;
+
     private readonly PerformanceCounter? _totalCpuCounter;
     private readonly IReadOnlyList<PerformanceCounter> _perCoreCounters;
     private readonly CounterProbe _diskLatencyProbe;
@@ -29,6 +54,10 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
     private DateTimeOffset _lastProcessSampleUtc = DateTimeOffset.MinValue;
     private IReadOnlyList<ProcessActivity> _cachedTopCpu = [];
     private IReadOnlyList<ProcessActivity> _cachedTopDisk = [];
+
+    /// <summary>Set once the process table had to be read the slow way, so the session log can say so.</summary>
+    private bool _processTableFallback;
+    private bool _reportedProcessTableFallback;
     private string? _cpuCounterFailure;
     private long _samplesTaken;
     private bool _reportedYield;
@@ -96,6 +125,7 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
 
             _samplesTaken++;
             ReportCounterYieldIfDue(context);
+            ReportProcessTableFallbackIfDue(context);
 
             await Task.Delay(context.Settings.SystemPollingInterval, cancellationToken).ConfigureAwait(false);
         }
@@ -243,6 +273,31 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
         }
     }
 
+    /// <summary>
+    /// Says once that the process table is being read the expensive, incomplete way.
+    /// </summary>
+    /// <remarks>
+    /// Worth a line because both consequences are invisible otherwise: the app costs a third of a core
+    /// instead of nothing, and the table is missing every process it could not open — which on an
+    /// unelevated session is half of them, services included.
+    /// </remarks>
+    private void ReportProcessTableFallbackIfDue(CollectorContext context)
+    {
+        if (!_processTableFallback || _reportedProcessTableFallback)
+        {
+            return;
+        }
+
+        _reportedProcessTableFallback = true;
+        context.StatusSink.Report(
+            StatusLevel.Warning,
+            Name,
+            "Processtabellen kunde inte läsas med ett systemanrop och läses i stället process för process. "
+            + "Det kostar omkring hundra gånger mer CPU i appen själv, och tabellen saknar de processer "
+            + "appen inte får öppna — typiskt alla Windowstjänster. Topplistorna över CPU och disk är "
+            + "därför ofullständiga den här sessionen.");
+    }
+
     private (IReadOnlyList<ProcessActivity> TopCpu, IReadOnlyList<ProcessActivity> TopDisk) SampleProcesses(DateTimeOffset timestamp)
     {
         if (timestamp - _lastProcessSampleUtc < _processSampleInterval)
@@ -250,48 +305,45 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
             return (_cachedTopCpu, _cachedTopDisk);
         }
 
-        var samples = new List<ProcessActivity>();
-        var activeProcessIds = new HashSet<int>();
-
-        foreach (var process in Process.GetProcesses())
+        var rows = ProcessTableReader.TryRead(timestamp);
+        if (rows is null)
         {
-            using (process)
-            {
-                try
-                {
-                    if (process.SessionId != _currentSessionId)
-                    {
-                        continue;
-                    }
-                }
-                catch
-                {
-                    continue;
-                }
-
-                if (!ProcessMetricsReader.TryRead(process, timestamp, out var snapshot))
-                {
-                    continue;
-                }
-
-                activeProcessIds.Add(snapshot.ProcessId);
-                var cpu = 0d;
-                var ioPerSecond = 0L;
-
-                if (_previousSnapshots.TryGetValue(snapshot.ProcessId, out var previous))
-                {
-                    cpu = ProcessMetricsReader.ComputeCpuPercent(snapshot, previous);
-                    ioPerSecond = ProcessMetricsReader.ComputeReadBytesPerSecond(snapshot, previous)
-                        + ProcessMetricsReader.ComputeWriteBytesPerSecond(snapshot, previous);
-                }
-
-                _previousSnapshots[snapshot.ProcessId] = snapshot;
-
-                samples.Add(new ProcessActivity(snapshot.ProcessName, snapshot.ProcessId, cpu, ioPerSecond));
-            }
+            _processTableFallback = true;
+            rows = ReadThroughHandles(timestamp);
         }
 
-        foreach (var staleProcessId in _previousSnapshots.Keys.Where(processId => !activeProcessIds.Contains(processId)).ToArray())
+        var samples = new List<ProcessActivity>(16);
+        var seen = new HashSet<int>(rows.Count);
+
+        foreach (var row in rows)
+        {
+            var snapshot = row.Snapshot;
+            seen.Add(snapshot.ProcessId);
+
+            var cpu = 0d;
+            var ioPerSecond = 0L;
+
+            if (_previousSnapshots.TryGetValue(snapshot.ProcessId, out var previous))
+            {
+                cpu = ProcessMetricsReader.ComputeCpuPercent(snapshot, previous);
+                ioPerSecond = ProcessMetricsReader.ComputeReadBytesPerSecond(snapshot, previous)
+                    + ProcessMetricsReader.ComputeWriteBytesPerSecond(snapshot, previous);
+            }
+
+            _previousSnapshots[snapshot.ProcessId] = snapshot;
+
+            // A machine runs well over a hundred services and two or three of them are ever doing
+            // anything. The floor keeps the idle ones out of the top lists without hiding a busy one.
+            var isService = row.SessionId != _currentSessionId;
+            if (isService && cpu < ServiceCpuFloorPercent && ioPerSecond < ServiceIoFloorBytesPerSecond)
+            {
+                continue;
+            }
+
+            samples.Add(new ProcessActivity(snapshot.ProcessName, snapshot.ProcessId, cpu, ioPerSecond, isService));
+        }
+
+        foreach (var staleProcessId in _previousSnapshots.Keys.Where(processId => !seen.Contains(processId)).ToArray())
         {
             _previousSnapshots.Remove(staleProcessId);
         }
@@ -301,6 +353,42 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
         _lastProcessSampleUtc = timestamp;
 
         return (_cachedTopCpu, _cachedTopDisk);
+    }
+
+    /// <summary>
+    /// The old sweep, kept as the answer for a machine where the system call is unavailable.
+    /// </summary>
+    /// <remarks>
+    /// One handle and several system calls per process, which is why it is no longer the first choice —
+    /// 168 ms against 2.6 ms for the same 265 processes. It is also blind to anything it cannot open, so
+    /// a session that lands here has a thinner process table and the log says so.
+    /// </remarks>
+    private List<ProcessTableRow> ReadThroughHandles(DateTimeOffset timestamp)
+    {
+        var rows = new List<ProcessTableRow>(200);
+
+        foreach (var process in Process.GetProcesses())
+        {
+            using (process)
+            {
+                int sessionId;
+                try
+                {
+                    sessionId = process.SessionId;
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (ProcessMetricsReader.TryRead(process, timestamp, out var snapshot))
+                {
+                    rows.Add(new ProcessTableRow(snapshot, sessionId));
+                }
+            }
+        }
+
+        return rows;
     }
 
     /// <summary>

@@ -204,10 +204,46 @@ public sealed record CaptureCostReport(
     double ElsewhereHitchesPerHour,
     double HitchThresholdMs)
 {
-    public string Message =>
-        $"Deep captures: {CaptureCount} st. Av sessionens {Hitches} hitches ≥{HitchThresholdMs:F0} ms inträffade "
-        + $"{HitchesNearCapture} inom en minut efter att en capture skrivits till disk — "
-        + $"{NearCaptureHitchesPerHour:F0}/h där, mot {ElsewhereHitchesPerHour:F0}/h i resten av sessionen. "
-        + "Delvis är det efterdyningar av hitchen som utlöste capturen, delvis kostnaden för att skriva "
-        + "~900 MB medan spelet kör. Räkna med det innan två kvällar med olika antal captures jämförs.";
+    /// <summary>
+    /// Captures beyond which an evening is paying for traces the review will not open.
+    /// </summary>
+    /// <remarks>
+    /// Six is what the 2 September review actually read: twelve were taken, and the conclusion rested on
+    /// three of them plus the confirmation that the rest agreed. Each one costs most of a gigabyte
+    /// written while the game runs, and the session's own figures put that at roughly a tenth more
+    /// hitches during the minute it is written — so the surplus is not free, and it is not evidence.
+    /// </remarks>
+    public const int SufficientCaptures = 6;
+
+    /// <summary>
+    /// How much worse the minute after a capture was, or null when the session has no comparison.
+    /// </summary>
+    public double? CostRatio => ElsewhereHitchesPerHour > 0
+        ? NearCaptureHitchesPerHour / ElsewhereHitchesPerHour
+        : null;
+
+    public string Message
+    {
+        get
+        {
+            // The setting named here has to be one that exists. It said DeepCapture.MaxCapturesPerWindow,
+            // which is not a setting in this app and never has been: whoever followed the advice would
+            // have searched the configuration for it and found nothing. The ceiling on an evening is
+            // MaxAutoCapturesPerSession; MaxAutoCapturesPerWindow governs how many may be taken in a
+            // burst and is the wrong lever for "twelve over five hours".
+            var advice = CaptureCount > SufficientCaptures
+                ? $" {CaptureCount} captures på en kväll är fler än analysen behöver — {SufficientCaptures} hade "
+                    + "räckt, och resten är betald diskskrivning under pågående spel. Sänk "
+                    + "DeepCapture.MaxAutoCapturesPerSession om nästa session inte ska betala för traces "
+                    + "ingen läser; DeepCapture.MaxAutoCapturesPerWindow styr i stället hur många som får "
+                    + "tas i följd."
+                : string.Empty;
+
+            return $"Deep captures: {CaptureCount} st. Av sessionens {Hitches} hitches ≥{HitchThresholdMs:F0} ms inträffade "
+                + $"{HitchesNearCapture} inom en minut efter att en capture skrivits till disk — "
+                + $"{NearCaptureHitchesPerHour:F0}/h där, mot {ElsewhereHitchesPerHour:F0}/h i resten av sessionen. "
+                + "Delvis är det efterdyningar av hitchen som utlöste capturen, delvis kostnaden för att skriva "
+                + $"~900 MB medan spelet kör. Räkna med det innan två kvällar med olika antal captures jämförs.{advice}";
+        }
+    }
 }

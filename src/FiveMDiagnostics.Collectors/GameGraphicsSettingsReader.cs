@@ -2,6 +2,8 @@
 
 using System.Xml.Linq;
 
+using FiveMDiagnostics.Core;
+
 /// <summary>
 /// One reading of the graphics settings file: which copy was read, when it was last written, and what
 /// it says.
@@ -22,6 +24,17 @@ public sealed record GameGraphicsSettings(
 {
     /// <summary>The values on one line, in the order they were asked for.</summary>
     public string Summary => string.Join(", ", Values.Select(entry => $"{entry.Key} {entry.Value}"));
+
+    /// <summary>
+    /// True when the window mode accounts for every frame going through the compositor.
+    /// </summary>
+    /// <remarks>
+    /// Windowed 1 and 2 are both windows, and a window cannot get an independent flip: DWM composes it,
+    /// by definition, on every frame. Once this is known the analysis has no reason to report the
+    /// composed present path as a finding on each incident — see <c>IWindowModeAwareAnalysis</c>.
+    /// </remarks>
+    public bool ExplainsComposedPresent =>
+        Values.TryGetValue("Windowed", out var mode) && mode is "1" or "2";
 
     /// <summary>
     /// Whether two readings describe the same file in the same state.
@@ -131,10 +144,12 @@ public sealed record GameSettingsCandidate(string Path, DateTimeOffset LastWrite
 /// the record is worse than no setting, because the next comparison would be made against it.
 /// </para>
 /// <para>
-/// Not complete, and the gap matters. <c>Extended Texture Budget</c> is FiveM's own setting and is not
-/// in this file — verified against a real install, which has no element for it in any section. It was
-/// one of the two knobs moved on 27 August and it is likely the larger half of the 1 776 MB that change
-/// took out of the game, so a reader must not treat the line below as the whole graphics configuration.
+/// Not complete on its own, and that gap turned out to be the investigation's answer.
+/// <c>Extended Texture Budget</c> is FiveM's own setting and is not in this file — it is
+/// <c>vid_budgetScale</c> in <c>fivem.cfg</c>, in the same directory, and it is the setting that
+/// decides how much video memory the game will take. <see cref="FiveMClientConfigReader"/> reads it,
+/// and both lines belong together: this one says what the picture costs, that one says what the card
+/// is allowed to hold.
 /// </para>
 /// </remarks>
 public static class GameGraphicsSettingsReader
@@ -378,28 +393,45 @@ public static class GameGraphicsSettingsReader
     /// Where the FiveM client keeps a copy of the game's settings under its own data directories.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Several layouts, because the client has used more than one and an installation moved to another
     /// drive keeps none of them. A path that does not exist costs one <c>File.Exists</c>, so the list is
     /// allowed to be generous; what is not allowed is the previous behaviour, which searched none of
     /// them and reported a fifteen-month-old file as the session's settings.
+    /// </para>
+    /// <para>
+    /// The file is named <c>gta5_settings.xml</c>, and that is the whole of what the previous version of
+    /// this method got wrong. It searched <c>%appdata%\CitizenFX\</c> — the right directory, arrived at
+    /// after three sessions of argument — for <c>settings.xml</c>, found nothing, and fell back to a
+    /// Rockstar file from June 2025 for a twelfth consecutive session. Both names are listed now:
+    /// the client has used the plain one in older builds, and a name that is not there costs a stat.
+    /// </para>
     /// </remarks>
     private static IEnumerable<string> FiveMCandidatePaths()
     {
         var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         var roamingAppData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
 
+        string[] names = ["gta5_settings.xml", "settings.xml"];
+
         if (!string.IsNullOrWhiteSpace(localAppData))
         {
-            yield return Path.Combine(localAppData, "FiveM", "FiveM.app", "citizen", "settings.xml");
-            yield return Path.Combine(localAppData, "FiveM", "FiveM.app", "data", "game-storage", "settings.xml");
-            yield return Path.Combine(localAppData, "FiveM", "FiveM.app", "data", "cache", "settings.xml");
-            yield return Path.Combine(localAppData, "FiveM", "FiveM.app", "settings.xml");
+            foreach (var name in names)
+            {
+                yield return Path.Combine(localAppData, "FiveM", "FiveM.app", "citizen", name);
+                yield return Path.Combine(localAppData, "FiveM", "FiveM.app", "data", "game-storage", name);
+                yield return Path.Combine(localAppData, "FiveM", "FiveM.app", "data", "cache", name);
+                yield return Path.Combine(localAppData, "FiveM", "FiveM.app", name);
+            }
         }
 
         if (!string.IsNullOrWhiteSpace(roamingAppData))
         {
-            yield return Path.Combine(roamingAppData, "CitizenFX", "settings.xml");
-            yield return Path.Combine(roamingAppData, "CitizenFX", "Rockstar Games", "GTA V", "settings.xml");
+            foreach (var name in names)
+            {
+                yield return Path.Combine(roamingAppData, "CitizenFX", name);
+                yield return Path.Combine(roamingAppData, "CitizenFX", "Rockstar Games", "GTA V", name);
+            }
         }
     }
 }
@@ -423,59 +455,191 @@ public static class GameGraphicsSettingsReader
 public sealed class GameGraphicsSettingsMonitor
 {
     private readonly IReadOnlyList<string>? _candidatePaths;
+    private readonly IReadOnlyList<string>? _configPaths;
     private readonly DateTimeOffset _sessionStartUtc;
     private readonly object _sync = new();
 
     private GameGraphicsSettings? _current;
+    private FiveMClientConfig? _currentConfig;
 
-    public GameGraphicsSettingsMonitor(DateTimeOffset sessionStartUtc, IEnumerable<string>? candidatePaths = null)
+    /// <summary>
+    /// Whether the settings that were read account for a composed present path.
+    /// </summary>
+    /// <remarks>
+    /// False when no settings file could be read, which is the conservative answer: an unexplained
+    /// compositor stays on every incident until something explains it.
+    /// </remarks>
+    public bool ExplainsComposedPresent
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _current?.ExplainsComposedPresent ?? false;
+            }
+        }
+    }
+
+    public GameGraphicsSettingsMonitor(
+        DateTimeOffset sessionStartUtc,
+        IEnumerable<string>? candidatePaths = null,
+        IEnumerable<string>? configPaths = null)
     {
         _sessionStartUtc = sessionStartUtc;
         _candidatePaths = candidatePaths?.ToArray();
+        _configPaths = configPaths?.ToArray();
     }
 
     /// <summary>
-    /// Reads the settings for the first time and returns the line for the session log, or null when no
-    /// candidate could be read.
+    /// The client configuration as last read, so the VRAM budget can be stated against the texture
+    /// budget the game was actually given. Null until <see cref="DescribeInitial"/> has run, and null
+    /// afterwards on a machine with no <c>fivem.cfg</c>.
     /// </summary>
-    public string? DescribeInitial()
+    public FiveMClientConfig? ClientConfig
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _currentConfig;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reads the settings for the first time and returns the lines for the session log — the graphics
+    /// file first, the client's texture budget second. Empty when neither could be read.
+    /// </summary>
+    /// <remarks>
+    /// Two lines rather than one sentence, because they come from two files with two write times and
+    /// either can be absent without saying anything about the other.
+    /// </remarks>
+    public IReadOnlyList<string> DescribeInitial()
     {
         var settings = GameGraphicsSettingsReader.Read(_candidatePaths, out var older);
+        var config = FiveMClientConfigReader.Read(_configPaths);
         lock (_sync)
         {
             _current = settings;
+            _currentConfig = config;
         }
 
-        return settings?.Describe(_sessionStartUtc, older);
+        var lines = new List<string>(2);
+        if (settings?.Describe(_sessionStartUtc, older) is { } graphics)
+        {
+            lines.Add(graphics);
+        }
+
+        if (config?.Describe() is { } budget)
+        {
+            lines.Add(budget);
+        }
+
+        return lines;
     }
 
     /// <summary>
     /// Re-reads and returns a line when something moved since the last reading, null otherwise.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// A file that disappears is reported too. It means the copy the session's record points at is gone
     /// — a OneDrive move, most likely — and the values above no longer have a source anybody can check.
+    /// </para>
+    /// <para>
+    /// What is read is what is held, both files, whether or not the reading was a file. Keeping the last
+    /// successful reading when a file vanished had two consequences and neither was the intended one:
+    /// the disappearance was re-reported on every check for the rest of the evening, because the state
+    /// it was compared against never moved, and everything that reasons off these readings — the window
+    /// mode, the texture budget — went on being told the values of a file that is not there. The
+    /// conservative answer is the honest one: nothing can be read, so nothing is known.
+    /// </para>
+    /// <para>
+    /// Both files are reported in the same call rather than the first one that has something to say. The
+    /// two readings were already taken together and both were already stored, so returning on the budget
+    /// threw away a graphics change that had happened in the same interval — and it was thrown away for
+    /// good, because the next check compares against the reading this one had just saved. A texture
+    /// quality step taken in the same five minutes as a slider move is exactly the pair of changes a
+    /// later comparison turns on.
+    /// </para>
     /// </remarks>
     public string? DescribeChange()
     {
         var settings = GameGraphicsSettingsReader.Read(_candidatePaths, out var older);
+        var config = FiveMClientConfigReader.Read(_configPaths);
 
         GameGraphicsSettings? previous;
+        FiveMClientConfig? previousConfig;
         lock (_sync)
         {
             previous = _current;
-            if (settings is not null)
-            {
-                _current = settings;
-            }
+            previousConfig = _currentConfig;
+            _current = settings;
+            _currentConfig = config;
         }
 
+        var lines = new List<string>(2);
+
+        if (DescribeConfigChange(previousConfig, config) is { } configChange)
+        {
+            lines.Add(configChange);
+        }
+
+        if (DescribeSettingsChange(previous, settings, older) is { } settingsChange)
+        {
+            lines.Add(settingsChange);
+        }
+
+        return lines.Count == 0 ? null : string.Join(" ", lines);
+    }
+
+    /// <summary>
+    /// What moved in <c>fivem.cfg</c> since the last reading, or null when nothing did.
+    /// </summary>
+    /// <remarks>
+    /// The texture budget is the setting somebody will be asked to change between two sessions, so a
+    /// change to it mid-session is worth its own sentence rather than a footnote on the graphics one.
+    /// </remarks>
+    private string? DescribeConfigChange(FiveMClientConfig? previous, FiveMClientConfig? current)
+    {
+        if (current is null)
+        {
+            return previous is null
+                ? null
+                : $"FiveM:s klientkonfiguration kan inte längre läsas; filen {previous.Path} finns inte "
+                    + "kvar. Texturbudgeten är inte längre känd, och ingenting i resten av sessionen "
+                    + "räknas mot den.";
+        }
+
+        if (previous is null)
+        {
+            return $"{current.Describe()} Filen fanns inte när sessionen startade.";
+        }
+
+        if (previous.Matches(current))
+        {
+            return null;
+        }
+
+        return $"FiveM:s Extended Texture Budget ändrades under sessionen: "
+            + $"{previous.BudgetScale?.ToString() ?? "standard"} → "
+            + $"{current.BudgetScale?.ToString() ?? "standard"}. {current.Describe()} "
+            + "Telemetrin före och efter den tidpunkten beskriver två olika texturbudgetar.";
+    }
+
+    /// <summary>What moved in the graphics settings file since the last reading, or null when nothing did.</summary>
+    private string? DescribeSettingsChange(
+        GameGraphicsSettings? previous,
+        GameGraphicsSettings? settings,
+        IReadOnlyList<GameSettingsCandidate> older)
+    {
         if (settings is null)
         {
             return previous is null
                 ? null
                 : $"Spelets grafikinställningar kan inte längre läsas; filen {previous.Path} finns inte kvar. "
-                    + "Värdena i sessionsstarten står kvar som det sist lästa.";
+                    + "Värdena i sessionsstarten står kvar som det sist lästa, men ingenting i resten av "
+                    + "sessionen bedöms mot dem.";
         }
 
         if (previous is null)

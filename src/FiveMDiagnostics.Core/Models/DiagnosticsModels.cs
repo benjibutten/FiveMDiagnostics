@@ -1036,15 +1036,35 @@ public sealed record TargetProcessInfo(
     DateTimeOffset DetectedAt,
     DateTimeOffset? StartedAt = null);
 
-public sealed record ProcessActivity(string ProcessName, int ProcessId, double CpuPercent, long IoBytesPerSecond);
+/// <param name="IsSystemService">
+/// True for a process outside the interactive session — a Windows service, in practice. Kept because
+/// the advice that follows from the row is different: a service cannot be closed from the taskbar, and
+/// naming one without saying so sends the reader looking for a window that does not exist.
+/// </param>
+public sealed record ProcessActivity(
+    string ProcessName,
+    int ProcessId,
+    double CpuPercent,
+    long IoBytesPerSecond,
+    bool IsSystemService = false);
 
+/// <param name="IsSystemService">
+/// True when the row came from outside the interactive session. Carried through to the text because
+/// "close it" is not the advice for a service, and because a reader who cannot find the process in the
+/// taskbar will otherwise conclude the app is wrong rather than that it means a service.
+/// </param>
 public sealed record SuspectedProcessImpact(
     string ProcessName,
     int? ProcessId,
     double PeakCpuPercent,
     double PeakIoMegabytesPerSecond,
     int ObservedSamples,
-    string Reason);
+    string Reason,
+    bool IsSystemService = false)
+{
+    /// <summary>The name as it should be shown, marked when it is a service.</summary>
+    public string DisplayName => IsSystemService ? $"{ProcessName} (systemtjänst)" : ProcessName;
+}
 
 public sealed record RemoteEndpointInfo(string Protocol, string RemoteAddress, int RemotePort, string? EndpointHint = null);
 
