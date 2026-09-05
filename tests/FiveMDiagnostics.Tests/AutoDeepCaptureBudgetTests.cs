@@ -61,7 +61,7 @@ public sealed class AutoDeepCaptureBudgetTests
 
         Assert.Null(refusal);
         Assert.Equal(1, budget.Spent);
-        Assert.Equal(11, budget.Remaining);
+        Assert.Equal(5, budget.Remaining);
     }
 
     [Fact]
@@ -484,7 +484,10 @@ public sealed class AutoDeepCaptureBudgetTests
         var options = Options();
 
         Assert.True(options.CaptureAutoIncidents);
-        Assert.Equal(12, options.MaxAutoCapturesPerSession);
+
+        // Six, not twelve. Three sessions took twelve and three reviews used the first six; the later
+        // captures were near-identical to the earlier ones and answered nothing they had not.
+        Assert.Equal(6, options.MaxAutoCapturesPerSession);
         Assert.Equal(120, options.AutoCaptureFrameTimeMs);
         Assert.Equal(250, options.AutoCaptureOverrideFrameTimeMs);
         Assert.Equal(3, options.MaxAutoCapturesPerWindow);
@@ -522,8 +525,8 @@ public sealed class AutoDeepCaptureBudgetTests
         // stops fourteen minutes of hitches from spending even that.
         Assert.Equal(2, budget.Spent);
 
-        // Five hours later the session still has almost all of its budget, which is the entire point.
-        Assert.Equal(10, budget.Remaining);
+        // Five hours later the session still has most of its budget, which is the entire point.
+        Assert.Equal(4, budget.Remaining);
         Assert.True(budget.TryReserve(Start.AddHours(5), frameTimeMs: 180, out _));
     }
 

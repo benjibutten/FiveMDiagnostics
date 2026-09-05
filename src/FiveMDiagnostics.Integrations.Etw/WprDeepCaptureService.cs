@@ -644,6 +644,11 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
             };
             kernel.StackWalkStack += data => stacks.Add(data.TimeStamp);
 
+            // Who made a waiting thread runnable again. Without it the analysis can say how long the game
+            // thread slept and nothing about what it was waiting for, which is where three sessions of
+            // "the main thread was off the processor for 355 ms" stopped.
+            kernel.DispatcherReadyThread += threadWaits.OnReadyThread;
+
             // Image loads, process names and the thread-to-process map all have to be in place before
             // the samples that need them, which they are: WPR rundown emits the already-loaded modules
             // and the existing process and thread tables at the start of the trace.
@@ -762,6 +767,20 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
                     metrics[$"cpuBusiestThreadCores_{module.Module}"] = Math.Round(module.Cores, 4);
                 }
 
+                // The neighbours, keyed by name the same way the modules are. This is what lets an
+                // incident name the process that was on the processor during its stall: the counters
+                // sample once a second and a shell burst lasts two to four tenths, so the trace is the
+                // only place these figures exist.
+                foreach (var process in attribution.TopProcesses)
+                {
+                    // Keyed by name, so the several svchost and chrome processes a machine runs collide
+                    // here. The largest wins rather than the last one enumerated: the question the key
+                    // answers is what a program of that name held while the frames were lost, and an
+                    // assignment would have made that the arbitrary one.
+                    var key = $"cpuProcessCores_{process.ProcessName}";
+                    metrics[key] = Math.Round(Math.Max(metrics.GetValueOrDefault(key), process.Cores), 4);
+                }
+
                 if (attribution.VideoMemory is { } videoMemory)
                 {
                     // The one measurement that tells a full card from a busy one, so the correlation
@@ -781,11 +800,34 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
 
             // Operations rather than megabytes, because the traffic that contends for the file system is
             // small in bytes and enormous in count — and the analysis has only ever weighed the bytes.
-            var fileSummary = fileOperations.Summarize(cpu.IsGameProcess, cpu.Name);
+            var fileSummary = fileOperations.Summarize(
+                cpu.IsGameProcess,
+                cpu.Name,
+                cpu.ProcessIdForThread,
+                threadId => cpu.ModulesForThread(threadId));
             if (fileSummary is not null)
             {
                 metrics["fileOperations"] = fileSummary.TotalOperations;
                 metrics["fileOperationsPerSecond"] = Math.Round(fileSummary.TotalOperations / fileSummary.CoveredSeconds, 1);
+
+                // The game's own traffic split by thread, which is what separates an anti-cheat scan from
+                // the server's resources arriving. Both produce thousands of operations a second in the
+                // same process and only one of them has anything to do with a lost frame.
+                for (var index = 0; index < fileSummary.GameThreads.Count; index++)
+                {
+                    var thread = fileSummary.GameThreads[index];
+                    metrics[$"fileOperationsGameThread{index}Id"] = thread.ThreadId;
+                    metrics[$"fileOperationsGameThread{index}PerSecond"] = Math.Round(thread.OperationsPerSecond, 1);
+                    metrics[$"fileOperationsGameThread{index}AntiCheatShare"] = Math.Round(thread.AntiCheatShare, 4);
+                }
+
+                if (fileSummary.AntiCheatThread is { } scanner)
+                {
+                    metrics["antiCheatFileOperationsPerSecond"] = Math.Round(scanner.OperationsPerSecond, 1);
+                    metrics["antiCheatThreadCores"] = Math.Round(scanner.AntiCheatCores, 4);
+                    metrics["fileOperationsPerSecondExcludingAntiCheat"] =
+                        Math.Round(fileSummary.NonAntiCheatOperationsPerSecond, 1);
+                }
 
                 if (fileSummary.BusiestNeighbour is { } neighbour)
                 {
@@ -819,6 +861,15 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
                 metrics["gameThreadTotalLongWaitMs"] = Math.Round(threadWait.TotalWaitMs, 3);
                 metrics["gameThreadCpuSampleCount"] = threadWait.CpuSampleCount;
                 metrics["gameThreadWaitIntervalCount"] = threadWait.Intervals.Count;
+                metrics["gameThreadWaitChainLength"] = threadWait.ReleaseChain.Count;
+
+                if (threadWait.Blocker is { } blocker)
+                {
+                    // The thread at the far end of the chain — the one that was on the processor while
+                    // everything behind it was not. It is the subject of the sentence the investigation
+                    // has been writing by hand since 25 August.
+                    metrics["gameThreadBlockedByThreadId"] = blocker.ThreadId;
+                }
 
                 for (var index = 0; index < threadWait.Intervals.Count; index++)
                 {

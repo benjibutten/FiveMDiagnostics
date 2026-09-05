@@ -21,6 +21,18 @@ public enum RootCauseCategory
     PossibleCacheOrResourceCorruption,
     InsufficientEvidence,
     FiveMThreadWait,
+
+    /// <summary>
+    /// The game was not the window in the foreground when the frames were lost.
+    /// </summary>
+    /// <remarks>
+    /// Not a fault in the machine and not a category the other rules compete with: nobody was looking at
+    /// the game, so whatever the frame times did during those seconds cost the player nothing. It exists
+    /// because the alternative is to keep ranking those windows against the same nine hypotheses as the
+    /// rest, which is how a Windows key press became "external process interference" — true, useless, and
+    /// counted in the evening's hitch rate as though it had been a stutter in play.
+    /// </remarks>
+    GameNotInFocus,
 }
 
 public enum ArtifactKind
@@ -209,7 +221,7 @@ public sealed record ObsOptions
 
 public sealed record DeepCaptureOptions
 {
-    public const int CurrentCaptureProfileRevision = 3;
+    public const int CurrentCaptureProfileRevision = 4;
 
     /// <summary>
     /// Version of the generated capture profile defaults. Zero means settings written before profile
@@ -422,13 +434,20 @@ public sealed record DeepCaptureOptions
     /// from filling the disk.
     /// </summary>
     /// <remarks>
-    /// Raised from eight alongside <see cref="MaxAutoCapturesPerWindow"/>, because a ceiling of eight
-    /// against three captures an hour is spent before a six hour session is half over — the failure the
-    /// window budget exists to prevent, arriving from the other end. Twelve captures at the 894–916 MB
-    /// the last session measured is about eleven gigabytes for an evening, which is the price of the
-    /// evenings this app exists to explain.
+    /// <para>
+    /// Was raised to twelve on the argument that eight against three an hour is spent before a six hour
+    /// session is half over. Three consecutive sessions then took twelve, and three consecutive reviews
+    /// used the first six: the captures arrive in the opening hours, they are near-identical to each
+    /// other, and the later ones answered nothing the earlier ones had not. Eleven gigabytes an evening
+    /// bought six traces of evidence.
+    /// </para>
+    /// <para>
+    /// So the review's standing recommendation of six is the default rather than a sentence at the bottom
+    /// of a report. The per-window budget still decides the spread across the evening, which is the part
+    /// that was actually working.
+    /// </para>
     /// </remarks>
-    public int MaxAutoCapturesPerSession { get; set; } = 12;
+    public int MaxAutoCapturesPerSession { get; set; } = 6;
 
     /// <summary>
     /// Ceiling on automatic captures inside <see cref="CaptureBudgetWindow"/>, rather than for a whole
@@ -602,10 +621,21 @@ public sealed record DeepCaptureOptions
         // An 8 loaded from a pre-revision-2 file may be a manual choice. Upgrade it only when this call
         // just produced it from the old default, or when revision 2 had already persisted it as that
         // revision's default before this migration began.
-        if (MaxAutoCapturesPerSession == 8
-            && (migratedLegacySessionDefault || previousRevision >= 2))
+        var migratedRevision3SessionDefault = MaxAutoCapturesPerSession == 8
+            && (migratedLegacySessionDefault || previousRevision >= 2);
+        if (migratedRevision3SessionDefault)
         {
             MaxAutoCapturesPerSession = 12;
+        }
+
+        // Revision 4 brings the session ceiling back down to six, which three reviews in a row asked for
+        // and none of them got — the line recommending it was written into the report and the setting
+        // stayed at twelve. Only a 12 is moved, and only when it is the previous revision's default
+        // rather than something somebody chose: a value this migration just produced above, or one
+        // loaded from a file that had already reached revision 3.
+        if (MaxAutoCapturesPerSession == 12 && (migratedRevision3SessionDefault || previousRevision >= 3))
+        {
+            MaxAutoCapturesPerSession = 6;
         }
 
         CaptureProfileRevision = CurrentCaptureProfileRevision;
@@ -1236,14 +1266,26 @@ public sealed record GpuProcessMemoryInstance(string InstanceName, string? Adapt
 /// <see cref="VramAccountingMonitor"/>. Their rows are kept in the log and excluded from every report,
 /// exactly as an impossible absolute reading is.
 /// </param>
+/// <param name="DriftingProcessIds">
+/// Processes whose row has been growing faster than the card it is supposed to be inside, also from
+/// <see cref="VramAccountingMonitor"/>. Weaker than the above and deliberately so: the row is not
+/// excluded from anything, because the process really does hold memory and removing it would put that
+/// memory into somebody else's headroom. What it may not be used for is a number — a split, a budget or
+/// a recommendation — and the sample says so rather than the reader having to notice.
+/// </param>
 public sealed record GpuProcessMemorySample(
     DateTimeOffset Timestamp,
     bool IsAvailable,
     IReadOnlyList<GpuProcessMemoryUsage> Processes,
     string? UnavailableReason = null,
     ulong? AllProcessesDedicatedBytes = null,
-    IReadOnlyCollection<int>? DoubleCountedProcessIds = null) : TelemetryEvent(Timestamp, "GpuProcessMemory")
+    IReadOnlyCollection<int>? DoubleCountedProcessIds = null,
+    IReadOnlyCollection<int>? DriftingProcessIds = null) : TelemetryEvent(Timestamp, "GpuProcessMemory")
 {
+    /// <summary>Whether a row's absolute value has been shown to be drifting away from the card's.</summary>
+    public bool IsDrifting(GpuProcessMemoryUsage process) =>
+        DriftingProcessIds?.Contains(process.ProcessId) == true;
+
     /// <summary>
     /// Whether a row cannot be believed: impossible for any adapter, or proved to double count on this
     /// one.
@@ -1383,6 +1425,30 @@ public sealed record NetworkProbeSample(
     bool Success,
     string? FailureReason = null,
     bool IsReferenceHost = false) : TelemetryEvent(Timestamp, "Probe");
+
+/// <summary>
+/// Which window owned the foreground, and therefore whether the frames around this moment were frames
+/// anybody saw.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Alt-tab and the Windows key do cost frames — the compositor takes the display back, the game drops to
+/// background priority, and the shell draws — and every one of those frames has been counted in this
+/// app's hitch rate as though it had happened in play. It has not: the game is behind another window and
+/// nobody is looking at it. Five of the nine stalls measured on 4 September coincided with the shell
+/// drawing, and the session that raised them could not tell them apart from a stutter in traffic.
+/// </para>
+/// <para>
+/// The foreground process is carried rather than only the boolean because it is the sentence that makes
+/// the exclusion checkable: "startmenyn låg i förgrunden" is read and believed, "spelet var ur fokus" is
+/// read and doubted. It is also the cheapest way this app will ever get to see a Windows key press.
+/// </para>
+/// </remarks>
+public sealed record WindowFocusSample(
+    DateTimeOffset Timestamp,
+    bool GameHasFocus,
+    int ForegroundProcessId,
+    string ForegroundProcessName) : TelemetryEvent(Timestamp, "Focus");
 
 public sealed record ArtifactEvidence(
     DateTimeOffset Timestamp,

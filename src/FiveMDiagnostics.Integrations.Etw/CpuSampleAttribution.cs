@@ -33,6 +33,21 @@ internal sealed class CpuSampleAttribution
     private const int DefaultIntervalIn100Ns = 10_000;
 
     /// <summary>
+    /// Processes carried out of the trace. Five is enough for the sentence the incident needs — the game,
+    /// the neighbour that mattered, and room to see whether it was alone.
+    /// </summary>
+    private const int TopProcessCount = 5;
+
+    /// <summary>
+    /// CPU a process has to hold across the retained window before it is worth naming.
+    /// </summary>
+    /// <remarks>
+    /// A tenth of a core over a window of seconds. Below that the process was woken, did something and
+    /// went back to sleep, which every machine does constantly; above it something was running.
+    /// </remarks>
+    private const double MaterialProcessCores = 0.10;
+
+    /// <summary>
     /// Buffered samples beyond which attribution stops collecting. Each entry is sixteen bytes, so this
     /// caps the parser at roughly 64 MB — far more than any ring buffer capture produces, and a bound
     /// worth having before a file-mode capture of unknown length is ever parsed.
@@ -106,6 +121,63 @@ internal sealed class CpuSampleAttribution
     public int SampleCountForThread(int threadId)
     {
         return _samples.Count(sample => sample.ThreadId == threadId);
+    }
+
+    /// <summary>
+    /// What one thread spent its time in, largest module first, or an empty list when it was never
+    /// sampled.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// On demand rather than for every thread in the trace, because the callers are few and specific: the
+    /// file system attribution wants to know what the thread making three thousand operations a second is
+    /// running, and "54 % adhesive.dll" is the difference between an anti-cheat scanning executables and
+    /// the game streaming a server's resources. Those get the same disk verdict today.
+    /// </para>
+    /// <para>
+    /// One pass over the samples, but only this thread's are resolved to a module — the expensive half —
+    /// so the cost is proportional to the thread rather than to the trace.
+    /// </para>
+    /// </remarks>
+    public IReadOnlyList<ModuleShare> ModulesForThread(int threadId, int take = 3)
+    {
+        var processId = _processByThread.GetValueOrDefault(threadId, -1);
+        var seconds = SampledSeconds;
+        if (seconds <= 0)
+        {
+            return [];
+        }
+
+        var byModule = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        long total = 0;
+
+        foreach (var sample in _samples)
+        {
+            if (sample.ThreadId != threadId)
+            {
+                continue;
+            }
+
+            total++;
+            var module = Resolve(processId, sample.InstructionPointer);
+            byModule[module] = byModule.GetValueOrDefault(module) + 1;
+        }
+
+        if (total == 0)
+        {
+            return [];
+        }
+
+        var samplesPerCoreSecond = 10_000_000d / Math.Max(_intervalIn100Ns, 1);
+
+        return byModule
+            .OrderByDescending(entry => entry.Value)
+            .Take(take)
+            .Select(entry => new ModuleShare(
+                entry.Key,
+                (double)entry.Value / total,
+                entry.Value / seconds / samplesPerCoreSecond))
+            .ToArray();
     }
 
     public bool IsGameThread(int threadId)
@@ -300,6 +372,23 @@ internal sealed class CpuSampleAttribution
             .Select(entry => new ModuleShare(entry.Key.Module, (double)entry.Value / busiestThread.Value, ToCores(entry.Value)))
             .ToArray();
 
+        // Everything else that was on the processor. The subject is excluded because the sentence below
+        // introduces this list as the rest of the machine and the line has already stated the subject's
+        // own figure — carrying it in both places printed the game twice, once under a heading saying it
+        // was somebody else. This list is the whole of the app's
+        // answer to the shortest and most expensive blindness it has: the process counters read about once
+        // a second, a start menu is drawn in two to four tenths, and so a burst that holds a core never
+        // becomes a peakCpuPercent anywhere. StartMenuExperienceHost held 1.2 cores in three of the ten
+        // stalls measured on 4 September and appears in none of that session's 200 incidents. The trace
+        // has it at kilohertz; it simply was not being carried out of the trace.
+        var topProcesses = samplesByProcess
+            .Where(entry => entry.Key > 0 && entry.Key != subject.Key)
+            .OrderByDescending(entry => entry.Value)
+            .Take(TopProcessCount)
+            .Select(entry => new ProcessCpuShare(Name(entry.Key), entry.Key, ToCores(entry.Value)))
+            .Where(item => item.Cores >= MaterialProcessCores)
+            .ToArray();
+
         return new CpuAttributionSummary(
             ToCores(_samples.Count),
             Name(subject.Key),
@@ -308,6 +397,7 @@ internal sealed class CpuSampleAttribution
             busiestThread.Key.ThreadId,
             ToCores(busiestThread.Value),
             modules,
+            topProcesses,
             SummarizeVideoMemory(
                 videoMemoryByBucket,
                 samplesByProcessBucket.GetValueOrDefault(subject.Key),
@@ -567,6 +657,13 @@ internal sealed record VideoMemoryPressure(
     }
 }
 
+/// <summary>One process's CPU across the window a trace retained.</summary>
+/// <remarks>
+/// In cores rather than percent, like everything else here: a percentage of a ring buffer whose retained
+/// window is seconds long means nothing, and cores compare directly against a frame budget.
+/// </remarks>
+internal sealed record ProcessCpuShare(string ProcessName, int ProcessId, double Cores);
+
 /// <summary>Where the sampled CPU time in a trace went.</summary>
 internal sealed record CpuAttributionSummary(
     double TotalCores,
@@ -576,6 +673,7 @@ internal sealed record CpuAttributionSummary(
     int BusiestThreadId,
     double BusiestThreadCores,
     IReadOnlyList<ModuleShare> BusiestThreadModules,
+    IReadOnlyList<ProcessCpuShare> TopProcesses,
     VideoMemoryPressure? VideoMemory)
 {
     /// <summary>
@@ -593,7 +691,15 @@ internal sealed record CpuAttributionSummary(
 
         var videoMemory = VideoMemory is { } pressure ? " " + pressure.Describe(adapterVramPercent) : string.Empty;
 
+        // The rest of the machine, named. Without it the line says what the game did and leaves the reader
+        // to assume nothing else was running, which is exactly the assumption that was wrong.
+        var neighbours = TopProcesses.Count > 0
+            ? " På processorn i övrigt: "
+                + string.Join(", ", TopProcesses.Select(item => $"{item.ProcessName} {item.Cores:F2}"))
+                + " kärnor."
+            : string.Empty;
+
         return $"CPU-sampling: {TotalCores:F2} kärnor upptagna totalt. {SubjectProcess} höll {SubjectProcessCores:F2} kärnor, "
-            + $"och dess hetaste tråd (tid {BusiestThreadId}) {BusiestThreadCores:F2} kärnor{modules}.{videoMemory}";
+            + $"och dess hetaste tråd (tid {BusiestThreadId}) {BusiestThreadCores:F2} kärnor{modules}.{neighbours}{videoMemory}";
     }
 }

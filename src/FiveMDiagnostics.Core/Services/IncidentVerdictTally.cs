@@ -84,13 +84,40 @@ public sealed record IncidentVerdictReport(int Incidents, IReadOnlyList<Incident
             + $"incidenter ({(double)VramPressureIncidents / Incidents:P0}). Det är sessionens tydligaste "
             + "enskilda dom och den pekar på texturinställningen, inte på en process som växer.";
 
+    /// <summary>Incidents the engine ruled out because the game was behind another window.</summary>
+    public int NotInFocusIncidents => ByCategory
+        .Where(item => item.Category == RootCauseCategory.GameNotInFocus)
+        .Sum(item => item.Count);
+
+    /// <summary>Incidents that happened while somebody was actually looking at the game.</summary>
+    public int IncidentsInPlay => Incidents - NotInFocusIncidents;
+
+    /// <summary>
+    /// The line that says how much of the evening's incident list was an alt-tab, or null when none of it
+    /// was.
+    /// </summary>
+    /// <remarks>
+    /// Its own line for the same reason the VRAM one has its own: it changes how every other figure in
+    /// the summary is read. A count of two hundred incidents of which sixty happened with the game in the
+    /// background is not a count of two hundred, and previous sessions had no way to say so — they
+    /// reported the whole list as stutter and left the comparison between evenings resting on how often
+    /// the player happened to tab out.
+    /// </remarks>
+    public string? NotInFocusMessage => NotInFocusIncidents == 0
+        ? null
+        : $"Ur fokus: {NotInFocusIncidents} av {Incidents} incidenter "
+            + $"({(double)NotInFocusIncidents / Incidents:P0}) inföll medan spelet låg bakom ett annat "
+            + $"fönster — alt-tab eller Windows-tangenten. De räknas inte som spellagg. Kvar i spelet: "
+            + $"{IncidentsInPlay} incidenter.";
+
     /// <summary>The whole ranking, largest first, for the reader who wants the rest of it.</summary>
     public string Message
     {
         get
         {
             var parts = ByCategory.Select(item => $"{item.Category} {item.Count}");
-            return $"Motorns rangordning över {Incidents} incidenter: {string.Join(", ", parts)}.";
+            var inPlay = NotInFocusIncidents > 0 ? $" Varav {IncidentsInPlay} med spelet i förgrunden." : string.Empty;
+            return $"Motorns rangordning över {Incidents} incidenter: {string.Join(", ", parts)}.{inPlay}";
         }
     }
 }

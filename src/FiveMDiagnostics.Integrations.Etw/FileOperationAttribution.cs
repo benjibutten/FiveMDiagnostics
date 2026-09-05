@@ -67,6 +67,12 @@ internal sealed class FileOperationAttribution
     /// </summary>
     private const int ReportedIntervals = 8;
 
+    /// <summary>
+    /// Threads of the game reported. Three covers the split the question needs — the anti-cheat, the
+    /// streamer, and one more so the reader can see whether the two account for the traffic.
+    /// </summary>
+    private const int ReportedThreads = 3;
+
     private readonly Dictionary<int, long> _operationsByProcess = [];
 
     /// <summary>
@@ -81,6 +87,30 @@ internal sealed class FileOperationAttribution
     /// is already stated in.
     /// </remarks>
     private readonly Dictionary<int, Dictionary<long, int>> _secondsByProcess = [];
+
+    /// <summary>
+    /// Operations per thread, over every process.
+    /// </summary>
+    /// <remarks>
+    /// The count alone cannot tell a streaming stall from an anti-cheat scan, and they are the two
+    /// explanations this figure is used to choose between. On 4 September the game made 114 906 file
+    /// operations in one trace, 3 731 a second, and the report said exactly that — while roughly half of
+    /// them were the anti-cheat thread reading other programs' executables in a loop and 1 652 of them
+    /// were the server's resource cache being streamed in. The first is a fixed cost of running FiveM and
+    /// the second is the thing that lost the frame; they got the same verdict.
+    /// <para>
+    /// The thread is what separates them, and it is on every event already. The path would be better
+    /// still, but the kernel's file events carry an object rather than a name and resolving it needs the
+    /// rundown name table — which is why that half lives in the offline analyser for now.
+    /// </para>
+    /// <para>
+    /// Counted for every process rather than only the game's, because which process is the game is known
+    /// from a rundown that has no guaranteed order against the file events. A machine runs a few thousand
+    /// threads and only those that touch the file system appear here, so the map stays small; the game's
+    /// are picked out at the end, when the thread-to-process table is complete.
+    /// </para>
+    /// </remarks>
+    private readonly Dictionary<int, long> _operationsByThread = [];
 
     private DateTime? _first;
     private DateTime? _last;
@@ -108,7 +138,7 @@ internal sealed class FileOperationAttribution
             return;
         }
 
-        Record(traceEvent.ProcessID, traceEvent.TimeStamp);
+        Record(traceEvent.ProcessID, traceEvent.TimeStamp, traceEvent.ThreadID);
     }
 
     /// <summary>
@@ -120,11 +150,16 @@ internal sealed class FileOperationAttribution
     /// the opcode filter was previously reachable only by parsing an ETL — which is why an average over
     /// a whole trace passed for a measurement of an incident inside it for as long as it did.
     /// </remarks>
-    internal void Record(int processId, DateTime timestamp)
+    internal void Record(int processId, DateTime timestamp, int threadId = -1)
     {
         if (processId <= 0)
         {
             return;
+        }
+
+        if (threadId > 0)
+        {
+            _operationsByThread[threadId] = _operationsByThread.GetValueOrDefault(threadId) + 1;
         }
 
         TotalOperations++;
@@ -157,6 +192,24 @@ internal sealed class FileOperationAttribution
     /// </param>
     public FileOperationSummary? Summarize(Func<int, bool> isGameProcess, Func<int, string> nameOf)
     {
+        return Summarize(isGameProcess, nameOf, _ => -1, _ => []);
+    }
+
+    /// <param name="processOfThread">
+    /// Which process a thread belongs to, so the game's own threads can be picked out of the map once the
+    /// trace's thread rundown is complete.
+    /// </param>
+    /// <param name="modulesForThread">
+    /// What a thread was running, so the game's busiest file thread can be named by what it is doing
+    /// rather than by a number. A thread that is 54% <c>adhesive.dll</c> is the anti-cheat; the same
+    /// operation count on a streaming thread is the server's resources arriving.
+    /// </param>
+    public FileOperationSummary? Summarize(
+        Func<int, bool> isGameProcess,
+        Func<int, string> nameOf,
+        Func<int, int> processOfThread,
+        Func<int, IReadOnlyList<ModuleShare>> modulesForThread)
+    {
         if (TotalOperations == 0 || CoveredSeconds <= 0)
         {
             return null;
@@ -174,12 +227,24 @@ internal sealed class FileOperationAttribution
 
         var neighbour = byProcess.Where(item => !item.IsGame).Take(1).FirstOrDefault();
 
+        var gameThreads = _operationsByThread
+            .Where(entry => processOfThread(entry.Key) is var owner && owner > 0 && isGameProcess(owner))
+            .OrderByDescending(entry => entry.Value)
+            .Take(ReportedThreads)
+            .Select(entry => new FileOperationThread(
+                entry.Key,
+                entry.Value,
+                entry.Value / CoveredSeconds,
+                modulesForThread(entry.Key)))
+            .ToArray();
+
         return new FileOperationSummary(
             TotalOperations,
             CoveredSeconds,
             byProcess.Take(ReportedProcesses).ToArray(),
             neighbour,
-            neighbour is null ? [] : ContendingIntervals(neighbour.ProcessId));
+            neighbour is null ? [] : ContendingIntervals(neighbour.ProcessId),
+            gameThreads);
     }
 
     /// <summary>
@@ -247,6 +312,54 @@ internal sealed class FileOperationAttribution
 /// <param name="PeakOperationsPerSecond">The busiest single second in it.</param>
 internal sealed record FileOperationInterval(DateTime Start, DateTime End, double PeakOperationsPerSecond);
 
+/// <summary>
+/// One thread of the game's share of its own file system traffic, and what that thread was running.
+/// </summary>
+internal sealed record FileOperationThread(
+    int ThreadId,
+    long Operations,
+    double OperationsPerSecond,
+    IReadOnlyList<ModuleShare> Modules)
+{
+    /// <summary>Share of the thread's sampled time spent in FiveM's anti-tamper layer, or zero.</summary>
+    public double AntiCheatShare => Modules
+        .Where(module => module.Module.Equals(AntiCheatModule, StringComparison.OrdinalIgnoreCase))
+        .Select(module => module.Share)
+        .DefaultIfEmpty(0)
+        .Max();
+
+    /// <summary>Cores that thread held inside the anti-tamper layer, or zero.</summary>
+    public double AntiCheatCores => Modules
+        .Where(module => module.Module.Equals(AntiCheatModule, StringComparison.OrdinalIgnoreCase))
+        .Select(module => module.Cores)
+        .DefaultIfEmpty(0)
+        .Max();
+
+    /// <summary>
+    /// Share above which the thread is the anti-cheat's rather than merely passing through it.
+    /// </summary>
+    /// <remarks>
+    /// Measured across twelve traces: the anti-cheat's own thread runs at 54% or more inside the module,
+    /// and no other thread of the game reaches a fifth. A third sits between them with room either side.
+    /// </remarks>
+    public const double AntiCheatThreadShare = 0.33;
+
+    internal const string AntiCheatModule = "adhesive.dll";
+
+    /// <summary>True when this thread's traffic is an anti-cheat scan rather than the game streaming.</summary>
+    public bool IsAntiCheat => AntiCheatShare >= AntiCheatThreadShare;
+
+    /// <summary>The thread as it reads in the line, named by what it runs.</summary>
+    public string Describe()
+    {
+        var what = Modules.Count == 0
+            ? string.Empty
+            : $" – {string.Join(", ", Modules.Select(module => $"{module.Share:P0} {ModuleGlossary.Annotate(module.Module)}"))}";
+
+        return $"tid {ThreadId} {Operations:N0} ({OperationsPerSecond:N0}/s){what}";
+    }
+}
+
 /// <summary>One process's share of the file system traffic in a trace.</summary>
 internal sealed record FileOperationProcess(
     string ProcessName,
@@ -263,13 +376,44 @@ internal sealed record FileOperationProcess(
 /// When that neighbour was actually over the bar, so a reader of this trace can tell whether it was
 /// doing it during the seconds under examination or during some other part of the same file.
 /// </param>
+/// <param name="GameThreads">
+/// The game's own busiest threads and what they were running, which is what separates an anti-cheat scan
+/// from a streaming stall. Empty when the trace held no game operations.
+/// </param>
 internal sealed record FileOperationSummary(
     long TotalOperations,
     double CoveredSeconds,
     IReadOnlyList<FileOperationProcess> TopProcesses,
     FileOperationProcess? BusiestNeighbour,
-    IReadOnlyList<FileOperationInterval> NeighbourContendingIntervals)
+    IReadOnlyList<FileOperationInterval> NeighbourContendingIntervals,
+    IReadOnlyList<FileOperationThread> GameThreads)
 {
+    /// <summary>The game's anti-cheat thread, when one of the reported threads is it.</summary>
+    public FileOperationThread? AntiCheatThread => GameThreads.FirstOrDefault(thread => thread.IsAntiCheat);
+
+    /// <summary>Operations a second the game made for reasons other than the anti-cheat scanning.</summary>
+    /// <remarks>
+    /// The figure a streaming verdict should be weighed against. The whole-process rate includes a loop
+    /// that reads other programs' executables thousands of times a second and has nothing to do with the
+    /// server's resources arriving.
+    /// <para>
+    /// The game's whole rate minus the scan thread's, rather than the sum of the reported threads. Only
+    /// the three busiest threads are carried, so summing those silently dropped every thread past the
+    /// third — and this figure is emitted as a metric and read as the game's traffic, not as a sample of
+    /// it. Zero when the game is not among <see cref="TopProcesses"/>, which means it made too few
+    /// operations for the question to arise.
+    /// </para>
+    /// </remarks>
+    public double NonAntiCheatOperationsPerSecond
+    {
+        get
+        {
+            var game = TopProcesses.Where(item => item.IsGame).Sum(item => item.OperationsPerSecond);
+            var scanner = AntiCheatThread?.OperationsPerSecond ?? 0;
+            return game > scanner ? game - scanner : 0;
+        }
+    }
+
     /// <summary>
     /// Operation rate at which a neighbour is contending for the file system rather than using it.
     /// </summary>
@@ -296,7 +440,17 @@ internal sealed record FileOperationSummary(
                 + "och den syns inte i MB/s eftersom sådan trafik är liten i byte och stor i antal."
             : string.Empty;
 
+        var threads = GameThreads.Count == 0
+            ? string.Empty
+            : $" Spelets egna trådar: {string.Join("; ", GameThreads.Select(thread => thread.Describe()))}.";
+
+        var antiCheat = AntiCheatThread is { } scanner
+            ? $" {scanner.OperationsPerSecond:N0} av spelets operationer i sekunden kommer från "
+                + "anti-cheat-tråden, som läser filer i en loop och inte strömmar någonting — de ska inte "
+                + "räknas som strömning."
+            : string.Empty;
+
         return $"Filsystem: {TotalOperations:N0} operationer på {CoveredSeconds:F1} s "
-            + $"({TotalOperations / CoveredSeconds:N0}/s). Mest: {top}.{verdict}";
+            + $"({TotalOperations / CoveredSeconds:N0}/s). Mest: {top}.{verdict}{threads}{antiCheat}";
     }
 }

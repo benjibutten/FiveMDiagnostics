@@ -47,6 +47,17 @@ public sealed class NetworkTelemetryCollector : ITelemetryCollector, IDisposable
     private int _candidateObservations;
     private int _latchedHostAbsentPolls;
     private bool _reportedNoPlausibleHost;
+
+    /// <summary>
+    /// When the process the derivation is currently working on was first seen.
+    /// </summary>
+    /// <remarks>
+    /// The connection to the game server is not open at process start. FiveM launches, puts up its own
+    /// window, loads the client and only then connects, which is seconds to tens of seconds later — and
+    /// the TCP table in the meantime holds the launcher's own connections to CitizenFX and a CDN or two.
+    /// Judging the derivation on that table is judging it before the game has done anything.
+    /// </remarks>
+    private DateTimeOffset? _processFirstSeenAt;
     private string? _failingProbeHost;
     private int _consecutiveProbeFailures;
     private string? _suspendedProbeHost;
@@ -55,6 +66,19 @@ public sealed class NetworkTelemetryCollector : ITelemetryCollector, IDisposable
     /// Local reference host probed once the server has been given up on, or null when there is none.
     /// </summary>
     private string? _referenceProbeHost;
+
+    /// <summary>
+    /// How long after a game process appears the derivation keeps quiet about having found nothing.
+    /// </summary>
+    /// <remarks>
+    /// On 4 September the game was restarted at 21:11 and the line "Ingen av FiveM:s 4 anslutningar
+    /// ligger på en spelserverport" was written seconds later — before the client had connected to
+    /// anything — and it was the last thing the session said about the network for the remaining six
+    /// hours. The derivation did keep running; the message said the probes were off until somebody set
+    /// ProbeHost by hand, so nobody looked again. A minute covers a client connecting, and the wording
+    /// below no longer claims anything has been switched off.
+    /// </remarks>
+    private static readonly TimeSpan ConnectionGrace = TimeSpan.FromMinutes(1);
 
     /// <summary>
     /// Consecutive failures against one host before probing it is given up for the session.
@@ -79,6 +103,7 @@ public sealed class NetworkTelemetryCollector : ITelemetryCollector, IDisposable
         _consecutiveProbeFailures = 0;
         _suspendedProbeHost = null;
         _referenceProbeHost = null;
+        _processFirstSeenAt = null;
 
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -141,6 +166,7 @@ public sealed class NetworkTelemetryCollector : ITelemetryCollector, IDisposable
         if (_autoDetectionProcessId != processId)
         {
             ResetAutoDetection(processId);
+            _processFirstSeenAt = context.UtcNow();
         }
 
         if (_autoDetectedProbeHost is not null)
@@ -169,17 +195,33 @@ public sealed class NetworkTelemetryCollector : ITelemetryCollector, IDisposable
             _candidateEndpointKey = null;
             _candidateObservations = 0;
 
-            // Said once rather than every poll. Silence here used to be indistinguishable from "probing
-            // fine", and the reports then carried no network evidence at all without explaining why.
-            if (!_reportedNoPlausibleHost && remoteEndpoints.Count > 0)
+            // Said once rather than every poll, and not until the client has had time to connect. Silence
+            // here used to be indistinguishable from "probing fine", and the reports then carried no
+            // network evidence at all without explaining why — but saying it in the first seconds after
+            // the game launched reports the absence of a connection that has not been made yet.
+            var waited = _processFirstSeenAt is { } firstSeen ? context.UtcNow() - firstSeen : (TimeSpan?)null;
+            var settled = waited is null || waited >= ConnectionGrace;
+
+            if (!_reportedNoPlausibleHost && settled && remoteEndpoints.Count > 0)
             {
                 _reportedNoPlausibleHost = true;
+
+                // The time actually waited, not the grace period. This line is written at the first poll
+                // after the grace that has connections to look at, which can be a great deal later than
+                // the grace itself — and "efter 60 sekunder" on a reading taken an hour in is the kind of
+                // wrong detail that makes a reader stop trusting the rest of the sentence.
+                var elapsed = waited is { } span
+                    ? $"efter {span.TotalSeconds:F0} sekunder"
+                    : "vid den här mätningen";
+
                 context.StatusSink.Report(
                     StatusLevel.Info,
                     Name,
                     $"Ingen av FiveM:s {remoteEndpoints.Count} anslutningar ligger på en spelserverport "
-                    + $"({FiveMPortRangeStart}-{FiveMPortRangeEnd}), så probe-hosten kan inte härledas. Nätproberna är "
-                    + "avstängda tills ProbeHost sätts manuellt — hellre ingen mätning än RTT mot fel maskin.");
+                    + $"({FiveMPortRangeStart}-{FiveMPortRangeEnd}) {elapsed}, så probe-hosten kan ännu inte härledas. "
+                    + "Härledningen fortsätter varje mätning resten av sessionen och säger till om den "
+                    + "lyckas; sätt ProbeHost manuellt om du vill mäta mot en bestämd maskin. Ingen RTT "
+                    + "mäts under tiden — hellre ingen mätning än RTT mot fel maskin.");
             }
 
             return null;

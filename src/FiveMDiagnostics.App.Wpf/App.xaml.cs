@@ -47,6 +47,7 @@ public partial class App : System.Windows.Application
 			[
 				new SystemTelemetryCollector(),
 				new FiveMProcessTelemetryCollector(),
+				new WindowFocusCollector(),
 				new NetworkTelemetryCollector(),
 				new PresentMonTelemetryCollector(),
 				new NvmlGpuTelemetryCollector(),

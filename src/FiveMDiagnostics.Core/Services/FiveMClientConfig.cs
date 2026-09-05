@@ -113,10 +113,23 @@ public sealed record FiveMClientConfig(string Path, DateTimeOffset LastWriteTime
     /// </remarks>
     public static double PercentOf(int scale) => Math.Clamp(scale, MinScale, MaxScale) * 100d / MaxScale;
 
-    /// <summary>Whether two readings describe the same file in the same state.</summary>
+    /// <summary>Whether two readings describe the same texture budget.</summary>
+    /// <remarks>
+    /// The write time is deliberately not part of this. It was, and the session of 4 September therefore
+    /// warned that "FiveM:s Extended Texture Budget ändrades under sessionen: 10 → 10" and that "the
+    /// telemetry before and after describes two different texture budgets" — because the client rewrote
+    /// <c>fivem.cfg</c> without changing the value in it. A rewrite is not a change. The only thing this
+    /// comparison is used for is deciding whether the budget the rest of the session is measured against
+    /// has moved, and the answer to that is the convar, not the file's timestamp.
+    /// <para>
+    /// The graphics settings file is compared differently on purpose — see
+    /// <c>GameGraphicsSettings.Matches</c> — because a rewrite of that one means the game restarted, and
+    /// a restart is worth a line. This file is written by the launcher and by the pause menu for reasons
+    /// that are not a restart.
+    /// </para>
+    /// </remarks>
     public bool Matches(FiveMClientConfig other) =>
         string.Equals(Path, other.Path, StringComparison.OrdinalIgnoreCase)
-        && LastWriteTimeUtc == other.LastWriteTimeUtc
         && BudgetScale == other.BudgetScale;
 
     /// <summary>

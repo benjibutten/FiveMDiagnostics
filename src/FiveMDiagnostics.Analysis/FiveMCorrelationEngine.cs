@@ -194,6 +194,22 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
     /// </remarks>
     private const double ClassificationFloor = 0.35;
 
+    /// <summary>
+    /// Prefix under which a deep capture's per-process CPU arrives in an artifact's metrics.
+    /// </summary>
+    private const string TraceProcessCoresPrefix = "cpuProcessCores_";
+
+    /// <summary>
+    /// Cores a process has to hold in the trace before the incident treats it as a suspect.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately low. A third of a core held for the length of a stall is not much of a machine, but it
+    /// is a program doing real work at the moment the frames were lost — <c>explorer</c> at 0.40 and the
+    /// voice recorder at 0.35 in the stall of 00:35 on 4 September — and the entire reason this path
+    /// exists is that the process counters never saw any of it.
+    /// </remarks>
+    private const double TraceSuspectCores = 0.30;
+
     public IncidentAnalysis Analyze(IncidentRecord incident)
     {
         var frameSamples = incident.GetEvents<FrameTelemetrySample>();
@@ -205,6 +221,10 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         var networkProbes = incident.GetEvents<NetworkProbeSample>();
         var networkEndpoints = incident.GetEvents<NetworkEndpointSample>();
         var artifacts = incident.GetEvents<ArtifactEvidence>();
+
+        // Asked first, because the answer can make every other question irrelevant. A window in which
+        // the game was behind another window is not a window about the game.
+        var focusState = GameFocusMonitor.Classify(incident.GetEvents<WindowFocusSample>(), incident.Marker.MarkedAt);
 
         // Process names, OBS presence, disk throughput and similar context cannot prove a frametime
         // incident on their own. In particular, two idle Discord helper processes used to become a
@@ -226,7 +246,9 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         var metrics = BuildFrameMetrics(frameSamples, incident.Environment.DisplayRefreshRateHz);
         var gpu = BuildGpuMetrics(gpuSamples);
         var cores = BuildCoreMetrics(systemSamples);
-        var suspectedProcesses = AnalyzeSuspiciousProcesses(systemSamples);
+        var suspectedProcesses = MergeTraceSuspects(
+            AnalyzeSuspiciousProcesses(systemSamples),
+            TraceSuspects(artifacts, systemSamples));
         var hypotheses = new List<HypothesisScore>();
         var correlatedThreadWait = FindCorrelatedThreadWait(artifacts, frameSamples, metrics);
 
@@ -242,6 +264,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         AddExternalProcessHypothesis(hypotheses, suspectedProcesses, processSamples, systemSamples);
         AddOsLatencyHypothesis(hypotheses, metrics, artifacts, systemSamples, obsSamples);
         AddCorruptionHypothesis(hypotheses, artifacts);
+        AddNotInFocusHypothesis(hypotheses, focusState, incident.GetEvents<WindowFocusSample>(), incident.Marker.MarkedAt);
 
         hypotheses = hypotheses
             .OrderByDescending(item => item.Confidence)
@@ -1321,6 +1344,69 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
     }
 
     /// <summary>
+    /// Rules the window out entirely when the game was not the window in front.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Confidence is high because this is read off a measurement rather than argued from one. The
+    /// foreground window is not a symptom that has to outweigh other symptoms: either another program
+    /// owned it or the game did, and when another program did, the frames the window is about were
+    /// frames nobody saw. Ranking it against the other hypotheses at ordinary confidence would leave a
+    /// Windows key press competing with a VRAM verdict on the strength of its CPU counters, which is how
+    /// five of the nine stalls measured on 4 September came out as external process interference —
+    /// literally true, and the wrong thing to tell somebody who is trying to make the game smoother.
+    /// </para>
+    /// <para>
+    /// The settling case is kept separate in the sentence and not in the ranking. Frames lost in the two
+    /// seconds after alt-tabbing back are real frames that a player really saw; they are simply the
+    /// price of the switch and not evidence about anything the machine does while playing, so they are
+    /// named as such rather than either counted or hidden.
+    /// </para>
+    /// </remarks>
+    private static void AddNotInFocusHypothesis(
+        List<HypothesisScore> hypotheses,
+        GameFocusState focusState,
+        IReadOnlyList<WindowFocusSample> focusSamples,
+        DateTimeOffset markedAt)
+    {
+        if (focusState is GameFocusState.InPlay or GameFocusState.Unknown)
+        {
+            return;
+        }
+
+        // The window that had the foreground at the marker, or the one that took it just after — the
+        // second case is the Windows key, where the cost lands before Windows finishes the handover.
+        var holder = focusSamples
+            .Where(sample => !sample.GameHasFocus && sample.Timestamp <= markedAt + GameFocusMonitor.LossGrace)
+            .OrderByDescending(sample => sample.Timestamp)
+            .FirstOrDefault();
+
+        var named = holder is null || string.IsNullOrWhiteSpace(holder.ForegroundProcessName)
+            ? "ett annat fönster"
+            : holder.ForegroundProcessName;
+
+        var evidence = focusState == GameFocusState.NotInFocus
+            ? new List<string>
+            {
+                $"Spelet låg inte i förgrunden när incidenten markerades: {named} ägde fönstret. "
+                + "Frametiderna i fönstret beskriver ett spel i bakgrunden — nedprioriterat av schemaläggaren, "
+                + "utan skärmen och utan någon som tittade på det.",
+                "Det här är inte ett lagg i spelet och ska inte räknas som ett. Alt-tab och Windows-tangenten "
+                + "kostar frames varje gång, och de framesen säger ingenting om hur spelet går när det spelas.",
+            }
+            : new List<string>
+            {
+                $"Spelet hade nyss fått tillbaka förgrunden ({GameFocusMonitor.RegainGrace.TotalSeconds:F0} s "
+                + "eller mindre innan markeringen). Frametiderna är växlingens egen kostnad: fönstret återställs, "
+                + "swapchainen byggs om och drivrutinen laddar tillbaka det som evakuerades medan spelet låg bakom.",
+                "Räknas inte som spellagg, men det är frames spelaren faktiskt såg — det är priset för att alt-tabba, "
+                + "inte ett fel i maskinen.",
+            };
+
+        hypotheses.Add(new HypothesisScore(RootCauseCategory.GameNotInFocus, 0.95, evidence));
+    }
+
+    /// <summary>
     /// Ranks background processes by how much of the machine they took, not merely by how many of them
     /// were noticed.
     /// </summary>
@@ -1857,13 +1943,158 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
                         group.Count(),
                         DescribeProcessReason(group.Key.ProcessName, peakCpu, peakIoMegabytes),
                         isService),
-                    Score = peakCpu + (peakIoMegabytes * 1.5) + (IsKnownOverlayOrHook(group.Key.ProcessName) ? 20 : 0),
+                    Score = SuspectScore(group.Key.ProcessName, Math.Round(peakCpu, 1), Math.Round(peakIoMegabytes, 1)),
                 };
             })
             .Where(item => item.Impact.PeakCpuPercent >= cpuFloor || item.Impact.PeakIoMegabytesPerSecond >= 12)
             .OrderByDescending(item => item.Score)
             .ThenByDescending(item => item.Impact.ObservedSamples)
             .Select(item => item.Impact)
+            .Take(5)
+            .ToArray();
+    }
+
+    /// <summary>
+    /// How a suspect is ranked against the others.
+    /// </summary>
+    /// <remarks>
+    /// One function rather than an expression in each ranking, because there are now two: the counters'
+    /// list and the merged list a deep capture produces. When the merge sorted on CPU alone, attaching a
+    /// trace to an incident silently threw away the IO weighting and the overlay bonus — so the same
+    /// machine ranked its suspects one way in an incident that got a capture and another way in the one
+    /// beside it that did not.
+    /// </remarks>
+    private static double SuspectScore(string processName, double peakCpuPercent, double peakIoMegabytesPerSecond) =>
+        peakCpuPercent
+        + (peakIoMegabytesPerSecond * 1.5)
+        + (IsKnownOverlayOrHook(processName) ? 20 : 0);
+
+    private static double SuspectScore(SuspectedProcessImpact impact) =>
+        SuspectScore(impact.ProcessName, impact.PeakCpuPercent, impact.PeakIoMegabytesPerSecond);
+
+    /// <summary>
+    /// Suspects taken out of the deep capture attached to this incident, rather than out of the process
+    /// counters.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The counters read about once a second and a shell burst lasts two to four tenths of one, so the
+    /// processes that coincided with the measured stalls of 4 September never became a
+    /// <c>peakCpuPercent</c> anywhere: <c>StartMenuExperienceHost</c> held 1.2 cores in three of ten
+    /// measured stalls and appears in none of that session's 200 incidents, which still ranked "external
+    /// process interference" first 86 times without ever naming a process.
+    /// </para>
+    /// <para>
+    /// The trace samples at a kilohertz and already resolves every sample to a process; the figures were
+    /// simply not being carried out of it. Converted from cores to a share of the whole machine so they
+    /// stand next to the counters' own figures rather than in a second unit — a suspect list in two units
+    /// is a list nobody can sort.
+    /// </para>
+    /// </remarks>
+    private static IReadOnlyList<SuspectedProcessImpact> TraceSuspects(
+        IReadOnlyList<ArtifactEvidence> artifacts,
+        IReadOnlyList<SystemTelemetrySample> systemSamples)
+    {
+        var cores = systemSamples
+            .Select(sample => sample.PerCoreUsagePercent.Count)
+            .DefaultIfEmpty(0)
+            .Max();
+
+        if (cores <= 0)
+        {
+            // Without the machine's width there is nothing to express a core count as a share of, and a
+            // suspect list mixing cores with percentages is worse than one short entry.
+            return [];
+        }
+
+        var byName = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var artifact in artifacts.Where(item => item.Kind == ArtifactKind.EtlTrace))
+        {
+            foreach (var (key, value) in artifact.Metrics)
+            {
+                if (!key.StartsWith(TraceProcessCoresPrefix, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var name = key[TraceProcessCoresPrefix.Length..];
+                if (value < TraceSuspectCores || !IsRelevantExternalProcess(name))
+                {
+                    continue;
+                }
+
+                byName[name] = Math.Max(byName.GetValueOrDefault(name), value);
+            }
+        }
+
+        return byName
+            .Select(entry => new SuspectedProcessImpact(
+                entry.Key,
+                ProcessId: null,
+                Math.Round(entry.Value / cores * 100, 1),
+                PeakIoMegabytesPerSecond: 0,
+                ObservedSamples: 1,
+                $"höll {entry.Value:F2} kärnor i deep capture-tracen över incidenten — mätt i spåret, "
+                + "inte i processräknaren, som läser en gång i sekunden och missar en burst på några "
+                + "tiondelar"))
+            .OrderByDescending(item => item.PeakCpuPercent)
+            .ToArray();
+    }
+
+    /// <summary>
+    /// Folds the trace's suspects into the counters', keeping the larger figure for a process both saw.
+    /// </summary>
+    /// <remarks>
+    /// The two measure the same thing at different resolutions, so the larger is the better measurement
+    /// rather than a second observation: a counter that caught a burst at all caught part of it, and the
+    /// trace caught the whole of it. Keeping both rows would double the process in the evidence list and
+    /// in the summary, which is how an incident ends up naming its suspect twice with two different
+    /// numbers.
+    /// <para>
+    /// Re-ranked on <see cref="SuspectScore"/> rather than on CPU, so that an incident with a trace
+    /// attached orders its suspects by the same rule as one without. Sorting the merged list on CPU alone
+    /// dropped the IO weighting and the overlay bonus for exactly the incidents that had the most
+    /// evidence behind them.
+    /// </para>
+    /// </remarks>
+    private static IReadOnlyList<SuspectedProcessImpact> MergeTraceSuspects(
+        IReadOnlyList<SuspectedProcessImpact> polled,
+        IReadOnlyList<SuspectedProcessImpact> fromTrace)
+    {
+        if (fromTrace.Count == 0)
+        {
+            return polled;
+        }
+
+        var merged = polled.ToList();
+
+        foreach (var suspect in fromTrace)
+        {
+            var index = merged.FindIndex(item =>
+                item.ProcessName.Equals(suspect.ProcessName, StringComparison.OrdinalIgnoreCase));
+
+            if (index < 0)
+            {
+                merged.Add(suspect);
+                continue;
+            }
+
+            if (merged[index].PeakCpuPercent >= suspect.PeakCpuPercent)
+            {
+                continue;
+            }
+
+            merged[index] = merged[index] with
+            {
+                PeakCpuPercent = suspect.PeakCpuPercent,
+                Reason = suspect.Reason,
+            };
+        }
+
+        return merged
+            .OrderByDescending(SuspectScore)
+            .ThenByDescending(item => item.PeakIoMegabytesPerSecond)
             .Take(5)
             .ToArray();
     }
@@ -2181,6 +2412,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             RootCauseCategory.ExternalProcessInterference => "External process interference",
             RootCauseCategory.OsOrDriverLatency => "OS/driver latency",
             RootCauseCategory.PossibleCacheOrResourceCorruption => "Possible cache/resource corruption",
+            RootCauseCategory.GameNotInFocus => "Game not in focus",
             _ => "Insufficient evidence",
         };
     }

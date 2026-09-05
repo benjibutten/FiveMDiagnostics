@@ -32,6 +32,7 @@ This project stays framework-agnostic.
 - system telemetry collector
 - per-process FiveM telemetry collector
 - network collector
+- window focus collector
 - environment metadata provider
 
 The collectors write into a bounded channel to keep backpressure explicit.
@@ -43,7 +44,7 @@ The collectors write into a bounded channel to keep backpressure explicit.
 
 The analysis intentionally prefers evidence correlation over averages. It also emits `insufficient evidence` if the signals are weak, naming which missing input would help most.
 
-Two decisions shape the scoring:
+Three decisions shape the scoring:
 
 - **Spike thresholds are derived, not fixed.** They come from `max(median frame time, display refresh
   interval)`, because stutter is deviation from the achieved cadence. A fixed threshold either misses
@@ -52,6 +53,13 @@ Two decisions shape the scoring:
   spike was CPU-bound, GPU-bound or present-bound. Without that breakdown the engine falls back to
   frame-time-only reasoning but caps its confidence lower, so a measured attribution always outranks
   an inferred one.
+- **Frames nobody saw are not stutter.** Alt-tab and the Windows key produce frame times that read
+  exactly like a freeze, and the game is behind another window while they happen. `WindowFocusSample`
+  makes that measurable, so those frames are held out of every running measurement — the spike
+  detector's baseline, the pacing classification, the VRAM band comparison, the capture budget — and
+  counted separately in `GameFocusMonitor` instead of quietly folded in. An incident marked during one
+  is ruled `GameNotInFocus` rather than ranked against nine hypotheses about a game nobody was
+  watching. With no focus telemetry at all every frame counts, which is what the app did before.
 
 ## `FiveMDiagnostics.Export`
 
@@ -82,6 +90,10 @@ Two decisions shape the scoring:
 
 - short WPR deep capture for severe incidents
 - ETL artifact parsing via `TraceEvent`
+- per-process CPU out of the trace, because the process counters read about once a second and a shell
+  burst lasts two to four tenths of one
+- the release chain behind the game thread's longest wait, which separates "the game blocked on
+  itself" from "something outside took the processor"
 
 ## `FiveMDiagnostics.Fakes`
 
@@ -110,6 +122,7 @@ Important concrete event types:
 - `ObsTelemetrySample`
 - `NetworkEndpointSample`
 - `NetworkProbeSample`
+- `WindowFocusSample`
 - `ArtifactEvidence`
 
 This lets the app preserve one merged timeline while still keeping type-specific analysis.

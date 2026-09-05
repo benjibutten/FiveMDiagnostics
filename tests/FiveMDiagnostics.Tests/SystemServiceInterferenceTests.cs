@@ -101,7 +101,8 @@ public sealed class SystemServiceInterferenceTests
             CoveredSeconds: 21.7,
             TopProcesses: [],
             BusiestNeighbour: new FileOperationProcess("SearchIndexer.exe", 5672, 1_364_973, neighbourPerSecond, IsGame: false),
-            NeighbourContendingIntervals: []);
+            NeighbourContendingIntervals: [],
+            GameThreads: []);
 
         Assert.Equal(contending, summary.HasContendingNeighbour);
         Assert.Equal(contending, summary.Describe().Contains("filsystemsträngsel", StringComparison.Ordinal));

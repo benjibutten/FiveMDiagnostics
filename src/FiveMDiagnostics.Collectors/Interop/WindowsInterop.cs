@@ -14,6 +14,17 @@ internal static class WindowsInterop
     [DllImport("psapi.dll", SetLastError = true)]
     internal static extern bool GetPerformanceInfo(out PerformanceInformation performanceInformation, int size);
 
+    /// <summary>
+    /// The window the user is currently working in, or <see cref="IntPtr.Zero"/> when the foreground
+    /// belongs to no window at all — which happens for a moment during a switch and on a locked desktop.
+    /// </summary>
+    [DllImport("user32.dll")]
+    internal static extern IntPtr GetForegroundWindow();
+
+    /// <summary>Owner of a window. The return value is the thread id; the process comes back in the out.</summary>
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern uint GetWindowThreadProcessId(IntPtr windowHandle, out int processId);
+
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
     internal static extern bool EnumDisplaySettings(string? deviceName, int modeNum, ref DevMode devMode);
 

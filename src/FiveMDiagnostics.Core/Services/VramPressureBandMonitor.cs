@@ -75,11 +75,33 @@ public sealed class VramPressureBandMonitor
     /// <summary>The band, in percent of the card's own capacity.</summary>
     public const double BandPercent = 88;
 
+    /// <summary>
+    /// How long after the game starts the session is still loading rather than running.
+    /// </summary>
+    /// <remarks>
+    /// The measurement, not a guess: on 4 September the card spent 11.5 minutes above the band inside the
+    /// first forty minutes after a restart and 3.0 minutes across the six hours after that — 80% of the
+    /// pressure in 10% of the evening. A single share over the whole session hides that completely, and
+    /// worse, it makes two evenings incomparable whenever they contain a different number of restarts:
+    /// the same machine reads as twice as pressured on the night the game crashed twice.
+    /// </remarks>
+    public static readonly TimeSpan LoadingWindow = TimeSpan.FromMinutes(40);
+
     /// <summary>The deeper band, reported separately because minutes there are minutes at the edge.</summary>
     public const double DeepBandPercent = 91;
 
     private readonly object _sync = new();
     private readonly Dictionary<long, Interval> _intervals = [];
+
+    /// <summary>
+    /// When the game was seen to start, oldest first. One or two entries on an ordinary evening.
+    /// </summary>
+    /// <remarks>
+    /// Told to the monitor rather than inferred from the frames, because the two are different events: a
+    /// capture that restarts produces a gap in the frames and no restart, and a game that restarts while
+    /// PresentMon keeps running produces a restart and barely a gap.
+    /// </remarks>
+    private readonly List<DateTimeOffset> _gameStarts = [];
     private readonly List<(DateTimeOffset At, double FrameTimeMs)> _warmup = new(CadenceWarmupFrames);
     private readonly double _refreshIntervalMs;
 
@@ -92,6 +114,27 @@ public sealed class VramPressureBandMonitor
     public VramPressureBandMonitor(double? refreshRateHz)
     {
         _refreshIntervalMs = refreshRateHz is > 0 ? 1000d / refreshRateHz.Value : 1000d / 60;
+    }
+
+    /// <summary>
+    /// Notes that the game has started, so the minutes after it can be reported apart from the rest.
+    /// </summary>
+    /// <remarks>
+    /// Repeated calls for the same start are ignored — the caller polls for the process and does not know
+    /// whether it has told this already, and a list of a hundred identical starts would make the whole
+    /// session loading.
+    /// </remarks>
+    public void NoteGameStart(DateTimeOffset at)
+    {
+        lock (_sync)
+        {
+            if (_gameStarts.Count > 0 && (at - _gameStarts[^1]).Duration() < TimeSpan.FromMinutes(1))
+            {
+                return;
+            }
+
+            _gameStarts.Add(at);
+        }
     }
 
     /// <summary>Folds one adapter reading into the minute it belongs to.</summary>
@@ -160,11 +203,22 @@ public sealed class VramPressureBandMonitor
                 SettleThreshold();
             }
 
-            var measured = _intervals.Values.Where(interval => interval.AdapterReadings > 0).ToArray();
-            if (measured.Length == 0)
+            var measuredPairs = _intervals.Where(entry => entry.Value.AdapterReadings > 0).ToArray();
+            if (measuredPairs.Length == 0)
             {
                 return null;
             }
+
+            var measured = measuredPairs.Select(entry => entry.Value).ToArray();
+
+            // Split by whether the interval fell inside the loading window after a game start. Done here
+            // rather than when the interval was created, because the caller can learn about a start a
+            // poll or two after it happened and the intervals it affects are already open.
+            var loading = measuredPairs.Count(entry => IsLoading(entry.Key));
+            var loadingInBand = measuredPairs.Count(entry => IsLoading(entry.Key) && entry.Value.IsInBand);
+            var loadingHitches = measuredPairs
+                .Where(entry => IsLoading(entry.Key) && entry.Value.IsInBand)
+                .Sum(entry => entry.Value.Hitches);
 
             var inBand = measured.Where(interval => interval.IsInBand).ToArray();
             var outside = measured.Where(interval => !interval.IsInBand).ToArray();
@@ -193,8 +247,38 @@ public sealed class VramPressureBandMonitor
                 inBandWithFrames.Sum(interval => interval.Hitches),
                 outsideWithFrames.Sum(interval => interval.Hitches),
                 inBandRate,
-                outsideRate);
+                outsideRate,
+                _gameStarts.Count,
+                loading,
+                loadingInBand,
+                loadingHitches);
         }
+    }
+
+    /// <summary>
+    /// Whether an interval fell inside the loading window after a game start. Called under the lock.
+    /// </summary>
+    /// <remarks>
+    /// The interval's own start is recoverable from its key, which is what lets this be decided at the
+    /// end from a list of starts that was still being appended to while the intervals were filling.
+    /// </remarks>
+    private bool IsLoading(long key)
+    {
+        if (_gameStarts.Count == 0)
+        {
+            return false;
+        }
+
+        var at = DateTimeOffset.FromUnixTimeSeconds(key * IntervalSeconds);
+        foreach (var start in _gameStarts)
+        {
+            if (at >= start - TimeSpan.FromSeconds(IntervalSeconds) && at - start < LoadingWindow)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>Called under the lock.</summary>
@@ -270,6 +354,14 @@ public sealed class VramPressureBandMonitor
 /// <param name="InBandHitchesPerHour">
 /// Null when no interval inside the band carried frames, which is the only honest answer then.
 /// </param>
+/// <param name="GameStarts">
+/// How many times the game was seen to start during the session. Carried because it is what makes the
+/// loading split readable: two restarts is eighty minutes of loading, and an evening's share of pressure
+/// cannot be compared with another evening's without knowing that.
+/// </param>
+/// <param name="LoadingIntervals">Measured intervals inside <see cref="VramPressureBandMonitor.LoadingWindow"/> of a start.</param>
+/// <param name="LoadingIntervalsInBand">Of those, the ones spent inside the band.</param>
+/// <param name="LoadingInBandHitches">Hitches inside the band during loading, which the steady figure excludes.</param>
 public sealed record VramPressureBandReport(
     int IntervalSeconds,
     int MeasuredIntervals,
@@ -281,8 +373,24 @@ public sealed record VramPressureBandReport(
     int InBandHitches,
     int OutsideHitches,
     double? InBandHitchesPerHour,
-    double? OutsideHitchesPerHour)
+    double? OutsideHitchesPerHour,
+    int GameStarts = 0,
+    int LoadingIntervals = 0,
+    int LoadingIntervalsInBand = 0,
+    int LoadingInBandHitches = 0)
 {
+    /// <summary>Minutes above the band inside the loading window after a game start.</summary>
+    public double MinutesInBandLoading => LoadingIntervalsInBand * IntervalSeconds / 60d;
+
+    /// <summary>Minutes above the band during the rest of the session — the figure to compare evenings on.</summary>
+    public double MinutesInBandSteady => (IntervalsInBand - LoadingIntervalsInBand) * IntervalSeconds / 60d;
+
+    /// <summary>Minutes of the session spent loading.</summary>
+    public double LoadingMinutes => LoadingIntervals * IntervalSeconds / 60d;
+
+    /// <summary>Minutes of the session spent running.</summary>
+    public double SteadyMinutes => (MeasuredIntervals - LoadingIntervals) * IntervalSeconds / 60d;
+
     /// <summary>The measured session in minutes, which is the unit the line is read in.</summary>
     public double MeasuredMinutes => MeasuredIntervals * IntervalSeconds / 60d;
 
@@ -326,13 +434,41 @@ public sealed record VramPressureBandReport(
                 : string.Empty;
 
             var gradient = DescribeGradient();
+            var split = DescribeLoadingSplit();
 
             return $"VRAM-tryck: kortet låg över {VramPressureBandMonitor.BandPercent:F0} % i {MinutesInBand:F1} av "
-                + $"{MeasuredMinutes:F0} minuter ({InBandShare:P0}){deep}; högst {PeakPercent:F1} %.{gradient} "
+                + $"{MeasuredMinutes:F0} minuter ({InBandShare:P0}){deep}; högst {PeakPercent:F1} %.{split}{gradient} "
                 + $"Mätt i {IntervalSeconds}-sekundersintervall, varav {MixedIntervals} låg på båda sidor om "
                 + "gränsen och räknats dit de lutar. Bandet är den här sessionens egen tid jämförd mot sig "
                 + "själv, inte en gissad gräns.";
         }
+    }
+
+    /// <summary>
+    /// The sentence splitting the band time into the minutes after a game start and the rest.
+    /// </summary>
+    /// <remarks>
+    /// Silent when nothing told the monitor about a game start, which is the honest answer: without one
+    /// there is no loading window to measure against and the undivided figure is all there is. Silent too
+    /// when the session was entirely loading or entirely running, where the split would say nothing the
+    /// line above has not.
+    /// </remarks>
+    private string DescribeLoadingSplit()
+    {
+        if (GameStarts == 0 || LoadingIntervals == 0 || LoadingIntervals >= MeasuredIntervals)
+        {
+            return string.Empty;
+        }
+
+        var starts = GameStarts == 1
+            ? "efter spelstarten"
+            : $"efter {GameStarts} spelstarter";
+
+        return $" Av dem låg {MinutesInBandLoading:F1} min i inladdningen — de första "
+            + $"{VramPressureBandMonitor.LoadingWindow.TotalMinutes:F0} minuterna {starts}, "
+            + $"{LoadingMinutes:F0} minuter totalt — och {MinutesInBandSteady:F1} min under "
+            + $"{SteadyMinutes:F0} minuters drift. Det är driftsiffran som går att jämföra mot en annan "
+            + "kväll; inladdningen beror på hur många gånger spelet startades om.";
     }
 
     /// <summary>

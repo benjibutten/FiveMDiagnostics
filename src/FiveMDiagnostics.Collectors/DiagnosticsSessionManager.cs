@@ -67,6 +67,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private CaptureCostMonitor? _captureCost;
     private VramPressureBandMonitor? _vramPressure;
     private SlowFrameWaitProfile? _slowFrameWaits;
+    private GameFocusMonitor? _gameFocus;
+    private AntiCheatCostMonitor? _antiCheatCost;
     private IncidentVerdictTally? _verdicts;
     private GameGraphicsSettingsMonitor? _gameSettings;
 
@@ -125,6 +127,16 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// <summary>Whether the game has been seen at all, and whether its exit has been reported.</summary>
     private bool _targetProcessSeen;
     private bool _reportedTargetProcessExit;
+
+    /// <summary>
+    /// The game process the session is currently watching, so a restart can be told from a poll.
+    /// </summary>
+    /// <remarks>
+    /// The identity, not merely the presence. The forty minutes after a restart carry most of the VRAM
+    /// pressure of an evening — 80% of it on 4 September — and a session that cannot separate them
+    /// reports a share that depends on how many times the game happened to be restarted.
+    /// </remarks>
+    private int? _targetProcessId;
 
     /// <summary>How often the graphics settings file is compared against what the session started with.</summary>
     private static readonly TimeSpan GameSettingsCheckInterval = TimeSpan.FromMinutes(5);
@@ -328,6 +340,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _vramBudget = new VramBudgetMonitor();
             _vramPressure = new VramPressureBandMonitor(Environment?.DisplayRefreshRateHz);
             _slowFrameWaits = new SlowFrameWaitProfile();
+            _gameFocus = new GameFocusMonitor(Environment?.DisplayRefreshRateHz);
+            _antiCheatCost = new AntiCheatCostMonitor();
             _verdicts = new IncidentVerdictTally();
             _liveVram = new LiveVramTracker();
 
@@ -335,6 +349,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _lastStallFrameAtUtc = null;
             _targetProcessSeen = false;
             _reportedTargetProcessExit = false;
+            _targetProcessId = null;
 
             // Half the capture threshold: a frame that large is unambiguously part of a stall, while an
             // ordinary two-refresh hitch is not, and holding a trace open for those would keep every
@@ -500,6 +515,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         _incidentMaterializer = null;
         _vramPressure = null;
         _slowFrameWaits = null;
+        _gameFocus = null;
+        _antiCheatCost = null;
         _verdicts = null;
         _gameSettings = null;
         _nextGameSettingsCheck = DateTimeOffset.MaxValue;
@@ -839,6 +856,58 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     }
 
     /// <summary>
+    /// Writes how much of the session was spent behind another window, and what that removed from the
+    /// hitch count.
+    /// </summary>
+    /// <remarks>
+    /// A Warning once a material share of the evening's hitches turn out to have happened while the game
+    /// was in the background, because that is a correction to every other number in the summary and to
+    /// every hitch rate quoted from a previous session — the earlier ones did not measure this and
+    /// counted those frames as stutter.
+    /// </remarks>
+    private void FinalizeGameFocus(bool final)
+    {
+        if (_gameFocus?.Summary() is { } report && ShouldWriteSummary("WindowFocus", report.Message))
+        {
+            Report(
+                report.ExcludedHitchShare >= 0.1 ? StatusLevel.Warning : StatusLevel.Info,
+                "WindowFocus",
+                report.Message);
+        }
+
+        if (final)
+        {
+            _gameFocus = null;
+        }
+    }
+
+    /// <summary>
+    /// Writes what FiveM's own anti-cheat cost across the session's traces.
+    /// </summary>
+    /// <remarks>
+    /// Info, because the whole point of the line is that the answer is "nothing to do here". It is worth
+    /// writing anyway: the per-trace sentence naming the module has now been read as a new discovery in
+    /// three separate reviews, and a session-level range with a median is what retires the question
+    /// instead of re-opening it. A Warning only when the figure leaves the range every measured session
+    /// has stayed inside.
+    /// </remarks>
+    private void FinalizeAntiCheatCost(bool final)
+    {
+        if (_antiCheatCost?.Summary() is { } report && ShouldWriteSummary("AntiCheat.Cost", report.Message))
+        {
+            Report(
+                report.IsUnusual ? StatusLevel.Warning : StatusLevel.Info,
+                "AntiCheat.Cost",
+                report.Message);
+        }
+
+        if (final)
+        {
+            _antiCheatCost = null;
+        }
+    }
+
+    /// <summary>
     /// Writes what the engine concluded across the whole session, with the VRAM verdict on its own line.
     /// </summary>
     private void FinalizeVerdicts(bool final)
@@ -848,6 +917,13 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             if (report.VramPressureMessage is { } vram && ShouldWriteSummary("Analysis.Verdicts.Vram", vram))
             {
                 Report(StatusLevel.Warning, "Analysis.Verdicts", vram);
+            }
+
+            // Ahead of the ranking rather than inside it: it is the line that says how many of the
+            // incidents below were about the game at all.
+            if (report.NotInFocusMessage is { } focus && ShouldWriteSummary("Analysis.Verdicts.Focus", focus))
+            {
+                Report(StatusLevel.Info, "Analysis.Verdicts", focus);
             }
 
             if (ShouldWriteSummary("Analysis.Verdicts", report.Message))
@@ -876,6 +952,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         FinalizeCaptureCost(final);
         FinalizeVramPressure(final);
         FinalizeSlowFrameWaits(final);
+        FinalizeGameFocus(final);
+        FinalizeAntiCheatCost(final);
         FinalizeVerdicts(final);
     }
 
@@ -1382,6 +1460,13 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
         var annotated = accounting.Annotate(sample, out var newlyProven);
 
+        // After the annotation rather than before it: a row already proved impossible needs no second
+        // verdict, and the drift watch reads the same adapter reading the annotation just used.
+        foreach (var drifting in accounting.ObserveDrift(annotated))
+        {
+            Report(StatusLevel.Warning, "GpuProcessMemory.Accounting", drifting.Message);
+        }
+
         foreach (var row in newlyProven)
         {
             var process = row.Process;
@@ -1598,43 +1683,16 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 {
                     CaptureHealthUpdated?.Invoke(this, healthSample);
                 }
+                else if (telemetryEvent is WindowFocusSample focusSample)
+                {
+                    if (_gameFocus?.Observe(focusSample) is { } excursion)
+                    {
+                        Report(StatusLevel.Info, "WindowFocus", excursion);
+                    }
+                }
                 else if (telemetryEvent is FrameTelemetrySample frameSample)
                 {
-                    // Every frame, not only the ones that trigger something: the capture thresholds are
-                    // derived from the session's own distribution, and a sample taken only from frames
-                    // that already crossed a threshold would describe the threshold rather than the
-                    // evening.
-                    _autoCaptureBudget?.Observe(frameSample.Timestamp, frameSample.FrameTimeMs);
-
-                    if (frameSample.FrameTimeMs >= _stallFrameThresholdMs)
-                    {
-                        _lastStallFrameAtUtc = DateTimeOffset.UtcNow;
-                    }
-
-                    _displayCadence?.Observe(frameSample);
-                    _captureCost?.Observe(frameSample);
-                    _vramPressure?.Observe(frameSample);
-                    _slowFrameWaits?.Observe(frameSample);
-
-                    // The marker has to be raised before the materializer sees this event, so the frame
-                    // that triggered the incident lands inside its own window rather than one event
-                    // short of it.
-                    if (_autoDetector?.Observe(frameSample) is { } observation)
-                    {
-                        if (observation.IsSuppressed)
-                        {
-                            EscalateOpenIncident(frameSample.Timestamp, observation.Trigger, observation.Suppression);
-                        }
-                        else
-                        {
-                            MarkAutoIncident(frameSample.Timestamp, observation.Trigger);
-                        }
-                    }
-
-                    if (_framePacing?.Observe(frameSample) is { } pacingWindow)
-                    {
-                        OnPacingWindow(pacingWindow);
-                    }
+                    ObserveFrame(frameSample);
                 }
 
                 if (_incidentMaterializer is not null && Environment is not null)
@@ -1644,6 +1702,61 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                     await QueueForAnalysisAsync(completed).ConfigureAwait(false);
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Feeds one presented frame to everything that measures how the game ran — unless the game was not
+    /// the window in front at the time.
+    /// </summary>
+    /// <remarks>
+    /// The frame is still in the ring buffer, still in the incident windows that overlap it and still in
+    /// the export; what it is kept out of is every running measurement. An alt-tab produces frame times
+    /// indistinguishable from a freeze, and letting those through moves the detector's rolling baseline,
+    /// the pacing classification, the VRAM band comparison and the capture budget's own distribution at
+    /// once — so a player who tabbed out four times an hour would raise the bar on the frames that
+    /// actually cost her something. They are counted in <see cref="GameFocusMonitor"/> instead, where the
+    /// summary can say how many there were rather than quietly folding them in.
+    /// </remarks>
+    private void ObserveFrame(FrameTelemetrySample frameSample)
+    {
+        if (_gameFocus?.ObserveFrame(frameSample.Timestamp, frameSample.FrameTimeMs) == false)
+        {
+            return;
+        }
+
+        // Every frame, not only the ones that trigger something: the capture thresholds are derived from
+        // the session's own distribution, and a sample taken only from frames that already crossed a
+        // threshold would describe the threshold rather than the evening.
+        _autoCaptureBudget?.Observe(frameSample.Timestamp, frameSample.FrameTimeMs);
+
+        if (frameSample.FrameTimeMs >= _stallFrameThresholdMs)
+        {
+            _lastStallFrameAtUtc = DateTimeOffset.UtcNow;
+        }
+
+        _displayCadence?.Observe(frameSample);
+        _captureCost?.Observe(frameSample);
+        _vramPressure?.Observe(frameSample);
+        _slowFrameWaits?.Observe(frameSample);
+
+        // The marker has to be raised before the materializer sees this event, so the frame that
+        // triggered the incident lands inside its own window rather than one event short of it.
+        if (_autoDetector?.Observe(frameSample) is { } observation)
+        {
+            if (observation.IsSuppressed)
+            {
+                EscalateOpenIncident(frameSample.Timestamp, observation.Trigger, observation.Suppression);
+            }
+            else
+            {
+                MarkAutoIncident(frameSample.Timestamp, observation.Trigger);
+            }
+        }
+
+        if (_framePacing?.Observe(frameSample) is { } pacingWindow)
+        {
+            OnPacingWindow(pacingWindow);
         }
     }
 
@@ -1698,10 +1811,23 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         var target = _processResolver.TryGetTargetProcess();
         if (target is not null)
         {
+            if (_targetProcessId != target.ProcessId)
+            {
+                _targetProcessId = target.ProcessId;
+
+                // The process's own start time when the resolver has it, and the moment it was noticed
+                // otherwise. The difference matters here: the session may be started with the game
+                // already running for an hour, and calling that a fresh load would file an hour of
+                // ordinary play as the loading window.
+                _vramPressure?.NoteGameStart(target.StartedAt ?? DateTimeOffset.UtcNow);
+            }
+
             _targetProcessSeen = true;
             _reportedTargetProcessExit = false;
             return;
         }
+
+        _targetProcessId = null;
 
         if (!_targetProcessSeen || _reportedTargetProcessExit)
         {
@@ -2037,6 +2163,14 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private void TryAttachEvidenceToIncident(Guid? markerId, ArtifactEvidence evidence, ArtifactAttachment attachment)
     {
         IncidentRecord updated;
+
+        // Every trace, whichever incident it ends up on and whether it ends up on one at all. The
+        // anti-cheat's cost is a property of the evening rather than of any incident, and answering it
+        // once at session level is what stops it being rediscovered as a finding a fourth time.
+        if (evidence.Kind == ArtifactKind.EtlTrace)
+        {
+            _antiCheatCost?.Observe(evidence.Metrics);
+        }
 
         lock (_sync)
         {

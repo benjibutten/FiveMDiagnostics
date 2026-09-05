@@ -93,6 +93,17 @@ public sealed class VramBudgetMonitor
     private GpuTelemetrySample? _lastAdapter;
     private FiveMClientConfig? _clientConfig;
     private bool _reported;
+
+    /// <summary>
+    /// Whether the current spell of unusable process tables has already been reported.
+    /// </summary>
+    /// <remarks>
+    /// Separate from <see cref="_reported"/> on purpose: that one is the budget line's own "said once"
+    /// flag, and a refusal must not spend it. Cleared as soon as a sampling adds up again, so the
+    /// evening's second spell gets its own line.
+    /// </remarks>
+    private bool _reportedUnusableTable;
+
     private bool _budgetApproachReported;
     private bool _budgetOverheadReported;
     private bool _streamStackPresent;
@@ -333,9 +344,25 @@ public sealed class VramBudgetMonitor
         // given against — the stream stack can be closed and the desktop mostly cannot.
         var hiddenBytes = HiddenBytes(sample);
 
+        // Two ways the game's row stops being a number this class may divide by, and they need the same
+        // answer. The loud one is a row larger than what the whole card reports as used. The quiet one is
+        // a row that has been growing faster than the card for a quarter of an hour — 4.3 GB to 8.2 GB
+        // while the adapter moved a tenth of a gigabyte, on the evening this was written for — which
+        // looks perfectly reasonable while it happens.
+        //
+        // Either one takes the rest of the sample with it, because the residual below is the card's own
+        // figure minus the game's row: an inflated game row does not merely make its own number wrong, it
+        // empties the desktop and the stream stack and hands their memory to the game's headroom. Floored
+        // at zero, that printed "skrivbordet håller 0,0 GB och streamstacken 0,0 GB" for the whole evening
+        // of 4 September while dwm alone held 1.29, and the closing recommendation to lower the texture
+        // slider another step was computed against that empty card. Refusing is worth more than a split
+        // known to be wrong.
+        var gameRowDrifting = believable.Where(IsGame).Any(sample.IsDrifting);
+        var tableUnusable = gameBytes > usedBytes || gameRowDrifting;
+
         // Everything the game does not hold, taken from the card's own figure so the table's double
-        // counting cannot reach it. Floored because the two collectors sample at different instants and
-        // a game that grew between them would otherwise produce a negative desktop.
+        // counting cannot reach it. Floored because the two collectors sample at different instants and a
+        // game that grew between them would otherwise produce a negative desktop.
         var otherBytes = usedBytes > gameBytes ? usedBytes - gameBytes : 0;
 
         var streamMeasuredBytes = believable.Where(IsStreamStack).Aggregate(0UL, (total, process) => total + process.DedicatedBytes);
@@ -362,20 +389,73 @@ public sealed class VramBudgetMonitor
         }
 
         // Kept before the early return: the approach warning reads these on samples that produce no
-        // line of their own, which is all but two of them.
-        _lastGameBytes = gameBytes;
-        _lastReservedBytes = desktopBytes + streamBytes;
-        _lastTotalBytes = totalBytes;
-
-        // What the slider does not reach, measured rather than assumed. Only observable once the game
-        // has actually passed its streaming budget; before that it is zero because nothing has been
-        // seen, not because there is none.
-        if (_clientConfig?.TextureBudgetBytes is { } budgetBytes && gameBytes > budgetBytes)
+        // line of their own, which is all but two of them. Not from a sampling whose table is unusable —
+        // the approach warning and its recommendation would then be computed against the same empty card.
+        if (!tableUnusable)
         {
-            _overheadBytes = Math.Max(_overheadBytes, gameBytes - budgetBytes);
+            _lastGameBytes = gameBytes;
+            _lastReservedBytes = desktopBytes + streamBytes;
+            _lastTotalBytes = totalBytes;
+
+            // What the slider does not reach, measured rather than assumed. Only observable once the game
+            // has actually passed its streaming budget; before that it is zero because nothing has been
+            // seen, not because there is none. An inflated row would raise this permanently — the field
+            // only ever ratchets up — so it is the one figure that must never see an unusable sampling.
+            if (_clientConfig?.TextureBudgetBytes is { } budget && gameBytes > budget)
+            {
+                _overheadBytes = Math.Max(_overheadBytes, gameBytes - budget);
+            }
         }
 
-        var transition = TrackStreamStack(streamUnmeasurable ? null : streamMeasuredBytes >= StreamStackPresentBytes);
+        // A sampling that cannot be split cannot say whether the stream stack is running either, so the
+        // stack's state is held rather than re-decided from rows that have just been proved wrong.
+        var transition = TrackStreamStack(streamUnmeasurable || tableUnusable ? null : streamMeasuredBytes >= StreamStackPresentBytes);
+
+        if (tableUnusable)
+        {
+            // Held under its own flag rather than the budget line's. The collector keeps producing the
+            // same table, so without a flag the refusal is written every five seconds for the rest of the
+            // evening — and setting _reported here would spend the budget line's one slot on the refusal,
+            // leaving the session with no budget line at all if the first sampling happened to be a bad
+            // one. What is refused is the split and the recommendation, not the card's own figures, which
+            // are still stated because they are still true.
+            if (_reportedUnusableTable)
+            {
+                return null;
+            }
+
+            _reportedUnusableTable = true;
+
+            var why = gameBytes > usedBytes
+                ? $"Spelets rad säger {Gigabytes(gameBytes)}, vilket är mer än vad kortet självt "
+                    + $"rapporterar som använt ({Gigabytes(usedBytes)} av {Gigabytes(totalBytes)}). En "
+                    + "process kan inte hålla minne kortet inte räknar, så processtabellen dubbelräknar "
+                    + "den här sekunden"
+                : $"Spelets rad ({Gigabytes(gameBytes)}) har visat sig växa snabbare än kortet gör och "
+                    + "räknas därför som driftande; dess absolutvärde går inte att bygga en uppdelning på";
+
+            // No stream stack transition can be pending here: TrackStreamStack was told to hold above,
+            // so this branch never has one to prefix.
+            return new VramBudgetReport(
+                $"VRAM-budget: kan inte delas upp. {why}, och uppdelningen mellan spel, "
+                + $"skrivbord och streamstack finns inte att göra. Kortet står på {Gigabytes(usedBytes)} "
+                + $"av {Gigabytes(totalBytes)} och den siffran gäller; rekommendationen om texturbudgeten "
+                + "hålls inne tills tabellen går ihop igen.",
+                DesktopBytes: 0,
+                StreamStackBytes: 0,
+                gameBytes,
+                GameHeadroomBytes: 0,
+                GameBandHeadroomBytes: 0,
+                totalBytes,
+                usedBytes,
+                totalBytes > usedBytes ? totalBytes - usedBytes : 0,
+                StreamStackDerived: false);
+        }
+
+        // Cleared once the table adds up again, so a second spell of drift or double counting later in the
+        // evening is reported rather than swallowed by the first one.
+        _reportedUnusableTable = false;
+
         if (_reported && transition is null)
         {
             return null;

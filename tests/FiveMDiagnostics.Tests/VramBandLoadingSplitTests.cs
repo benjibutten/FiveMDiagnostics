@@ -1,0 +1,168 @@
+namespace FiveMDiagnostics.Tests;
+
+using FiveMDiagnostics.Core;
+
+/// <summary>
+/// The minutes after a game start are reported apart from the minutes of play.
+/// </summary>
+/// <remarks>
+/// The evening of 4 September spent 21.5 of 426 minutes above the band, and 80% of that time fell inside
+/// the first forty minutes after the game was restarted at 21:10. Reported as one share it reads as a
+/// card that is mildly full all evening; reported split it reads as a card that is full while the game
+/// loads and comfortable afterwards, which is a different problem with a different answer. It also makes
+/// two evenings comparable, which the single figure cannot: the same machine looks twice as pressured on
+/// the night the game was restarted twice.
+/// </remarks>
+public sealed class VramBandLoadingSplitTests
+{
+    private static readonly DateTimeOffset Start = new(2026, 9, 4, 19, 10, 0, TimeSpan.Zero);
+
+    /// <summary>
+    /// Ten pressured minutes right after the start and two more an hour later. The line separates them.
+    /// </summary>
+    [Fact]
+    public void TheBandTimeIsSplitIntoLoadingAndRunning()
+    {
+        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        monitor.NoteGameStart(Start);
+
+        Play(monitor, Start, minutes: 10, vramPercent: 92);
+        Play(monitor, Start.AddMinutes(10), minutes: 30, vramPercent: 70);
+
+        // An hour in: past the loading window, and two minutes back in the band.
+        Play(monitor, Start.AddMinutes(60), minutes: 2, vramPercent: 92);
+        Play(monitor, Start.AddMinutes(62), minutes: 30, vramPercent: 70);
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report);
+        Assert.Equal(12, report.MinutesInBand, 1);
+        Assert.Equal(10, report.MinutesInBandLoading, 1);
+        Assert.Equal(2, report.MinutesInBandSteady, 1);
+        Assert.Equal(1, report.GameStarts);
+        Assert.Contains("i inladdningen", report.Message, StringComparison.Ordinal);
+        Assert.Contains("minuters drift", report.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A restart opens a second loading window, and the line says how many there were — which is the
+    /// figure a reader needs before comparing this evening's loading minutes with another's.
+    /// </summary>
+    [Fact]
+    public void EachRestartOpensItsOwnLoadingWindow()
+    {
+        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        monitor.NoteGameStart(Start);
+        Play(monitor, Start, minutes: 5, vramPercent: 92);
+        Play(monitor, Start.AddMinutes(5), minutes: 55, vramPercent: 70);
+
+        monitor.NoteGameStart(Start.AddMinutes(60));
+        Play(monitor, Start.AddMinutes(60), minutes: 5, vramPercent: 92);
+        Play(monitor, Start.AddMinutes(65), minutes: 30, vramPercent: 70);
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report);
+        Assert.Equal(2, report.GameStarts);
+        Assert.Equal(10, report.MinutesInBandLoading, 1);
+        Assert.Equal(0, report.MinutesInBandSteady, 1);
+        Assert.Contains("efter 2 spelstarter", report.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Polling for the process must not turn the whole evening into a loading window. The same start
+    /// told repeatedly is one start.
+    /// </summary>
+    [Fact]
+    public void TheSameStartToldRepeatedlyIsOneStart()
+    {
+        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+
+        for (var i = 0; i < 50; i++)
+        {
+            monitor.NoteGameStart(Start.AddSeconds(i));
+        }
+
+        Play(monitor, Start, minutes: 5, vramPercent: 92);
+        Play(monitor, Start.AddMinutes(5), minutes: 60, vramPercent: 70);
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report);
+        Assert.Equal(1, report.GameStarts);
+        Assert.Equal(40, report.LoadingMinutes, 1);
+    }
+
+    /// <summary>
+    /// Without a start the split says nothing rather than guessing. A session that began with the game
+    /// already running has no loading window to measure against.
+    /// </summary>
+    [Fact]
+    public void WithNoStartTheLineIsUndivided()
+    {
+        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+
+        Play(monitor, Start, minutes: 5, vramPercent: 92);
+        Play(monitor, Start.AddMinutes(5), minutes: 20, vramPercent: 70);
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report);
+        Assert.Equal(0, report.GameStarts);
+        Assert.DoesNotContain("i inladdningen", report.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// One frame a second at the session's cadence, with a hitch a minute so the threshold settles.
+    /// </summary>
+    private static void Play(VramPressureBandMonitor monitor, DateTimeOffset from, int minutes, double vramPercent)
+    {
+        for (var minute = 0; minute < minutes; minute++)
+        {
+            var minuteStart = from.AddMinutes(minute);
+
+            for (var reading = 0; reading < 12; reading++)
+            {
+                monitor.Observe(Adapter(minuteStart.AddSeconds(reading * 5), vramPercent));
+            }
+
+            for (var frame = 0; frame < 60; frame++)
+            {
+                monitor.Observe(Frame(minuteStart.AddSeconds(frame), frame == 0 ? 90 : 16.7));
+            }
+        }
+    }
+
+    private static GpuTelemetrySample Adapter(DateTimeOffset timestamp, double vramPercent)
+    {
+        const ulong Total = 10UL * 1024 * 1024 * 1024;
+
+        return new GpuTelemetrySample(
+            timestamp,
+            IsAvailable: true,
+            "NVIDIA GeForce RTX 3080",
+            UtilizationPercent: 60,
+            MemoryBandwidthUtilizationPercent: 20,
+            UsedVramBytes: (ulong)(Total * vramPercent / 100),
+            TotalVramBytes: Total,
+            EncoderUtilizationPercent: 12,
+            DecoderUtilizationPercent: 0,
+            TemperatureCelsius: 60,
+            ThrottleReasons: [],
+            AdapterCount: 1);
+    }
+
+    private static FrameTelemetrySample Frame(DateTimeOffset timestamp, double frameTimeMs)
+    {
+        return new FrameTelemetrySample(
+            timestamp,
+            frameTimeMs,
+            GpuBusyMs: 5,
+            DisplayLatencyMs: 20,
+            MsBetweenPresents: frameTimeMs,
+            Dropped: false,
+            ProcessName: "FiveM_b3407_GTAProcess.exe",
+            CpuBusyMs: frameTimeMs - 6,
+            CpuWaitMs: 6);
+    }
+}

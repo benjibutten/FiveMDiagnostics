@@ -84,13 +84,51 @@ public sealed class WprProfileWriterTests : IDisposable
         Assert.Equal(DeepCaptureOptions.CurrentCaptureProfileRevision, options.CaptureProfileRevision);
     }
 
+    /// <summary>
+    /// A value that is still a previous revision's default follows the default forward, however many
+    /// revisions it has to travel. Eight was revision 2's, twelve was revision 3's, and six is what the
+    /// review asked for three sessions running.
+    /// </summary>
     [Fact]
-    public void RevisionTwoDefaultEightCaptureBudgetIsUpgraded()
+    public void RevisionTwoDefaultEightCaptureBudgetFollowsTheDefaultToSix()
     {
         var options = new DeepCaptureOptions
         {
             CaptureProfileRevision = 2,
             MaxAutoCapturesPerSession = 8,
+        };
+
+        Assert.True(options.MigrateCaptureProfile());
+        Assert.Equal(6, options.MaxAutoCapturesPerSession);
+    }
+
+    /// <summary>
+    /// Revision 3's own default is lowered in place: twelve captures is eleven gigabytes an evening for
+    /// six traces of evidence.
+    /// </summary>
+    [Fact]
+    public void RevisionThreeDefaultTwelveCaptureBudgetIsLowered()
+    {
+        var options = new DeepCaptureOptions
+        {
+            CaptureProfileRevision = 3,
+            MaxAutoCapturesPerSession = 12,
+        };
+
+        Assert.True(options.MigrateCaptureProfile());
+        Assert.Equal(6, options.MaxAutoCapturesPerSession);
+    }
+
+    /// <summary>
+    /// A hand-picked ceiling from before revision 2 is still left exactly where somebody put it.
+    /// </summary>
+    [Fact]
+    public void ManualCaptureBudgetFromBeforeRevisionTwoSurvivesTheNewDefault()
+    {
+        var options = new DeepCaptureOptions
+        {
+            CaptureProfileRevision = 1,
+            MaxAutoCapturesPerSession = 12,
         };
 
         Assert.True(options.MigrateCaptureProfile());

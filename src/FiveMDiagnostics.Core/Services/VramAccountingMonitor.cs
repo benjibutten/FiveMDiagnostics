@@ -95,6 +95,44 @@ public sealed class VramAccountingMonitor
     /// </remarks>
     private readonly Dictionary<int, (string Name, int Count)> _surplusStreak = [];
 
+    /// <summary>
+    /// Excess growth, scaled to an hour, at which a row is drifting rather than filling.
+    /// </summary>
+    /// <remarks>
+    /// Measured against the card's own growth over the same stretch, which is what makes this a test of
+    /// the counter and not of the program. A game filling its texture memory grows a gigabyte in the
+    /// first hour and so does the card, and the difference stays near zero; <c>obs64</c> going 0.59 GB to
+    /// 579 GB over seven hours, and the game's own row going 4.3 to 8.2 GB while the card moved 0.1, do
+    /// not. Half a gigabyte an hour is well above the sampling skew between two collectors and well below
+    /// either of those.
+    /// </remarks>
+    public const long DriftBytesPerHour = 512L * 1024 * 1024;
+
+    /// <summary>
+    /// How long a row has to be watched before its growth rate means anything.
+    /// </summary>
+    /// <remarks>
+    /// The rate is an extrapolation, so a short window extrapolates noise: two collectors that sample a
+    /// few seconds apart can differ by a hundred megabytes, which over thirty seconds is twelve gigabytes
+    /// an hour. Fifteen minutes makes the skew worth two gigabytes an hour at worst — still above the
+    /// bar — so the anchor is also re-taken whenever the card moves with the row, which is what an honest
+    /// allocation looks like and what keeps a game filling its budget out of this.
+    /// </remarks>
+    private static readonly TimeSpan MinimumDriftWindow = TimeSpan.FromMinutes(15);
+
+    /// <summary>
+    /// Where each row was when it was last agreed with, and what the card said at the same moment.
+    /// </summary>
+    /// <remarks>
+    /// Held against the name for the same reason <see cref="_doubleCounted"/> is: a recycled process id
+    /// would otherwise inherit an anchor taken hours ago against a different program, and every new
+    /// process would start life having apparently grown from whatever its predecessor held.
+    /// </remarks>
+    private readonly Dictionary<int, GrowthAnchor> _growth = [];
+
+    /// <summary>Rows proved to drift, kept for the session like the double counters above.</summary>
+    private readonly Dictionary<int, string> _drifting = [];
+
     private GpuTelemetrySample? _lastAdapter;
     private DateTimeOffset? _lastReportAt;
 
@@ -153,6 +191,21 @@ public sealed class VramAccountingMonitor
             return sample;
         }
 
+        // Before anything is stamped, and outside the adapter-freshness check below, because the drift
+        // verdict is carried on every annotated sample whether or not the adapter reading is fresh. Same
+        // rule as the double-count verdict a few lines down: an id recycled to a different program
+        // inherits nothing. Without it a drifting row's id could hand a permanent verdict to whatever
+        // started next, and a game that picked it up would have its VRAM budget refused for the rest of
+        // the evening on the strength of its predecessor's counter.
+        foreach (var process in sample.Processes)
+        {
+            if (_drifting.TryGetValue(process.ProcessId, out var driftingName)
+                && !string.Equals(driftingName, process.ProcessName, StringComparison.OrdinalIgnoreCase))
+            {
+                _drifting.Remove(process.ProcessId);
+            }
+        }
+
         if (_lastAdapter is { UsedVramBytes: { } adapterBytes, IsSingleAdapterMachine: true } adapter
             && (sample.Timestamp - adapter.Timestamp).Duration() <= AdapterFreshness)
         {
@@ -194,9 +247,105 @@ public sealed class VramAccountingMonitor
             }
         }
 
-        return _doubleCounted.Count == 0
+        return _doubleCounted.Count == 0 && _drifting.Count == 0
             ? sample
-            : sample with { DoubleCountedProcessIds = _doubleCounted.Keys.ToArray() };
+            : sample with
+            {
+                DoubleCountedProcessIds = _doubleCounted.Count == 0 ? null : _doubleCounted.Keys.ToArray(),
+                DriftingProcessIds = _drifting.Count == 0 ? null : _drifting.Keys.ToArray(),
+            };
+    }
+
+    /// <summary>
+    /// Watches each row against the card it is supposed to be inside, and names the ones that have come
+    /// loose.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The two proofs above are about a single sampling: a row larger than the whole card, or a row whose
+    /// removal reconciles the table. Both need the fault to be large enough to be arithmetically
+    /// impossible right now, and the faults that have actually cost this investigation time were not —
+    /// they were slow. <c>obs64</c> went from 0.59 GB to 579 GB across seven hours and was caught only
+    /// when it passed the card's size; <c>Voicemod</c> went 9.36 to 16.44 and was caught the same way; the
+    /// game's own row went 4.3 to 8.2 GB while the card moved a tenth of a gigabyte, and was never caught
+    /// at all.
+    /// </para>
+    /// <para>
+    /// What all three have in common is visible long before the absolute value is: the row grows and the
+    /// card does not. A process cannot take memory the adapter does not then report as used, so growth in
+    /// excess of the card's own is a statement about the counter. The anchor is re-taken whenever the two
+    /// move together, which is what filling a texture budget looks like — so a game legitimately taking a
+    /// gigabyte an hour never accumulates any excess to be measured.
+    /// </para>
+    /// <para>
+    /// A drifting row is marked and not excluded. It holds real memory, and the mistake this codebase has
+    /// already made twice is to remove a row from the reports and thereby move its memory into somebody
+    /// else's headroom. What the mark buys is that nothing computes a split or a recommendation from the
+    /// row's absolute value — see <c>VramBudgetMonitor</c>, which refuses instead.
+    /// </para>
+    /// </remarks>
+    public IReadOnlyList<DriftingRow> ObserveDrift(GpuProcessMemorySample sample)
+    {
+        if (!sample.IsAvailable || sample.Processes.Count == 0)
+        {
+            return [];
+        }
+
+        if (_lastAdapter is not { UsedVramBytes: { } adapterBytes, IsSingleAdapterMachine: true } adapter
+            || (sample.Timestamp - adapter.Timestamp).Duration() > AdapterFreshness)
+        {
+            return [];
+        }
+
+        List<DriftingRow>? found = null;
+
+        foreach (var process in sample.Processes)
+        {
+            // The same recycled-id rule the anchor below applies, so this holds even when nothing called
+            // Annotate first.
+            if (_drifting.TryGetValue(process.ProcessId, out var driftingName)
+                && !string.Equals(driftingName, process.ProcessName, StringComparison.OrdinalIgnoreCase))
+            {
+                _drifting.Remove(process.ProcessId);
+            }
+
+            if (!_growth.TryGetValue(process.ProcessId, out var anchor)
+                || !string.Equals(anchor.Name, process.ProcessName, StringComparison.OrdinalIgnoreCase))
+            {
+                _growth[process.ProcessId] = new GrowthAnchor(process.ProcessName, sample.Timestamp, process.DedicatedBytes, adapterBytes);
+                continue;
+            }
+
+            var elapsed = sample.Timestamp - anchor.At;
+            var rowGrowth = (long)process.DedicatedBytes - (long)anchor.Bytes;
+            var cardGrowth = (long)adapterBytes - (long)anchor.AdapterBytes;
+            var excess = rowGrowth - cardGrowth;
+
+            // The row shrank, or the card kept up with it. Either way this row is behaving, and the
+            // anchor moves forward so the next window is measured from here rather than from an hour of
+            // honest growth the row is still carrying.
+            if (excess <= 0)
+            {
+                _growth[process.ProcessId] = new GrowthAnchor(process.ProcessName, sample.Timestamp, process.DedicatedBytes, adapterBytes);
+                continue;
+            }
+
+            if (elapsed < MinimumDriftWindow || _drifting.ContainsKey(process.ProcessId))
+            {
+                continue;
+            }
+
+            var perHour = (long)(excess / elapsed.TotalHours);
+            if (perHour < DriftBytesPerHour)
+            {
+                continue;
+            }
+
+            _drifting[process.ProcessId] = process.ProcessName;
+            (found ??= []).Add(new DriftingRow(process, rowGrowth, cardGrowth, elapsed));
+        }
+
+        return found ?? (IReadOnlyList<DriftingRow>)[];
     }
 
     /// <summary>
@@ -358,6 +507,9 @@ public sealed class VramAccountingMonitor
         return new VramAccountingReport(message, implausible, processBytes, adapterBytes, differenceBytes);
     }
 
+    /// <summary>Where a row and the card both stood the last time they agreed with each other.</summary>
+    private readonly record struct GrowthAnchor(string Name, DateTimeOffset At, ulong Bytes, ulong AdapterBytes);
+
     private static string Gigabytes(ulong bytes) => $"{bytes / 1024d / 1024 / 1024:F2} GB";
 
     private static string Signed(long bytes)
@@ -385,6 +537,32 @@ public enum DoubleCountProof
     /// The table exceeded the card, and removing this one row landed it back on the card's own figure.
     /// </summary>
     ExplainsSurplus,
+}
+
+/// <summary>
+/// A row whose growth has come loose from the card's, and the two figures that show it.
+/// </summary>
+/// <param name="RowGrowthBytes">What the row claims it gained over the window.</param>
+/// <param name="CardGrowthBytes">What the card gained over the same window, which is the honest ceiling.</param>
+public sealed record DriftingRow(
+    GpuProcessMemoryUsage Process,
+    long RowGrowthBytes,
+    long CardGrowthBytes,
+    TimeSpan Window)
+{
+    /// <summary>The line for the session log, which has to be readable without the arithmetic.</summary>
+    public string Message =>
+        $"{Process.ProcessName}s VRAM-rad har växt {Signed(RowGrowthBytes)} på "
+        + $"{Window.TotalMinutes:F0} minuter medan kortet växt {Signed(CardGrowthBytes)}. En process kan "
+        + "inte ta minne som kortet inte räknar, så raden driver: dess absolutvärde "
+        + $"({Process.DedicatedGigabytes:F2} GB) ska inte användas i någon uppdelning eller rekommendation. "
+        + "Raden står kvar i tabellen — minnet finns — men budgeten räknas mot kortets egen siffra.";
+
+    private static string Signed(long bytes)
+    {
+        var gigabytes = bytes / 1024d / 1024 / 1024;
+        return $"{(bytes >= 0 ? "+" : "-")}{Math.Abs(gigabytes):F2} GB";
+    }
 }
 
 /// <summary>A row this session has proved is double counting, and the proof that settled it.</summary>
