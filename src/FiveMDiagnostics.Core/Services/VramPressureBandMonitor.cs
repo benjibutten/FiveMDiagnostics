@@ -416,8 +416,21 @@ public sealed record VramPressureBandReport(
         ? inBand / outside
         : null;
 
+    /// <summary>
+    /// True when a minute inside the band hitched less often than a minute outside it.
+    /// </summary>
+    /// <remarks>
+    /// The strongest thing this measurement can say, and it says the opposite of a warning: the card was
+    /// full and the frames were fine, so the band is not what cost the session anything. On 5 September
+    /// the evening with the highest VRAM pressure ever measured — half the session above the band — had
+    /// its hitches concentrated <em>outside</em> it, 789 against 869 an hour, while the actual cause was
+    /// a paging read. That line went out as a Warning and was read as a VRAM warning for a day.
+    /// </remarks>
+    public bool BandCostNothing => HitchRatio is { } ratio && ratio < 1;
+
     /// <summary>True once the band was occupied enough to be worth acting on rather than noting.</summary>
-    public bool IsPressured => IntervalsInBand > 0 && (IntervalsInDeepBand > 0 || InBandShare >= 0.05);
+    public bool IsPressured =>
+        IntervalsInBand > 0 && !BandCostNothing && (IntervalsInDeepBand > 0 || InBandShare >= 0.05);
 
     public string Message
     {
@@ -436,7 +449,13 @@ public sealed record VramPressureBandReport(
             var gradient = DescribeGradient();
             var split = DescribeLoadingSplit();
 
-            return $"VRAM-tryck: kortet låg över {VramPressureBandMonitor.BandPercent:F0} % i {MinutesInBand:F1} av "
+            // The conclusion first when there is one, because the rest of the sentence is a large VRAM
+            // percentage and a reader who stops after the first clause has to stop on the right one.
+            var lead = BandCostNothing
+                ? "Bandet kostade ingenting den här sessionen. "
+                : string.Empty;
+
+            return $"{lead}VRAM-tryck: kortet låg över {VramPressureBandMonitor.BandPercent:F0} % i {MinutesInBand:F1} av "
                 + $"{MeasuredMinutes:F0} minuter ({InBandShare:P0}){deep}; högst {PeakPercent:F1} %.{split}{gradient} "
                 + $"Mätt i {IntervalSeconds}-sekundersintervall, varav {MixedIntervals} låg på båda sidor om "
                 + "gränsen och räknats dit de lutar. Bandet är den här sessionens egen tid jämförd mot sig "
@@ -494,8 +513,8 @@ public sealed record VramPressureBandReport(
         {
             return ratio >= 1
                 ? $" I de minuterna var hitchfrekvensen {ratio:F1}× högre än i resten — {rates}."
-                : $" I de minuterna var hitchfrekvensen lägre än i resten — {rates} — så bandet kostade "
-                    + "ingenting mätbart.";
+                : $" I de minuterna var hitchfrekvensen lägre än i resten — {rates}. Det är ett motbevis mot "
+                    + "att bandet skulle vara orsaken, inte en varning om det.";
         }
 
         return inBand > 0

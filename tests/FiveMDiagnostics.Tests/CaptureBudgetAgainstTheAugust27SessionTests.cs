@@ -54,13 +54,15 @@ public sealed class CaptureBudgetAgainstTheAugust27SessionTests
         // one, inside the spacing that exists so a capture does not record a ring buffer that has not
         // refilled. That is the cooldown working, not the budget going blind again.
         Assert.DoesNotContain(138d, captured);
-        // And the last frame of the evening, 166 ms at 05:19, still gets one. That is the claim the
-        // session ceiling has to survive, and it is the tight one: six captures is exactly what this
-        // evening spends, so the ceiling is reached by the last of them and refuses nothing. A seventh
-        // capture-worthy frame would have been turned away — which is the trade the lower ceiling makes,
-        // and it is made deliberately: the last three sessions each took twelve and each review used six.
-        Assert.Contains(166d, captured);
-        Assert.Equal(0, budget.Remaining);
+
+        // The last frame of the evening, 166 ms at 05:19, is now refused — and this is the price of the
+        // reserve rather than a regression. Two of the six captures are held for frames past the
+        // session's own extreme threshold, and this evening produced four of those (528, 484, 285, 284)
+        // plus the ordinary 217. A quiet ending leaves one capture unspent; the trade is that
+        // 5 September, which spent all six before 00:19 and then refused a 1 133 ms frame at 02:45,
+        // would have kept two slots for exactly that frame.
+        Assert.DoesNotContain(166d, captured);
+        Assert.Equal(1, budget.Remaining);
     }
 
     /// <summary>

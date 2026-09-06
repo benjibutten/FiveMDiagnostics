@@ -59,7 +59,14 @@ Three decisions shape the scoring:
   detector's baseline, the pacing classification, the VRAM band comparison, the capture budget — and
   counted separately in `GameFocusMonitor` instead of quietly folded in. An incident marked during one
   is ruled `GameNotInFocus` rather than ranked against nine hypotheses about a game nobody was
-  watching. With no focus telemetry at all every frame counts, which is what the app did before.
+  watching. With no focus telemetry at all every frame counts, which is what the app did before. The
+  verdict is classified at the frame the incident is *named after* rather than at its marker — an
+  escalated incident's marker can sit most of a minute before that frame — and it never silences the
+  verdict behind it, because excluding a window from the statistics is not the same as explaining it.
+- **A paging stall is proved twice.** `MemoryPagingStall` fires when the trace shows hard faults in
+  the game process and a read out of the paging file whose service time matches the game thread's
+  off-CPU interval. Two streams that know nothing about each other reporting the same millisecond
+  figure is the strongest evidence the engine can assemble, and it outranks every inferred verdict.
 
 ## `FiveMDiagnostics.Export`
 
@@ -94,6 +101,9 @@ Three decisions shape the scoring:
   burst lasts two to four tenths of one
 - the release chain behind the game thread's longest wait, which separates "the game blocked on
   itself" from "something outside took the processor"
+- disk service time per **volume**, not per process. A machine's disks are not alike, and averaging
+  them hides the one that is broken: a system drive answering thousands of operations at 0.1 ms and a
+  second drive answering tens at 20–450 ms read as one unremarkable disk when summed together
 
 ## `FiveMDiagnostics.Fakes`
 

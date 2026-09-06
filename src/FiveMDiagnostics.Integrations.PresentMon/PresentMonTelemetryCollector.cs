@@ -21,6 +21,11 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
     private long _lastFilePosition;
     private Dictionary<string, int>? _headerIndex;
     private DateTimeOffset? _traceStartEstimateUtc;
+
+    /// <summary>When this capture first produced an anchor estimate, so the log can wait for it to settle.</summary>
+    private DateTimeOffset? _anchorFirstSeenUtc;
+
+    private bool _reportedAnchor;
     private long _samplesThisCapture;
     private long _positionAtLastHealthCheck;
     private bool _reportedSuspension;
@@ -135,6 +140,7 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
                 }
 
                 CheckCaptureHealth(context, produced);
+                ReportTraceAnchorIfDue(context);
                 await WriteHealthSampleIfDueAsync(context, cancellationToken).ConfigureAwait(false);
 
                 await Task.Delay(context.Settings.PresentMon.PollingInterval, cancellationToken).ConfigureAwait(false);
@@ -195,6 +201,8 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
             _currentProcessId = processId;
             _currentOutputPath = Path.Combine(context.Settings.WorkingDirectory, $"presentmon_{processId}_{DateTimeOffset.UtcNow:yyyyMMdd_HHmmss}.csv");
             _traceStartEstimateUtc = null;
+            _anchorFirstSeenUtc = null;
+            _reportedAnchor = false;
             _samplesThisCapture = 0;
             _positionAtLastHealthCheck = 0;
 
@@ -640,6 +648,51 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
     }
 
     /// <summary>
+    /// How long the anchor is allowed to converge before it is written to the log.
+    /// </summary>
+    /// <remarks>
+    /// The estimate can only improve — it is the minimum of an upper bound — and it improves fastest in
+    /// the first seconds, as batches start being read promptly. Reporting on the opening batch would
+    /// write a figure a poll interval late; ten seconds is long enough for it to settle and short enough
+    /// that the line is near the top of the journal where a reader will find it.
+    /// </remarks>
+    private static readonly TimeSpan AnchorSettlingTime = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Writes what absolute second <c>TimeInMs = 0</c> is, once per capture.
+    /// </summary>
+    /// <remarks>
+    /// The CSV records frame times relative to the start of its own trace and never says when that was.
+    /// The app resolves it internally and kept the answer to itself, so offline analysis had to guess the
+    /// origin from the file's name — which is when the capture was <em>started</em>, several seconds
+    /// earlier — and every correlation against a GPU CSV or an ETL inherited that error.
+    /// </remarks>
+    private void ReportTraceAnchorIfDue(CollectorContext context)
+    {
+        string message;
+
+        lock (_sync)
+        {
+            if (_reportedAnchor
+                || _traceStartEstimateUtc is not { } anchor
+                || _anchorFirstSeenUtc is not { } seen
+                || context.UtcNow() - seen < AnchorSettlingTime)
+            {
+                return;
+            }
+
+            _reportedAnchor = true;
+            message = $"PresentMon-capture för PID {_currentProcessId} startad "
+                + $"{anchor.ToLocalTime():HH:mm:ss,fff} lokal tid ({anchor.UtcDateTime:HH:mm:ss,fff} UTC); "
+                + $"TimeInMs i {Path.GetFileName(_currentOutputPath)} räknas därifrån. Filnamnets tid är när "
+                + "capturen startades och är några sekunder tidigare — använd den här raden för korrelation "
+                + "mot GPU-loggen och mot traces.";
+        }
+
+        context.StatusSink.Report(StatusLevel.Info, Name, message);
+    }
+
+    /// <summary>
     /// PresentMon reports frame times relative to the start of its trace, not as wall-clock. The read
     /// always happens after the frame, so <c>readUtc - relativeMs</c> is an upper bound on the trace
     /// start and the tightest bound seen so far is the best estimate. Keeping the minimum lets the
@@ -658,6 +711,7 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
             if (_traceStartEstimateUtc is null || candidate < _traceStartEstimateUtc)
             {
                 _traceStartEstimateUtc = candidate;
+                _anchorFirstSeenUtc ??= readUtc;
             }
         }
     }
@@ -709,6 +763,8 @@ public sealed class PresentMonTelemetryCollector : ITelemetryCollector, IDisposa
         _lastFilePosition = 0;
         _headerIndex = null;
         _traceStartEstimateUtc = null;
+        _anchorFirstSeenUtc = null;
+        _reportedAnchor = false;
     }
 
     private static void DeleteEmptyOutputFile(string? path)

@@ -184,7 +184,12 @@ internal static class WaitReports
             // refuses to name a thread here; the chain has to refuse for the same reason.
             if (current.ReadiedFromDeferredProcedureCall)
             {
-                links.Add(new ChainLink(-1, null, $"släpptes av en DPC på CPU {current.ReadyProcessor} — ingen tråd att följa vidare till"));
+                var storage = scan.CompletionAt(current.ReadyAt) is { } completion
+                    ? $"släpptes av en {completion.ServiceMs:F0} ms-operation mot {completion.Path}, "
+                        + $"annonserad av en DPC på CPU {current.ReadyProcessor}"
+                    : $"släpptes av en DPC på CPU {current.ReadyProcessor} — ingen tråd att följa vidare till";
+
+                links.Add(new ChainLink(-1, null, storage));
                 break;
             }
 
@@ -249,6 +254,8 @@ internal static class WaitReports
         var readyByThread = new Dictionary<int, Ready>();
         var runningByProcessor = new Dictionary<int, int>();
         var waits = new List<ThreadWait>();
+        var pathsByFileKey = new Dictionary<ulong, string>();
+        var completions = new List<(DateTime At, double ServiceMs, ulong FileKey)>();
         var readyEvents = 0;
         DateTime? firstSample = null;
         DateTime? lastSample = null;
@@ -268,6 +275,21 @@ internal static class WaitReports
             kernel.ThreadStart += data => Map(processByThread, data);
             kernel.ThreadDCStart += data => Map(processByThread, data);
             kernel.ThreadDCStop += data => Map(processByThread, data);
+
+            // A storage DPC exists to announce that a disk operation finished, so the operation whose
+            // completion lands in the same instant is what the DPC released the thread for. Reading the
+            // two streams together here is what makes "released by a DPC on CPU 1, in CLASSPNP.SYS" into
+            // "released by a 454 ms read out of D:\pagefile.sys" — which is the whole answer, on one
+            // line, instead of a hint that sends the reader into the I/O report to match durations by
+            // hand.
+            void Completed(DiskIOTraceData data) =>
+                completions.Add((data.TimeStamp, data.DiskServiceTimeMSec, data.FileKey));
+
+            kernel.DiskIORead += Completed;
+            kernel.DiskIOWrite += Completed;
+            kernel.FileIOName += data => Name(pathsByFileKey, data);
+            kernel.FileIOFileCreate += data => Name(pathsByFileKey, data);
+            kernel.FileIOFileRundown += data => Name(pathsByFileKey, data);
 
             kernel.PerfInfoSample += data =>
             {
@@ -346,6 +368,7 @@ internal static class WaitReports
                                 data.TimeStampQPC,
                                 ready?.InferredThreadId ?? -1,
                                 ready?.Qpc ?? 0,
+                                ready?.Timestamp ?? default,
                                 ready?.Processor ?? -1,
                                 ready is not null,
                                 ready?.FromDeferredProcedureCall ?? false));
@@ -405,6 +428,16 @@ internal static class WaitReports
 
         var processId = processByThread.GetValueOrDefault(threadId.Value, -1);
         var processName = processNames.GetValueOrDefault(processId, $"pid {processId}");
+
+        // Resolved now rather than as they arrived: the name table is emitted at rundown, so a
+        // completion seen early in the trace has no path yet when it happens.
+        var diskCompletions = completions
+            .Select(entry => new DiskCompletion(
+                entry.At,
+                entry.ServiceMs,
+                pathsByFileKey.GetValueOrDefault(entry.FileKey, "en fil spåret inte namnger")))
+            .ToArray();
+
         return new Scan(
             threadId.Value,
             processName,
@@ -415,7 +448,8 @@ internal static class WaitReports
             images,
             processNames,
             processByThread,
-            readyEvents);
+            readyEvents,
+            diskCompletions);
     }
 
     /// <summary>
@@ -598,7 +632,11 @@ internal static class WaitReports
 
         if (wait.ReadiedFromDeferredProcedureCall)
         {
-            return $"a DPC on CPU {wait.ReadyProcessor}, in {module}";
+            // The disk operation the DPC was announcing, when there is one. Without it this line names a
+            // driver and leaves the reader to go and match durations in the I/O report by hand — which is
+            // exactly what it took to find the cause of 5 September, one trace at a time.
+            var storage = Storage(wait, scan);
+            return $"a DPC on CPU {wait.ReadyProcessor}, in {module}{storage}";
         }
 
         var recorded = stacks.Waking.GetValueOrDefault((wait.ReadyProcessor, wait.ReadyQpc));
@@ -612,6 +650,17 @@ internal static class WaitReports
         var self = threadId == wait.ThreadId ? " (itself)" : string.Empty;
         var derivation = recorded is null ? $" (inferred from CPU {wait.ReadyProcessor})" : string.Empty;
         return $"{process} tid {threadId}{self}{derivation}, in {module}";
+    }
+
+    /// <summary>
+    /// The disk operation that finished in the same instant the DPC released the thread, as a clause to
+    /// append. Empty when nothing did, which is an ordinary timer or network DPC.
+    /// </summary>
+    private static string Storage(ThreadWait wait, Scan scan)
+    {
+        return scan.CompletionAt(wait.ReadyAt) is { } completion
+            ? $" — a disk operation on {completion.Path} completed in the same instant, after {completion.ServiceMs:F1} ms"
+            : string.Empty;
     }
 
     /// <summary>The module that called the wait, i.e. the innermost user mode frame it resumed into.</summary>
@@ -702,6 +751,14 @@ internal static class WaitReports
         }
     }
 
+    private static void Name(Dictionary<ulong, string> paths, FileIONameTraceData data)
+    {
+        if (data.FileKey != 0 && !string.IsNullOrEmpty(data.FileName))
+        {
+            paths[data.FileKey] = data.FileName;
+        }
+    }
+
     private static void Map(Dictionary<int, int> processByThread, ThreadTraceData data)
     {
         if (data.ThreadID >= 0 && data.ProcessID >= 0)
@@ -743,6 +800,10 @@ internal static class WaitReports
         int Processor,
         bool FromDeferredProcedureCall);
 
+    /// <param name="ReadyAt">
+    /// When the wake fired, which is what pairs a storage DPC with the disk operation it completed.
+    /// Default when nothing readied the thread.
+    /// </param>
     private sealed record ThreadWait(
         int ThreadId,
         DateTime Start,
@@ -753,9 +814,13 @@ internal static class WaitReports
         long SwitchInQpc,
         int InferredReadyThreadId,
         long ReadyQpc,
+        DateTime ReadyAt,
         int ReadyProcessor,
         bool HasReadyEvent,
         bool ReadiedFromDeferredProcedureCall);
+
+    /// <summary>One disk operation finishing, which is what a storage DPC is running to announce.</summary>
+    private sealed record DiskCompletion(DateTime At, double ServiceMs, string Path);
 
     private sealed record Scan(
         int ThreadId,
@@ -767,8 +832,42 @@ internal static class WaitReports
         ImageMap Images,
         Dictionary<int, string> ProcessNames,
         Dictionary<int, int> ProcessByThread,
-        int ReadyThreadEventCount)
+        int ReadyThreadEventCount,
+        IReadOnlyList<DiskCompletion> DiskCompletions)
     {
+        /// <summary>
+        /// How close a disk completion has to be to a wake before it is called the same event.
+        /// </summary>
+        /// <remarks>
+        /// The ReadyThread fires from inside the completion DPC, so they are the same instant to within
+        /// the resolution of the trace. Two milliseconds is loose enough to survive that and tight enough
+        /// that an unrelated operation on a busy volume cannot claim the wake.
+        /// </remarks>
+        private static readonly TimeSpan CompletionTolerance = TimeSpan.FromMilliseconds(2);
+
+        /// <summary>
+        /// The disk operation a storage DPC was completing when it released a thread, if there was one.
+        /// </summary>
+        /// <remarks>
+        /// The slowest of the operations that finished in that instant, because that is the one capable
+        /// of having held a thread: a volume can complete several operations in the same millisecond and
+        /// only the long one is an explanation for anything.
+        /// </remarks>
+        public DiskCompletion? CompletionAt(DateTime readyAt)
+        {
+            DiskCompletion? best = null;
+            foreach (var completion in DiskCompletions)
+            {
+                if ((completion.At - readyAt).Duration() <= CompletionTolerance
+                    && (best is null || completion.ServiceMs > best.ServiceMs))
+                {
+                    best = completion;
+                }
+            }
+
+            return best;
+        }
+
         public string ProcessNameFor(int processId)
         {
             return processId switch

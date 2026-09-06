@@ -43,8 +43,7 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
 
     private readonly PerformanceCounter? _totalCpuCounter;
     private readonly IReadOnlyList<PerformanceCounter> _perCoreCounters;
-    private readonly CounterProbe _diskLatencyProbe;
-    private readonly CounterProbe _diskQueueProbe;
+    private readonly IReadOnlyList<DiskInstanceProbe> _diskInstances;
     private readonly CounterProbe _hardFaultPagesProbe;
     private readonly IReadOnlyList<CounterProbe> _diskProbes;
     private readonly Dictionary<int, ProcessMetricSnapshot> _previousSnapshots = new();
@@ -90,10 +89,53 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
         // Deliberately outside the CPU try block: a failing Processor category used to skip the disk
         // counters entirely, and that outcome then looked exactly like disk counters which had been
         // created and simply had nothing to report.
-        _diskLatencyProbe = CounterProbe.Create("Disklatens", "PhysicalDisk", "Avg. Disk sec/Transfer", "_Total");
-        _diskQueueProbe = CounterProbe.Create("Diskkö", "PhysicalDisk", "Current Disk Queue Length", "_Total");
+        _diskInstances = CreateDiskInstances();
         _hardFaultPagesProbe = CounterProbe.Create("Hard faults", "Memory", "Pages Input/sec", null);
-        _diskProbes = [_diskLatencyProbe, _diskQueueProbe, _hardFaultPagesProbe];
+        _diskProbes = [.. _diskInstances.SelectMany(instance => instance.Probes), _hardFaultPagesProbe];
+    }
+
+    /// <summary>
+    /// One latency and queue probe per physical disk, rather than one pair over all of them.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>_Total</c> is an average weighted by operation count, and that is the wrong statistic for the
+    /// only disk fault this app has ever had to find. Through the evening of 5 September C: served
+    /// thousands of operations at 0.1 ms while D: served tens at 20–450 ms; the average over both landed
+    /// far under the 20 ms bar in <c>AddDiskHypothesis</c>, so the rule could never fire and the counter
+    /// measured the wrong thing all evening.
+    /// </para>
+    /// <para>
+    /// Falls back to <c>_Total</c> when the instances cannot be enumerated, because one wrong statistic
+    /// still beats no measurement — and the availability line then names the instance it is reading, so
+    /// the fallback is visible in the journal rather than silent.
+    /// </para>
+    /// </remarks>
+    private static IReadOnlyList<DiskInstanceProbe> CreateDiskInstances()
+    {
+        string[] instances;
+        try
+        {
+            instances = new PerformanceCounterCategory("PhysicalDisk")
+                .GetInstanceNames()
+                .Where(name => !name.Equals("_Total", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
+        // Anything at all, like CounterProbe.Create. This runs from the constructor, so a throw here
+        // takes the app down at startup — on exactly the machine the fallback below was written for, one
+        // whose counter registry is damaged and whose enumeration can fail in ways nothing documents.
+        catch (Exception)
+        {
+            instances = [];
+        }
+
+        if (instances.Length == 0)
+        {
+            instances = ["_Total"];
+        }
+
+        return instances.Select(name => new DiskInstanceProbe(name)).ToArray();
     }
 
     public string Name => "SystemTelemetry";
@@ -108,6 +150,7 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
             var (memoryPressure, availableMb) = ReadMemorySnapshot();
             var hasTarget = context.ProcessResolver.TryGetTargetProcess() is not null;
             var (topCpu, topDisk) = hasTarget ? SampleProcesses(timestamp) : ([], []);
+            var disk = ReadWorstDisk();
 
             await context.Writer.WriteAsync(
                 new SystemTelemetrySample(
@@ -118,9 +161,10 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
                     availableMb,
                     topCpu,
                     topDisk,
-                    _diskLatencyProbe.Read(multiplier: 1000),
-                    _diskQueueProbe.Read(),
-                    _hardFaultPagesProbe.Read()),
+                    disk.LatencyMs,
+                    disk.QueueLength,
+                    _hardFaultPagesProbe.Read(),
+                    disk.Instance),
                 cancellationToken).ConfigureAwait(false);
 
             _samplesTaken++;
@@ -167,10 +211,14 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
         var unavailable = _diskProbes.Where(probe => !probe.IsAvailable).ToArray();
         if (unavailable.Length == 0)
         {
+            // The instances by name, because which disks are being measured is the part that matters and
+            // the counter paths are six near-identical strings.
             context.StatusSink.Report(
                 StatusLevel.Info,
                 Name,
-                $"Diskcounters aktiva: {string.Join(", ", _diskProbes.Select(probe => probe.CounterPath))}.");
+                $"Diskcounters aktiva per fysisk disk: {string.Join(", ", _diskInstances.Select(instance => instance.Name))}. "
+                + "Latens och kö rapporteras för den disk som svarar långsammast, inte som medelvärde över alla. "
+                + $"Dessutom {_hardFaultPagesProbe.CounterPath}.");
             return;
         }
 
@@ -218,6 +266,39 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
             $"Följande counters skapades men gav inget värde på {_samplesTaken} avläsningar: "
             + string.Join(", ", mute.Select(probe => $"{probe.Label} ({probe.LastReadError ?? "läsningen returnerade inget"})"))
             + ". Behandla dem som saknade.");
+    }
+
+    /// <summary>
+    /// Reads every physical disk and keeps the one that answered slowest.
+    /// </summary>
+    /// <remarks>
+    /// Every instance is read on every poll, not only the one that turns out to be worst: a performance
+    /// counter reports the delta since its own last read, so skipping an instance for a poll would make
+    /// its next reading cover two intervals.
+    /// </remarks>
+    private (double? LatencyMs, double? QueueLength, string? Instance) ReadWorstDisk()
+    {
+        (double? LatencyMs, double? QueueLength, string? Instance) worst = (null, null, null);
+
+        foreach (var instance in _diskInstances)
+        {
+            var latency = instance.Latency.Read(multiplier: 1000);
+            var queue = instance.Queue.Read();
+
+            if (latency is { } value && value > (worst.LatencyMs ?? -1))
+            {
+                worst = (value, queue, instance.Name);
+            }
+            else if (worst.Instance is null && queue is not null)
+            {
+                // Nothing has reported a latency yet. The queue still says something, and dropping it
+                // because its own instance had no latency reading is how a half-working counter set
+                // becomes no disk data at all.
+                worst = (null, queue, instance.Name);
+            }
+        }
+
+        return worst;
     }
 
     private static double ReadCpuUsage(PerformanceCounter? counter)
@@ -389,6 +470,26 @@ public sealed class SystemTelemetryCollector : ITelemetryCollector, IDisposable
         }
 
         return rows;
+    }
+
+    /// <summary>The latency and queue counters of one physical disk, kept together under its name.</summary>
+    private sealed class DiskInstanceProbe
+    {
+        public DiskInstanceProbe(string name)
+        {
+            Name = name;
+            Latency = CounterProbe.Create($"Disklatens {name}", "PhysicalDisk", "Avg. Disk sec/Transfer", name);
+            Queue = CounterProbe.Create($"Diskkö {name}", "PhysicalDisk", "Current Disk Queue Length", name);
+        }
+
+        /// <summary>The counter's own instance name, e.g. <c>1 D:</c>, which is what a report has to say.</summary>
+        public string Name { get; }
+
+        public CounterProbe Latency { get; }
+
+        public CounterProbe Queue { get; }
+
+        public IEnumerable<CounterProbe> Probes => [Latency, Queue];
     }
 
     /// <summary>

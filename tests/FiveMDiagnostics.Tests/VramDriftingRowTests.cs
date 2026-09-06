@@ -29,16 +29,17 @@ public sealed class VramDriftingRowTests
         var monitor = new VramAccountingMonitor();
 
         Observe(monitor, Start, gameGigabytes: 4.3, cardGigabytes: 8.0);
-        Assert.Empty(monitor.ObserveDrift(Sample(Start, gameGigabytes: 4.3)));
+        Assert.Null(monitor.ObserveDrift(Sample(Start, gameGigabytes: 4.3)));
 
         var later = Start.AddMinutes(40);
         Observe(monitor, later, gameGigabytes: 5.9, cardGigabytes: 8.1);
 
-        var drifting = monitor.ObserveDrift(Sample(later, gameGigabytes: 5.9));
+        var drift = monitor.ObserveDrift(Sample(later, gameGigabytes: 5.9));
 
-        Assert.Single(drifting);
-        Assert.Equal("FiveM_b3407_GTAProcess", drifting[0].Process.ProcessName);
-        Assert.Contains("driver", drifting[0].Message, StringComparison.Ordinal);
+        Assert.NotNull(drift);
+        Assert.Single(drift!.Rows);
+        Assert.Equal("FiveM_b3407_GTAProcess", drift.Rows[0].Process.ProcessName);
+        Assert.Contains("driver", drift.Rows[0].Message, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -57,7 +58,7 @@ public sealed class VramDriftingRowTests
             var game = 4.3 + (minute * 0.03);
             Observe(monitor, at, gameGigabytes: game, cardGigabytes: 6.0 + (minute * 0.03));
 
-            Assert.Empty(monitor.ObserveDrift(Sample(at, gameGigabytes: game)));
+            Assert.Null(monitor.ObserveDrift(Sample(at, gameGigabytes: game)));
         }
     }
 
@@ -75,11 +76,11 @@ public sealed class VramDriftingRowTests
 
         var later = Start.AddMinutes(40);
         Observe(monitor, later, gameGigabytes: 6.5, cardGigabytes: 8.0);
-        Assert.Single(monitor.ObserveDrift(Sample(later, gameGigabytes: 6.5)));
+        Assert.Single(monitor.ObserveDrift(Sample(later, gameGigabytes: 6.5))!.Rows);
 
         var laterStill = Start.AddMinutes(50);
         Observe(monitor, laterStill, gameGigabytes: 7.2, cardGigabytes: 8.0);
-        Assert.Empty(monitor.ObserveDrift(Sample(laterStill, gameGigabytes: 7.2)));
+        Assert.Null(monitor.ObserveDrift(Sample(laterStill, gameGigabytes: 7.2)));
     }
 
     /// <summary>
@@ -166,6 +167,102 @@ public sealed class VramDriftingRowTests
     }
 
     /// <summary>
+    /// A card that gives memory back does not turn every stationary row into a drifter.
+    /// </summary>
+    /// <remarks>
+    /// The excess is the row's growth minus the card's, so a card that shrank makes the excess positive
+    /// for a row that has not moved at all. On 5 September the card released 0.71 GB and the session log
+    /// filled with twenty warnings, fourteen of them about rows that had grown 0.00 GB — and they buried
+    /// the two that had grown 80 GB and 0.32. The rows that stayed put are counted in one sentence.
+    /// </remarks>
+    [Fact]
+    public void RowsThatDidNotGrowAreCountedRatherThanNamed()
+    {
+        var monitor = new VramAccountingMonitor();
+
+        Observe(monitor, Start, gameGigabytes: 6.3, cardGigabytes: 8.7);
+        Assert.Null(monitor.ObserveDrift(Sample(Start, gameGigabytes: 6.3)));
+
+        // Twenty minutes later the card has given back three quarters of a gigabyte, the game's row has
+        // climbed a gigabyte, and every other row is exactly where it was.
+        var later = Start.AddMinutes(20);
+        Observe(monitor, later, gameGigabytes: 7.3, cardGigabytes: 8.0);
+
+        var drift = monitor.ObserveDrift(Sample(later, gameGigabytes: 7.3));
+
+        Assert.NotNull(drift);
+        Assert.Single(drift!.Rows);
+        Assert.Equal("FiveM_b3407_GTAProcess", drift.Rows[0].Process.ProcessName);
+
+        // dwm stood still and is accounted for without a paragraph of its own.
+        Assert.Equal(1, drift.SteadyRows);
+        Assert.Contains("Ytterligare 1 processrader", drift.SteadySummary!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A row that gained what the card gained is not drifting, however fast both of them grew.
+    /// </summary>
+    /// <remarks>
+    /// The rate test cannot tell "this row took memory nobody else saw" from "this row and the card took
+    /// the same memory, read a few seconds apart". On 5 September the game's row went +5.58 GB while the
+    /// card went +5.20; the 0.38 GB between them is the skew between two collectors, and over a quarter
+    /// of an hour it extrapolates to 1.5 GB an hour — past the bar. The game's own row was called
+    /// drifting, and <c>VramBudgetMonitor</c> then refused to split the budget for the rest of the
+    /// evening.
+    /// </remarks>
+    [Fact]
+    public void ARowThatGrewWithTheCardIsNotDrifting()
+    {
+        var monitor = new VramAccountingMonitor();
+
+        Observe(monitor, Start, gameGigabytes: 2.0, cardGigabytes: 3.0);
+        Assert.Null(monitor.ObserveDrift(Sample(Start, gameGigabytes: 2.0)));
+
+        // A quarter of an hour of the game filling its texture budget, with the card following it.
+        var later = Start.AddMinutes(15);
+        Observe(monitor, later, gameGigabytes: 7.58, cardGigabytes: 8.20);
+
+        Assert.Null(monitor.ObserveDrift(Sample(later, gameGigabytes: 7.58)));
+    }
+
+    /// <summary>
+    /// The sentence accounting for the steady rows says why they were steady, for both reasons.
+    /// </summary>
+    /// <remarks>
+    /// A row is counted steady either because it barely grew or because the card gained the same memory,
+    /// and the summary used to claim the first about both. A game filling its texture budget at a dozen
+    /// gigabytes an hour was reported to the reader as having grown slower than half a gigabyte an hour — in the same
+    /// line as a row that really was drifting, which is where the reader goes to check.
+    /// </remarks>
+    [Fact]
+    public void TheSteadySummaryDoesNotClaimARowGrewSlowlyWhenTheCardKeptUp()
+    {
+        var monitor = new VramAccountingMonitor();
+
+        monitor.Observe(Adapter(Start, usedGigabytes: 3.0));
+        Assert.Null(monitor.ObserveDrift(Rows(Start, gameGigabytes: 2.0, voicemodGigabytes: 0.5)));
+
+        // A quarter of an hour of the game filling its budget with the card following it. Voicemod took
+        // less than the card gained, so its anchor moves here and the game's does not.
+        var filling = Start.AddMinutes(15);
+        monitor.Observe(Adapter(filling, usedGigabytes: 8.2));
+        Assert.Null(monitor.ObserveDrift(Rows(filling, gameGigabytes: 7.58, voicemodGigabytes: 3.0)));
+
+        // Another quarter of an hour: the card has stopped moving and Voicemod's row has not.
+        var drifting = filling.AddMinutes(15);
+        monitor.Observe(Adapter(drifting, usedGigabytes: 8.25));
+        var drift = monitor.ObserveDrift(Rows(drifting, gameGigabytes: 7.58, voicemodGigabytes: 4.2));
+
+        Assert.NotNull(drift);
+        Assert.Equal("Voicemod", drift!.Rows.Single().Process.ProcessName);
+
+        // The game's row cleared both rate bars — 12 GB/h of its own growth — and is steady only because
+        // the card gained the same memory alongside it.
+        Assert.Equal(1, drift.SteadyRows);
+        Assert.Contains("i takt med kortets egen tillväxt", drift.SteadySummary!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// A process id recycled to a different program inherits no drift verdict.
     /// </summary>
     /// <remarks>
@@ -183,11 +280,11 @@ public sealed class VramDriftingRowTests
         Observe(monitor, Start, gameGigabytes: 4.3, cardGigabytes: 8.0);
 
         // The first reading is where the row and the card are anchored against each other.
-        Assert.Empty(monitor.ObserveDrift(Sample(Start, gameGigabytes: 4.3)));
+        Assert.Null(monitor.ObserveDrift(Sample(Start, gameGigabytes: 4.3)));
 
         var later = Start.AddMinutes(40);
         Observe(monitor, later, gameGigabytes: 5.9, cardGigabytes: 8.1);
-        Assert.Single(monitor.ObserveDrift(Sample(later, gameGigabytes: 5.9)));
+        Assert.Single(monitor.ObserveDrift(Sample(later, gameGigabytes: 5.9))!.Rows);
 
         // The same id, a different program. Nothing about it has been measured.
         var after = later.AddMinutes(5);
@@ -231,6 +328,18 @@ public sealed class VramDriftingRowTests
             TemperatureCelsius: 61,
             ThrottleReasons: [],
             AdapterCount: 1);
+    }
+
+    /// <summary>The game and one neighbour, both of which the caller moves.</summary>
+    private static GpuProcessMemorySample Rows(DateTimeOffset timestamp, double gameGigabytes, double voicemodGigabytes)
+    {
+        return new GpuProcessMemorySample(
+            timestamp,
+            IsAvailable: true,
+            [
+                new GpuProcessMemoryUsage(18704, "FiveM_b3407_GTAProcess", (ulong)(gameGigabytes * Gigabyte), 0, 1),
+                new GpuProcessMemoryUsage(9128, "Voicemod", (ulong)(voicemodGigabytes * Gigabyte), 0, 1),
+            ]);
     }
 
     private static GpuProcessMemorySample Sample(DateTimeOffset timestamp, double gameGigabytes)

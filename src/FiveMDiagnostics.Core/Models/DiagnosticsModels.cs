@@ -33,6 +33,25 @@ public enum RootCauseCategory
     /// counted in the evening's hitch rate as though it had been a stutter in play.
     /// </remarks>
     GameNotInFocus,
+
+    /// <summary>
+    /// The game's thread page-faulted on memory Windows had written out, and the disk holding the paging
+    /// file took hundreds of milliseconds to hand it back.
+    /// </summary>
+    /// <remarks>
+    /// Its own category rather than a flavour of <see cref="StreamingOrDiskStall"/>, because the two call
+    /// for opposite responses: a streaming stall is about how fast the game's own files arrive, and this
+    /// is about a machine that has run out of RAM and a paging file that lives on a slow drive. Nine root
+    /// causes and none of them fitted the evening of 5 September, where every long freeze was a single
+    /// 64 kB read out of <c>D:\pagefile.sys</c> taking 431–454 ms.
+    /// <para>
+    /// It is also the best-evidenced verdict the engine can reach. The signal is the same millisecond
+    /// figure arriving from two unrelated streams — the drive's own service time and the scheduler's
+    /// off-CPU interval for the game's thread — plus a hard fault in that process to say the thread was
+    /// waiting for that read and not merely at the same time as it.
+    /// </para>
+    /// </remarks>
+    MemoryPagingStall,
 }
 
 public enum ArtifactKind
@@ -450,6 +469,26 @@ public sealed record DeepCaptureOptions
     public int MaxAutoCapturesPerSession { get; set; } = 6;
 
     /// <summary>
+    /// Captures out of <see cref="MaxAutoCapturesPerSession"/> that only an extreme frame may spend.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The ceiling is right and the order it was spent in was not. On 5 September the budget ran out at
+    /// 03:38 and the three hitches after it were skipped in silence — one of them a 454 ms frame, which
+    /// is the exact event the whole investigation was about. Captures are granted first come, first
+    /// served, and the evening's worst frames are not the first to arrive.
+    /// </para>
+    /// <para>
+    /// A reservation rather than a replacement, because a capture cannot be taken back: by the time a
+    /// worse frame arrives the earlier ETL is a written file and the ring buffer it came from is gone.
+    /// Holding two of six back for frames past <c>EffectiveExtremeFrameTimeMs</c> costs an ordinary
+    /// evening nothing — those two are the ones that went unspent in three of the last four sessions —
+    /// and it is what keeps the last hour able to record the worst frame of the night.
+    /// </para>
+    /// </remarks>
+    public int ReservedSevereCaptures { get; set; } = 2;
+
+    /// <summary>
     /// Ceiling on automatic captures inside <see cref="CaptureBudgetWindow"/>, rather than for a whole
     /// session.
     /// </summary>
@@ -671,6 +710,10 @@ public sealed record DeepCaptureOptions
             : Math.Min(AutoCaptureFrameTimeMs, 60_000);
 
         MaxAutoCapturesPerSession = Math.Clamp(MaxAutoCapturesPerSession, 0, 100);
+
+        // At least one capture has to stay reachable by an ordinary frame, or the reservation would be
+        // the ceiling and the ordinary threshold dead code.
+        ReservedSevereCaptures = Math.Clamp(ReservedSevereCaptures, 0, Math.Max(MaxAutoCapturesPerSession - 1, 0));
 
         // Never more per window than the session allows in total, which would make the window budget
         // dead code rather than the tighter of the two gates.
@@ -1356,6 +1399,17 @@ public sealed record GpuProcessMemorySample(
     }
 }
 
+/// <param name="DiskAverageLatencyMs">
+/// The slowest physical disk's own latency, not an average across them. A machine's disks are not alike
+/// — on 5 September one answered in 0.1 ms and another in 20–450 ms — and the average over both stayed
+/// below every threshold the analysis has while one of them was stalling the game half a second at a
+/// time.
+/// </param>
+/// <param name="DiskQueueLength">Queue depth on that same disk, so the two readings describe one device.</param>
+/// <param name="WorstDiskInstance">
+/// Which disk the two readings above came from, as the counter names it (<c>1 D:</c>). Null when no
+/// instance produced a reading. A latency figure nobody can attribute to a drive is not actionable.
+/// </param>
 public sealed record SystemTelemetrySample(
     DateTimeOffset Timestamp,
     double TotalCpuUsagePercent,
@@ -1366,7 +1420,18 @@ public sealed record SystemTelemetrySample(
     IReadOnlyList<ProcessActivity> TopDiskProcesses,
     double? DiskAverageLatencyMs = null,
     double? DiskQueueLength = null,
-    double? HardFaultPagesPerSecond = null) : TelemetryEvent(Timestamp, "System");
+    double? HardFaultPagesPerSecond = null,
+    string? WorstDiskInstance = null) : TelemetryEvent(Timestamp, "System")
+{
+    /// <summary>Whether the memory figures on this sample are a measurement at all.</summary>
+    /// <remarks>
+    /// Zero available megabytes is the interop call having failed, not a machine with nothing left. Every
+    /// reader of the memory figures has to skip those samples or one failed call becomes a minimum
+    /// nothing can beat, so the rule lives here rather than once per reader — the session log, the
+    /// incident summary and the paging hypothesis have to agree on whether memory was tight.
+    /// </remarks>
+    public bool HasMemoryReading => AvailableMemoryMb > 0;
+}
 
 public sealed record ProcessTelemetrySample(
     DateTimeOffset Timestamp,
@@ -1457,7 +1522,30 @@ public sealed record ArtifactEvidence(
     IReadOnlyDictionary<string, double> Metrics,
     string? SourceFile = null) : TelemetryEvent(Timestamp, "Artifact");
 
-public sealed record IncidentMarker(Guid Id, DateTimeOffset MarkedAt, IncidentSeverity Severity, string Label);
+/// <param name="EscalatedFrameAt">
+/// When the frame this incident was renamed after happened, if it was renamed. Null for an incident
+/// still describing the frame that opened it.
+/// </param>
+public sealed record IncidentMarker(
+    Guid Id,
+    DateTimeOffset MarkedAt,
+    IncidentSeverity Severity,
+    string Label,
+    DateTimeOffset? EscalatedFrameAt = null)
+{
+    /// <summary>
+    /// The moment the incident is actually about, which is the frame it is named after.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="MarkedAt"/> cannot move — the window bounds and every event collected in it hang off
+    /// it — so an escalated incident's marker time can sit most of a minute before the frame in its own
+    /// label. Anything asking "what was the machine doing when this happened" has to ask about the
+    /// frame: on 5 September the focus verdict was classified at the marker and so described a moment up
+    /// to 45 seconds away in 26 of the evening's 47 focus verdicts, each time a brief alt-tab at the
+    /// marker outranking the paging stall that actually cost the frame.
+    /// </remarks>
+    public DateTimeOffset WorstFrameAt => EscalatedFrameAt ?? MarkedAt;
+}
 
 public sealed record TimelineHighlight(DateTimeOffset Timestamp, string Category, string Summary);
 

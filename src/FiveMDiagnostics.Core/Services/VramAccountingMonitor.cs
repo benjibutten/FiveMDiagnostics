@@ -109,6 +109,20 @@ public sealed class VramAccountingMonitor
     public const long DriftBytesPerHour = 512L * 1024 * 1024;
 
     /// <summary>
+    /// Share of a row's own growth that has to be growth the card never saw before the row is drifting.
+    /// </summary>
+    /// <remarks>
+    /// The rate test alone cannot tell "this row gained memory nobody else did" from "this row and the
+    /// card gained the same memory, read a few seconds apart". Both produce a positive excess, and on a
+    /// row taking gigabytes an hour the skew between two collectors is worth gigabytes an hour too. Half
+    /// is the point at which the row gained materially more than the card rather than alongside it: the
+    /// three faults this codebase has met sit at 100% and above — <c>obs64</c>'s excess exceeded its own
+    /// growth, <c>Voicemod</c>'s was seventeen times it — and a game filling its texture budget sits at
+    /// seven percent.
+    /// </remarks>
+    private const double MinimumExcessShareOfGrowth = 0.5;
+
+    /// <summary>
     /// How long a row has to be watched before its growth rate means anything.
     /// </summary>
     /// <remarks>
@@ -284,20 +298,21 @@ public sealed class VramAccountingMonitor
     /// row's absolute value — see <c>VramBudgetMonitor</c>, which refuses instead.
     /// </para>
     /// </remarks>
-    public IReadOnlyList<DriftingRow> ObserveDrift(GpuProcessMemorySample sample)
+    public DriftReport? ObserveDrift(GpuProcessMemorySample sample)
     {
         if (!sample.IsAvailable || sample.Processes.Count == 0)
         {
-            return [];
+            return null;
         }
 
         if (_lastAdapter is not { UsedVramBytes: { } adapterBytes, IsSingleAdapterMachine: true } adapter
             || (sample.Timestamp - adapter.Timestamp).Duration() > AdapterFreshness)
         {
-            return [];
+            return null;
         }
 
         List<DriftingRow>? found = null;
+        var steady = 0;
 
         foreach (var process in sample.Processes)
         {
@@ -335,9 +350,28 @@ public sealed class VramAccountingMonitor
                 continue;
             }
 
+            // Both rates have to clear the bar: the row's own growth as well as its excess over the
+            // card's. Excess alone is satisfied by a card that gave memory back, which turns every
+            // stationary row into a drifter — on 5 September the card released 0.71 GB and the session
+            // log filled with fourteen warnings about rows that had moved 0.00 GB. A row that did not
+            // grow is not counting anybody else's memory; the card simply moved underneath it.
             var perHour = (long)(excess / elapsed.TotalHours);
-            if (perHour < DriftBytesPerHour)
+            var rowPerHour = (long)(rowGrowth / elapsed.TotalHours);
+            if (perHour < DriftBytesPerHour || rowPerHour < DriftBytesPerHour)
             {
+                steady++;
+                continue;
+            }
+
+            // And the excess has to be a real share of what the row gained, not a residual on top of
+            // growth the card agreed with. A game filling its texture budget takes 5.58 GB while the card
+            // takes 5.20 — the two moved together, and the 0.38 GB between them is the skew of two
+            // collectors that never sample at the same instant. Judged on the rates alone that residual
+            // is 1.5 GB/h and the game's own row was called drifting on 5 September, which made
+            // VramBudgetMonitor refuse to split the budget for the rest of the evening.
+            if (excess < rowGrowth * MinimumExcessShareOfGrowth)
+            {
+                steady++;
                 continue;
             }
 
@@ -345,7 +379,7 @@ public sealed class VramAccountingMonitor
             (found ??= []).Add(new DriftingRow(process, rowGrowth, cardGrowth, elapsed));
         }
 
-        return found ?? (IReadOnlyList<DriftingRow>)[];
+        return found is null ? null : new DriftReport(found, steady);
     }
 
     /// <summary>
@@ -537,6 +571,29 @@ public enum DoubleCountProof
     /// The table exceeded the card, and removing this one row landed it back on the card's own figure.
     /// </summary>
     ExplainsSurplus,
+}
+
+/// <summary>
+/// The rows that came loose in one sample, and how many were checked and found to be behaving.
+/// </summary>
+/// <remarks>
+/// The count exists so the log can account for every row without writing a line per process. The drift
+/// watch of 5 September wrote twenty warnings in a row and the fourteen uninteresting ones buried the
+/// two that mattered; a reader skips twenty identical paragraphs and reads one sentence.
+/// </remarks>
+public sealed record DriftReport(IReadOnlyList<DriftingRow> Rows, int SteadyRows)
+{
+    /// <summary>The sentence accounting for the rows that were checked and not named. Null when none were.</summary>
+    /// <remarks>
+    /// Both reasons are named because a row can be steady either way. A row growing 22 GB/h nearly in
+    /// step with the card is counted here too, and a sentence claiming it grew slower than 0.5 GB/h says
+    /// something the measurement never did.
+    /// </remarks>
+    public string? SteadySummary => SteadyRows == 0
+        ? null
+        : $"Ytterligare {SteadyRows} processrader mättes mot kortet i samma stund och räknas som stabila: de "
+            + $"växte antingen långsammare än {VramAccountingMonitor.DriftBytesPerHour / 1024d / 1024 / 1024:F1} GB/h "
+            + "eller i takt med kortets egen tillväxt. De driver inte och loggas inte var för sig.";
 }
 
 /// <summary>

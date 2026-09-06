@@ -616,6 +616,7 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
             var stacks = new CoverageTracker();
             var cpu = new CpuSampleAttribution();
             var fileOperations = new FileOperationAttribution();
+            var disk = new DiskVolumeAttribution();
             var threadWaits = new ThreadWaitAttribution();
             var samples = new CoverageTracker();
             long eventCount = 0;
@@ -648,6 +649,17 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
             // thread slept and nothing about what it was waiting for, which is where three sessions of
             // "the main thread was off the processor for 355 ms" stopped.
             kernel.DispatcherReadyThread += threadWaits.OnReadyThread;
+
+            // The disk's own service time per operation, which is the only measurement in the app that
+            // can tell a slow volume from a busy one. The path arrives separately: the disk events carry
+            // a file object key and the name table that resolves it is emitted at rundown.
+            kernel.DiskIORead += data => disk.OnDiskOperation(data, isRead: true);
+            kernel.DiskIOWrite += data => disk.OnDiskOperation(data, isRead: false);
+            kernel.FileIOName += disk.OnFileName;
+            kernel.FileIOFileCreate += disk.OnFileName;
+            kernel.FileIOFileRundown += disk.OnFileName;
+            kernel.SystemConfigLogDisk += disk.OnLogicalDisk;
+            kernel.MemoryHardFault += disk.OnHardFault;
 
             // Image loads, process names and the thread-to-process map all have to be in place before
             // the samples that need them, which they are: WPR rundown emits the already-loaded modules
@@ -852,6 +864,36 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
                 }
             }
 
+            var diskSummary = disk.Summarize(cpu);
+            if (diskSummary is not null)
+            {
+                metrics["diskHardFaults"] = diskSummary.HardFaults;
+                metrics["diskGameHardFaults"] = diskSummary.GameHardFaults;
+                metrics["diskSlowestHardFaultMs"] = Math.Round(diskSummary.SlowestHardFaultMs, 3);
+
+                if (diskSummary.SlowestOperation is { } slowest)
+                {
+                    metrics["diskSlowestOperationMs"] = Math.Round(slowest.ServiceMs, 3);
+                    metrics["diskSlowestOperationIsGame"] = slowest.IsGameProcess ? 1 : 0;
+                }
+
+                // Keyed by volume the way the per-process CPU is keyed by name, because that is the only
+                // way a string reaches an analysis whose evidence is a dictionary of doubles — and which
+                // volume was slow is the whole finding.
+                foreach (var volume in diskSummary.Volumes)
+                {
+                    metrics[$"diskVolumeOperations_{volume.Volume}"] = volume.Operations;
+                    metrics[$"diskVolumeMedianMs_{volume.Volume}"] = Math.Round(volume.MedianMs, 3);
+                    metrics[$"diskVolumeMaxMs_{volume.Volume}"] = Math.Round(volume.MaxMs, 3);
+                }
+
+                if (diskSummary.SlowestPagingOperation is { } paging)
+                {
+                    metrics[$"diskPagingReadMaxMs_{paging.Volume}"] = Math.Round(paging.ServiceMs, 3);
+                    metrics["diskPagingReadIsGame"] = paging.IsGameProcess ? 1 : 0;
+                }
+            }
+
             if (threadWait is not null)
             {
                 metrics["gameThreadWaitThreadId"] = threadWait.ThreadId;
@@ -885,6 +927,7 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
                 + BuildSpanSummary(coveredStart, coveredEnd, durationSeconds, fileSpanSeconds)
                 + (attribution is not null ? " " + attribution.Describe(vramPercent) : string.Empty)
                 + (fileSummary is not null ? " " + fileSummary.Describe() : string.Empty)
+                + (diskSummary is not null ? " " + diskSummary.Describe(threadWait?.MaxWaitMs) : string.Empty)
                 + (threadWait is not null ? " " + threadWait.Describe() : string.Empty)
                 + BuildCoverageSummary(contextSwitches, stacks, coveredStart, durationSeconds, source.EventsLost);
 

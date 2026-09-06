@@ -292,6 +292,7 @@ public sealed class AutoDeepCaptureBudget
             $"en {frameTimeMs:F0} ms hitch",
             mayOverrideCooldown: OverridesCooldownFor(frameTimeMs),
             mayOverrideRefill: SkipsRefillFor(frameTimeMs),
+            maySpendReserve: frameTimeMs >= EffectiveExtremeFrameTimeMs,
             frameTimeMs,
             out refusal);
     }
@@ -345,6 +346,7 @@ public sealed class AutoDeepCaptureBudget
             "en period där bildfrekvensen inte återhämtade sig",
             mayOverrideCooldown: false,
             mayOverrideRefill: false,
+            maySpendReserve: false,
             frameTimeMs: 0,
             out refusal);
     }
@@ -361,6 +363,7 @@ public sealed class AutoDeepCaptureBudget
             "en sammanhängande följd av tappade frames",
             mayOverrideCooldown: false,
             mayOverrideRefill: false,
+            maySpendReserve: false,
             frameTimeMs: 0,
             out refusal);
     }
@@ -399,6 +402,7 @@ public sealed class AutoDeepCaptureBudget
         string description,
         bool mayOverrideCooldown,
         bool mayOverrideRefill,
+        bool maySpendReserve,
         double frameTimeMs,
         out string? refusal)
     {
@@ -430,6 +434,21 @@ public sealed class AutoDeepCaptureBudget
                 + $"capture(s) per {window.TotalMinutes:F0} min är redan tagna, nästa plats öppnar om "
                 + $"{Math.Max(0, (freesAt - timestamp).TotalMinutes):F0} min. En frame över "
                 + $"{EffectiveOverrideFrameTimeMs:F0} ms hade gått förbi den här gränsen.";
+            return false;
+        }
+
+        // The reserve, checked after the two gates that expire so a refusal names the one that lifts
+        // first. Captures used to be granted in arrival order, which is how 5 September spent all six
+        // before 00:19 and then refused everything that came after — a 1 133 ms frame at 02:45 among
+        // them, the largest of the evening. An ordinary frame therefore stops here and leaves the last
+        // captures for the frames this session's own material calls extreme.
+        if (!maySpendReserve && _spent >= _options.MaxAutoCapturesPerSession - _options.ReservedSevereCaptures)
+        {
+            refusal = $"Deep capture hoppades över för {description}: {_spent} av sessionens budget på "
+                + $"{_options.MaxAutoCapturesPerSession} automatiska captures är tagna, och de sista "
+                + $"{_options.ReservedSevereCaptures} är reserverade för frames över "
+                + $"{EffectiveExtremeFrameTimeMs:F0} ms — så kvällens värsta hitch kan spåras även när den "
+                + "kommer sist.";
             return false;
         }
 

@@ -88,6 +88,34 @@ public sealed class SessionSummaryMeasurementTests
     }
 
     /// <summary>
+    /// The card full and the frames fine. The measurement clears VRAM rather than accusing it, and the
+    /// line has to say so first and stop being a warning.
+    /// </summary>
+    /// <remarks>
+    /// 5 September had the highest VRAM pressure of the whole investigation — half the session above the
+    /// band — with its hitches concentrated outside the band, 789 an hour against 869. The line went out
+    /// as a Warning starting "VRAM-tryck: kortet låg över 88 %" and was read as a VRAM warning for a day,
+    /// while the actual cause was a paging read.
+    /// </remarks>
+    [Fact]
+    public void ABandThatCostNothingLeadsWithTheConclusionAndIsNotAWarning()
+    {
+        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+
+        // Ten minutes at 92% with one hitch each, then ten at 70% with five.
+        Play(monitor, Start, minutes: 10, vramPercent: 92, hitchesPerMinute: 1);
+        Play(monitor, Start.AddMinutes(10), minutes: 10, vramPercent: 70, hitchesPerMinute: 5);
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report);
+        Assert.True(report!.BandCostNothing);
+        Assert.False(report.IsPressured);
+        Assert.StartsWith("Bandet kostade ingenting den här sessionen.", report.Message, StringComparison.Ordinal);
+        Assert.Contains("motbevis", report.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// An evening that never reaches the band says so, and says nothing about a gradient it has no
     /// minutes to measure.
     /// </summary>

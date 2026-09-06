@@ -200,6 +200,41 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
     private const string TraceProcessCoresPrefix = "cpuProcessCores_";
 
     /// <summary>
+    /// Prefixes under which a deep capture's per-volume disk figures arrive. The volume is part of the
+    /// key because an artifact's metrics are doubles, and which volume was slow is the finding.
+    /// </summary>
+    private const string PagingReadMaxPrefix = "diskPagingReadMaxMs_";
+
+    private const string VolumeMedianPrefix = "diskVolumeMedianMs_";
+
+    private const string VolumeOperationsPrefix = "diskVolumeOperations_";
+
+    /// <summary>
+    /// Operations a volume needs before its median is quoted as what healthy storage costs here.
+    /// </summary>
+    private const int ComparableVolumeOperations = 20;
+
+    /// <summary>
+    /// Service time at which a read out of the paging file is a stall rather than the cost of paging.
+    /// </summary>
+    /// <remarks>
+    /// Paging happens on every machine and mostly costs a fraction of a millisecond, which is why the app
+    /// has never had reason to look at it. Fifty milliseconds is three missed frames at 60 Hz and an
+    /// order of magnitude beyond what the healthy volume of the 5 September machine ever did.
+    /// </remarks>
+    private const double PagingReadStallMs = 50;
+
+    /// <summary>
+    /// How far apart a paging read and the thread's wait may be and still describe the same stall.
+    /// </summary>
+    /// <remarks>
+    /// The drive reports its own service time and the scheduler reports an off-CPU interval; five percent
+    /// covers the wake-up between them without letting an unrelated wait borrow the disk's number.
+    /// Mirrors the tolerance the ETL parser uses to write the same pairing into the trace's own summary.
+    /// </remarks>
+    private const double PagingWaitMatchTolerance = 0.05;
+
+    /// <summary>
     /// Cores a process has to hold in the trace before the incident treats it as a suspect.
     /// </summary>
     /// <remarks>
@@ -224,7 +259,12 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
 
         // Asked first, because the answer can make every other question irrelevant. A window in which
         // the game was behind another window is not a window about the game.
-        var focusState = GameFocusMonitor.Classify(incident.GetEvents<WindowFocusSample>(), incident.Marker.MarkedAt);
+        //
+        // Asked about the frame the incident is named after, not about the marker. An escalated incident
+        // keeps the marker where it was while its label moves to a worse frame up to a minute later, and
+        // classifying at the marker described the wrong moment in 26 of 47 focus verdicts on
+        // 5 September — a half-second alt-tab at the marker outranking the stall that cost the frame.
+        var focusState = GameFocusMonitor.Classify(incident.GetEvents<WindowFocusSample>(), incident.Marker.WorstFrameAt);
 
         // Process names, OBS presence, disk throughput and similar context cannot prove a frametime
         // incident on their own. In particular, two idle Discord helper processes used to become a
@@ -261,10 +301,11 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         AddResourceHypothesis(hypotheses, metrics, processSamples, artifacts, obsSamples, systemSamples, cores, correlatedThreadWait);
         AddNetworkHypothesis(hypotheses, metrics, networkProbes, networkEndpoints, artifacts, systemSamples, obsSamples);
         AddDiskHypothesis(hypotheses, metrics, processSamples, systemSamples, artifacts, correlatedThreadWait, incident.WindowStart, incident.WindowEnd);
+        AddMemoryPagingStallHypothesis(hypotheses, artifacts, systemSamples, correlatedThreadWait);
         AddExternalProcessHypothesis(hypotheses, suspectedProcesses, processSamples, systemSamples);
         AddOsLatencyHypothesis(hypotheses, metrics, artifacts, systemSamples, obsSamples);
         AddCorruptionHypothesis(hypotheses, artifacts);
-        AddNotInFocusHypothesis(hypotheses, focusState, incident.GetEvents<WindowFocusSample>(), incident.Marker.MarkedAt);
+        AddNotInFocusHypothesis(hypotheses, focusState, incident.GetEvents<WindowFocusSample>(), incident.Marker.WorstFrameAt);
 
         hypotheses = hypotheses
             .OrderByDescending(item => item.Confidence)
@@ -273,6 +314,13 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         // Kept before the fallback is inserted, so the summary can say how close the engine came rather
         // than only that it fell short.
         var runnerUp = hypotheses.FirstOrDefault();
+
+        // The verdict standing behind the winning one. It exists for GameNotInFocus, which outranks
+        // everything at 0.95 and is not an explanation: it says nobody was looking at those frames. On
+        // 5 September it silently displaced a storage stall at 0.80 in the incident that was a 455 ms
+        // read out of the paging file, and the summary said only that the game had been in the
+        // background.
+        var secondPlace = hypotheses.Skip(1).FirstOrDefault();
 
         if (hypotheses.Count == 0 || hypotheses[0].Confidence < ClassificationFloor)
         {
@@ -288,7 +336,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
 
         var highlights = BuildHighlights(incident, metrics, hypotheses.First(), artifacts, obsSamples, gpu, networkProbes, suspectedProcesses, gpuProcessMemory, composedPresentExplained);
         var top = hypotheses[0];
-        var summary = BuildSummary(top, runnerUp, metrics, obsSamples, gpu, artifacts, networkProbes, suspectedProcesses, gpuProcessMemory, composedPresentExplained);
+        var summary = BuildSummary(top, runnerUp, secondPlace, metrics, obsSamples, gpu, artifacts, networkProbes, suspectedProcesses, gpuProcessMemory, composedPresentExplained);
 
         return new IncidentAnalysis(
             hypotheses,
@@ -1224,8 +1272,21 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
 
         if (maxLatency >= 20)
         {
+            // Named, because the reading is now one disk's own and not the machine's average. "Disk
+            // latency peaked at 450 ms" on a machine whose system drive answers in a tenth of a
+            // millisecond is a sentence about a drive nobody has identified, and identifying it was the
+            // whole of the 5 September investigation.
+            var slowest = systemSamples
+                .Where(item => item.DiskAverageLatencyMs is { } latency && latency >= maxLatency)
+                .Select(item => item.WorstDiskInstance)
+                .FirstOrDefault(name => !string.IsNullOrWhiteSpace(name));
+
             confidence += 0.3;
-            evidence.Add($"Disklatensen toppade på {maxLatency:F1} ms.");
+            evidence.Add(slowest is null
+                ? $"Disklatensen toppade på {maxLatency:F1} ms."
+                : $"Disklatensen toppade på {maxLatency:F1} ms, och det var disk {slowest}. Siffran är den "
+                    + "diskens egen, inte ett medelvärde över maskinens diskar — de andra kan ha svarat på "
+                    + "bråkdelar av en millisekund samtidigt.");
         }
 
         if (maxQueue >= 2)
@@ -1344,6 +1405,131 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
     }
 
     /// <summary>
+    /// Names the case where the game's thread was waiting for Windows to fetch its own memory back off a
+    /// slow disk.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The strongest verdict the engine can reach, and the only one that can show the same figure twice
+    /// from two streams that know nothing about each other: the drive reports how long it took to answer
+    /// a read out of the paging file, and the scheduler reports how long the game's thread was off the
+    /// processor. On 5 September those were 454.116 and 454.1 ms, ten times in ten traces.
+    /// </para>
+    /// <para>
+    /// The hard fault count is what makes the pairing causal rather than coincidental. A slow paging read
+    /// somewhere on the machine is a fact about the machine; a slow paging read plus a hard fault in the
+    /// game process is the game's own thread standing in that queue.
+    /// </para>
+    /// </remarks>
+    private static void AddMemoryPagingStallHypothesis(
+        List<HypothesisScore> hypotheses,
+        IReadOnlyList<ArtifactEvidence> artifacts,
+        IReadOnlyList<SystemTelemetrySample> systemSamples,
+        CorrelatedThreadWait? correlatedThreadWait)
+    {
+        foreach (var trace in artifacts.Where(item => item.Kind == ArtifactKind.EtlTrace))
+        {
+            var gameHardFaults = trace.Metrics.GetValueOrDefault("diskGameHardFaults");
+            var paging = trace.Metrics.FirstOrDefault(entry => entry.Key.StartsWith(PagingReadMaxPrefix, StringComparison.Ordinal));
+            if (gameHardFaults < 1 || paging.Key is null || paging.Value < PagingReadStallMs)
+            {
+                continue;
+            }
+
+            var volume = paging.Key[PagingReadMaxPrefix.Length..];
+            var pagingMs = paging.Value;
+
+            // The wait this incident's own frames were matched to, when there is one. The trace's
+            // longest wait is the fallback and a weaker claim: it says the thread stalled somewhere in
+            // the retained window rather than during the frames being explained.
+            var waitMs = correlatedThreadWait?.DurationMs ?? trace.Metrics.GetValueOrDefault("gameThreadMaxWaitMs");
+            var matched = waitMs > 0 && Math.Abs(waitMs - pagingMs) <= pagingMs * PagingWaitMatchTolerance;
+
+            var evidence = new List<string>
+            {
+                $"Spelprocessen tog {gameHardFaults:F0} hårda sidfel i spåret, och den långsammaste läsningen "
+                + $"ur växlingsfilen på {volume} tog {pagingMs:F0} ms. Ett hårt sidfel är tråden som står still "
+                + "tills Windows hämtat tillbaka minne den redan hade.",
+            };
+
+            if (DescribeFastestVolume(trace.Metrics, volume) is { } comparison)
+            {
+                evidence.Add(comparison);
+            }
+
+            if (matched)
+            {
+                evidence.Add(
+                    $"Tråden låg av processorn {waitMs:F1} ms — samma millisekundtal som diskens egen tjänsttid, "
+                    + "från två mätningar som inte känner till varandra. Det är den starkaste koppling det här "
+                    + "verktyget kan visa.");
+            }
+            else
+            {
+                evidence.Add(
+                    $"Trådens längsta väntan i spåret var {waitMs:F1} ms, vilket inte matchar diskoperationen på "
+                    + "tiondelen. Sidfelen och den långsamma växlingsfilen finns i samma spår, men att just den "
+                    + "här framen väntade på just den läsningen är inte belagt.");
+            }
+
+            var lowestAvailableMb = systemSamples
+                .Where(item => item.HasMemoryReading)
+                .Select(item => item.AvailableMemoryMb)
+                .DefaultIfEmpty(0UL)
+                .Min();
+            var tightMemory = lowestAvailableMb is > 0 and < SystemMemoryReport.ComfortableAvailableMb;
+            if (tightMemory)
+            {
+                evidence.Add(
+                    $"Maskinen hade som minst {lowestAvailableMb / 1024d:F1} GB ledigt RAM i fönstret. Det är "
+                    + "därför sidorna skrevs ut till att börja med: Windows trimmar arbetsmängder när minnet "
+                    + "tryter, och spelet betalar för varje sida det sedan rör igen.");
+            }
+            else if (lowestAvailableMb == 0)
+            {
+                evidence.Add(
+                    "Ledigt RAM mättes inte i fönstret, så varför sidorna skrevs ut går inte att säga — bara att "
+                    + "de gjorde det.");
+            }
+
+            evidence.Add(
+                $"Det här är varken grafikkortet, texturbudgeten eller strömningen av spelets egna filer. "
+                + $"Åtgärden är att flytta växlingsfilen från {volume} till maskinens snabbaste disk, och att ge "
+                + "maskinen mer ledigt RAM medan spelet körs.");
+
+            // Matched, the verdict rests on two independent measurements of the same event; unmatched it
+            // is a lead, and a lead about a component nothing else in the engine looks at.
+            var confidence = matched ? (tightMemory ? 0.9 : 0.85) : 0.5;
+            hypotheses.Add(new HypothesisScore(RootCauseCategory.MemoryPagingStall, confidence, evidence));
+            return;
+        }
+    }
+
+    /// <summary>
+    /// The sentence saying what the same operation costs on the machine's healthy volume.
+    /// </summary>
+    /// <remarks>
+    /// It is what turns "a read took 454 ms" into an accusation against one drive. Null when the trace
+    /// measured no other volume busy enough for its median to mean anything, which is the honest answer:
+    /// three operations is not a claim about what a disk normally does.
+    /// </remarks>
+    private static string? DescribeFastestVolume(IReadOnlyDictionary<string, double> metrics, string slowVolume)
+    {
+        var fastest = metrics
+            .Where(entry => entry.Key.StartsWith(VolumeMedianPrefix, StringComparison.Ordinal))
+            .Select(entry => (Volume: entry.Key[VolumeMedianPrefix.Length..], MedianMs: entry.Value))
+            .Where(volume => volume.Volume != slowVolume
+                && metrics.GetValueOrDefault($"{VolumeOperationsPrefix}{volume.Volume}") >= ComparableVolumeOperations)
+            .OrderBy(volume => volume.MedianMs)
+            .FirstOrDefault();
+
+        return fastest.Volume is null
+            ? null
+            : $"{fastest.Volume} svarar på samma sorts operation på {fastest.MedianMs:F2} ms i samma spår, så det "
+                + $"är {slowVolume} som är långsam och inte lagringen i allmänhet.";
+    }
+
+    /// <summary>
     /// Rules the window out entirely when the game was not the window in front.
     /// </summary>
     /// <remarks>
@@ -1363,21 +1549,25 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
     /// named as such rather than either counted or hidden.
     /// </para>
     /// </remarks>
+    /// <param name="frameAt">
+    /// The frame this incident is named after, which is what the verdict has to be about. See
+    /// <see cref="IncidentMarker.WorstFrameAt"/>.
+    /// </param>
     private static void AddNotInFocusHypothesis(
         List<HypothesisScore> hypotheses,
         GameFocusState focusState,
         IReadOnlyList<WindowFocusSample> focusSamples,
-        DateTimeOffset markedAt)
+        DateTimeOffset frameAt)
     {
         if (focusState is GameFocusState.InPlay or GameFocusState.Unknown)
         {
             return;
         }
 
-        // The window that had the foreground at the marker, or the one that took it just after — the
+        // The window that had the foreground at that frame, or the one that took it just after — the
         // second case is the Windows key, where the cost lands before Windows finishes the handover.
         var holder = focusSamples
-            .Where(sample => !sample.GameHasFocus && sample.Timestamp <= markedAt + GameFocusMonitor.LossGrace)
+            .Where(sample => !sample.GameHasFocus && sample.Timestamp <= frameAt + GameFocusMonitor.LossGrace)
             .OrderByDescending(sample => sample.Timestamp)
             .FirstOrDefault();
 
@@ -1388,7 +1578,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         var evidence = focusState == GameFocusState.NotInFocus
             ? new List<string>
             {
-                $"Spelet låg inte i förgrunden när incidenten markerades: {named} ägde fönstret. "
+                $"Spelet låg inte i förgrunden när framen tappades ({frameAt.ToLocalTime():HH:mm:ss}): "
+                + $"{named} ägde fönstret. "
                 + "Frametiderna i fönstret beskriver ett spel i bakgrunden — nedprioriterat av schemaläggaren, "
                 + "utan skärmen och utan någon som tittade på det.",
                 "Det här är inte ett lagg i spelet och ska inte räknas som ett. Alt-tab och Windows-tangenten "
@@ -1397,7 +1588,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             : new List<string>
             {
                 $"Spelet hade nyss fått tillbaka förgrunden ({GameFocusMonitor.RegainGrace.TotalSeconds:F0} s "
-                + "eller mindre innan markeringen). Frametiderna är växlingens egen kostnad: fönstret återställs, "
+                + $"eller mindre innan framen kl. {frameAt.ToLocalTime():HH:mm:ss}). Frametiderna är växlingens "
+                + "egen kostnad: fönstret återställs, "
                 + "swapchainen byggs om och drivrutinen laddar tillbaka det som evakuerades medan spelet låg bakom.",
                 "Räknas inte som spellagg, men det är frames spelaren faktiskt såg — det är priset för att alt-tabba, "
                 + "inte ett fel i maskinen.",
@@ -1677,6 +1869,14 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
                 $"{gpu.AdapterName ?? "GPU"}: peak {gpu.PeakUtilizationPercent:F0}% util, VRAM {gpu.PeakVramUsedGb:F1}/{gpu.TotalVramGb:F1} GB ({gpu.PeakVramPercent:F0}%), NVENC {gpu.PeakEncoderPercent:F0}%."));
         }
 
+        // Unconditional, like the frame line. Free RAM is collected every second and used to reach no
+        // incident at all, which is why the paging stall of 5 September was unmeasurable afterwards
+        // despite the app having sampled its cause all evening.
+        if (DescribeSystemMemory(incident.GetEvents<SystemTelemetrySample>()) is { } memory)
+        {
+            highlights.Add(new(incident.Marker.MarkedAt, "Memory", memory));
+        }
+
         if (DescribeGpuProcessMemory(gpuProcessMemory) is { } vramOwners)
         {
             highlights.Add(new(gpuProcessMemory!.Timestamp, "VRAM per process", vramOwners));
@@ -1715,6 +1915,27 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         return highlights.OrderBy(item => item.Timestamp).ToArray();
     }
 
+    /// <summary>
+    /// The least free RAM and the highest commit inside the window, or null when nothing measured them.
+    /// </summary>
+    private static string? DescribeSystemMemory(IReadOnlyList<SystemTelemetrySample> systemSamples)
+    {
+        var measured = systemSamples.Where(item => item.HasMemoryReading).ToArray();
+        if (measured.Length == 0)
+        {
+            return null;
+        }
+
+        var lowestMb = measured.Min(item => item.AvailableMemoryMb);
+        var highestCommit = measured.Max(item => item.MemoryCommitPercent);
+        var tight = lowestMb < SystemMemoryReport.ComfortableAvailableMb
+            ? " Under 3 GB trimmar Windows arbetsmängder ut till växlingsfilen, och varje återbesök i det "
+                + "utsidade minnet kostar en diskläsning."
+            : string.Empty;
+
+        return $"Minst {lowestMb / 1024d:F1} GB ledigt RAM i fönstret, högsta commit {highestCommit:F0} %.{tight}";
+    }
+
     /// <summary>Adds the worst probe of one host class to the timeline, named as that class.</summary>
     private static void AddProbeHighlight(
         List<TimelineHighlight> highlights,
@@ -1732,9 +1953,14 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             : $"Probe mot {label} ({probe.Host}) misslyckades: {probe.FailureReason ?? "okänt fel"}."));
     }
 
+    /// <param name="secondPlace">
+    /// The verdict ranked behind <paramref name="top"/>, printed when the winner only excludes the
+    /// window rather than explaining it.
+    /// </param>
     private static string BuildSummary(
         HypothesisScore top,
         HypothesisScore? runnerUp,
+        HypothesisScore? secondPlace,
         FrameMetrics metrics,
         IReadOnlyList<ObsTelemetrySample> obsSamples,
         GpuMetrics gpu,
@@ -1796,7 +2022,32 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             return $"Insufficient evidence. {measurements}{BuildShortfallHint(runnerUp, metrics, gpu, artifacts)}";
         }
 
-        return $"Trolig rotorsak: {ToLabel(top.Category)} ({top.Confidence:P0}). {measurements}";
+        return $"Trolig rotorsak: {ToLabel(top.Category)} ({top.Confidence:P0}).{DescribeSilencedRunnerUp(top, secondPlace)} {measurements}";
+    }
+
+    /// <summary>
+    /// Names the verdict the winner pushed aside, when the winner does not explain anything.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="RootCauseCategory.GameNotInFocus"/> is not a cause and does not compete with one: it
+    /// says the frames were lost while nobody was looking, which excludes them from the session's hitch
+    /// statistics and says nothing about why they were lost. Printing it alone hid a
+    /// <see cref="RootCauseCategory.StreamingOrDiskStall"/> at 80% in the very incident that turned out
+    /// to be the evening's cause — a 455 ms read out of the paging file — and the same happened in 26 of
+    /// 47 focus verdicts that night.
+    /// </remarks>
+    private static string DescribeSilencedRunnerUp(HypothesisScore top, HypothesisScore? secondPlace)
+    {
+        if (top.Category != RootCauseCategory.GameNotInFocus
+            || secondPlace is null
+            || secondPlace.Confidence < ClassificationFloor)
+        {
+            return string.Empty;
+        }
+
+        return $" Domen utesluter fönstret ur hitchstatistiken men förklarar inte framen. Näst högst rankad "
+            + $"var {ToLabel(secondPlace.Category)} ({secondPlace.Confidence:P0}), och den står kvar: "
+            + $"{secondPlace.Evidence.FirstOrDefault() ?? "se hypoteslistan"}";
     }
 
     /// <summary>
@@ -2413,6 +2664,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             RootCauseCategory.OsOrDriverLatency => "OS/driver latency",
             RootCauseCategory.PossibleCacheOrResourceCorruption => "Possible cache/resource corruption",
             RootCauseCategory.GameNotInFocus => "Game not in focus",
+            RootCauseCategory.MemoryPagingStall => "Sidfel mot växlingsfilen (slut på RAM)",
             _ => "Insufficient evidence",
         };
     }

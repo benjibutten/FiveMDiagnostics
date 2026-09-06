@@ -44,6 +44,17 @@ internal static class IoReports
         }
     }
 
+    /// <summary>
+    /// Physical disk activity, grouped by the volume it went to.
+    /// </summary>
+    /// <remarks>
+    /// The volume is the grouping because a machine's disks are not alike and averaging them hides the
+    /// one that is broken. On 5 September C: answered thousands of operations at a median of 0.1 ms while
+    /// D: answered tens at 4–44 ms with a tail at 431–454 ms; grouped by process — which is what this
+    /// report used to do — the two volumes landed in the same row and the evening's cause was invisible.
+    /// A median and a max per volume separate a disk that is working hard from a disk that is slow, and
+    /// the named slowest operations say which file and which program the wait belonged to.
+    /// </remarks>
     private static void Disk(TraceWindow window, IReadOnlyList<IDiskActivity> activity, string targetProcess)
     {
         activity = activity
@@ -51,25 +62,63 @@ internal static class IoReports
             .ToArray();
         Console.WriteLine();
         Console.WriteLine($"  disk operations: {activity.Count} total");
-        foreach (var group in activity
-            .GroupBy(entry => entry.IssuingProcess?.ImageName ?? "?")
-            .OrderByDescending(group => group.Count())
-            .Take(8))
+
+        if (activity.Count == 0)
         {
+            return;
+        }
+
+        Console.WriteLine("    by volume:");
+        foreach (var group in activity
+            .GroupBy(Volume)
+            .OrderByDescending(group => group.Max(entry => entry.DiskServiceDuration.TotalMilliseconds)))
+        {
+            var service = group
+                .Select(entry => (double)entry.DiskServiceDuration.TotalMilliseconds)
+                .Order()
+                .ToArray();
             var megabytes = group.Sum(entry => (double)entry.Size.Bytes) / (1024 * 1024);
-            var serviceMs = group.Sum(entry => (double)entry.DiskServiceDuration.TotalMilliseconds);
-            Console.WriteLine($"    {group.Count(),6} ops  {megabytes,8:F1} MB  {serviceMs,8:F0} ms service  {group.Key}");
+            // Rounded up rather than down, so a volume with a handful of operations does not print a p95
+            // below its own median — which is what an index of (n-1)*0.95 gives for n of two or three.
+            var p95 = service[Math.Min(service.Length - 1, (int)Math.Ceiling(service.Length * 0.95) - 1)];
+            Console.WriteLine($"      {group.Key,-14} {service.Length,6} ops  {megabytes,8:F1} MB  "
+                + $"median {service[service.Length / 2],8:F2} ms  p95 {p95,8:F2} ms  "
+                + $"max {service[^1],9:F1} ms");
+        }
+
+        Console.WriteLine("    slowest operations:");
+        foreach (var entry in activity
+            .OrderByDescending(entry => entry.DiskServiceDuration.TotalMilliseconds)
+            .Take(5))
+        {
+            Console.WriteLine($"      {(double)entry.DiskServiceDuration.TotalMilliseconds,9:F1} ms  "
+                + $"{entry.Size.Bytes / 1024d,7:F0} kB  {entry.IOType,-6} "
+                + $"{entry.IssuingProcess?.ImageName ?? "?",-28} {entry.Path ?? "(unnamed)"}");
         }
 
         var target = activity.Where(entry => Matches(entry.IssuingProcess?.ImageName, targetProcess)).ToArray();
+        if (target.Length == 0)
+        {
+            return;
+        }
+
+        Console.WriteLine($"    {targetProcess} paths:");
         foreach (var group in target
             .GroupBy(entry => entry.Path ?? "?")
             .OrderByDescending(group => group.Count())
             .Take(8))
         {
             var megabytes = group.Sum(entry => (double)entry.Size.Bytes) / (1024 * 1024);
-            Console.WriteLine($"      {group.Count(),5}  {megabytes,7:F1} MB  {group.Key}");
+            var slowest = group.Max(entry => (double)entry.DiskServiceDuration.TotalMilliseconds);
+            Console.WriteLine($"      {group.Count(),5}  {megabytes,7:F1} MB  max {slowest,8:F1} ms  {group.Key}");
         }
+    }
+
+    /// <summary>The volume an operation went to, taken from its own path.</summary>
+    private static string Volume(IDiskActivity activity)
+    {
+        var path = activity.Path;
+        return path is { Length: >= 2 } && path[1] == ':' ? path[..2].ToUpperInvariant() : "(unnamed)";
     }
 
     /// <summary>

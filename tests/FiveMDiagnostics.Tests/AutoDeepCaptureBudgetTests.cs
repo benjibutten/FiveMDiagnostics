@@ -337,6 +337,54 @@ public sealed class AutoDeepCaptureBudgetTests
         Assert.Contains("budget", refusal!, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// Ordinary hitches cannot spend the whole session's budget, so the evening's worst frame still has
+    /// a capture available when it arrives last.
+    /// </summary>
+    /// <remarks>
+    /// On 5 September the budget ran out at 00:19 and everything after it was refused — a 1 133 ms frame
+    /// at 02:45 among them, the largest of the evening. Captures were granted first come, first served,
+    /// and the worst frames are not the first to arrive.
+    /// </remarks>
+    [Fact]
+    public void OrdinaryHitchesCannotSpendTheReserveHeldForTheWorstFrame()
+    {
+        var budget = new AutoDeepCaptureBudget(Options(item => item.MaxAutoCapturesPerWindow = 100));
+        var timestamp = Start;
+
+        // Four ordinary hitches, an hour apart so nothing but the reserve can be refusing them.
+        for (var i = 0; i < 4; i++)
+        {
+            Assert.True(budget.TryReserve(timestamp, frameTimeMs: 180, out _));
+            timestamp = timestamp.AddHours(1);
+        }
+
+        Assert.False(budget.TryReserve(timestamp, frameTimeMs: 180, out var refusal));
+        Assert.Contains("reserverade", refusal!, StringComparison.Ordinal);
+
+        // And the frame the reserve exists for gets both of them.
+        Assert.True(budget.TryReserve(timestamp, frameTimeMs: 1133, out _));
+        Assert.True(budget.TryReserve(timestamp.AddHours(1), frameTimeMs: 454, out _));
+        Assert.Equal(0, budget.Remaining);
+    }
+
+    /// <summary>
+    /// The reserve may never be the whole budget. An ordinary frame has to stay able to reach a capture
+    /// however the setting is hand-edited.
+    /// </summary>
+    [Fact]
+    public void TheReserveAlwaysLeavesOneCaptureForAnOrdinaryFrame()
+    {
+        var options = Options(item =>
+        {
+            item.MaxAutoCapturesPerSession = 3;
+            item.ReservedSevereCaptures = 9;
+        });
+
+        Assert.Equal(2, options.ReservedSevereCaptures);
+        Assert.True(new AutoDeepCaptureBudget(options).TryReserve(Start, frameTimeMs: 180, out _));
+    }
+
     [Fact]
     public void TurningAutoCaptureOffRestoresTheOldBehaviour()
     {

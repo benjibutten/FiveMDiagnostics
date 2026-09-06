@@ -69,6 +69,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private SlowFrameWaitProfile? _slowFrameWaits;
     private GameFocusMonitor? _gameFocus;
     private AntiCheatCostMonitor? _antiCheatCost;
+    private SystemMemoryMonitor? _systemMemory;
     private IncidentVerdictTally? _verdicts;
     private GameGraphicsSettingsMonitor? _gameSettings;
 
@@ -342,6 +343,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _slowFrameWaits = new SlowFrameWaitProfile();
             _gameFocus = new GameFocusMonitor(Environment?.DisplayRefreshRateHz);
             _antiCheatCost = new AntiCheatCostMonitor();
+            _systemMemory = new SystemMemoryMonitor();
             _verdicts = new IncidentVerdictTally();
             _liveVram = new LiveVramTracker();
 
@@ -428,7 +430,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             ApplyGameSettingsToMonitors();
 
             _analysisTask = Task.Run(() => AnalysisLoopAsync(_analysisChannel.Reader));
-            _pumpTask = Task.Run(() => PumpAsync(_channel.Reader, _sessionCts.Token));
+            _pumpTask = Task.Run(() => PumpAsync(_channel.Reader));
             _finalizeTask = Task.Run(() => FinalizeLoopAsync(_sessionCts.Token));
             _collectorTasks = _collectors.Select(collector => Task.Run(() => RunCollectorSafeAsync(collector, context, _sessionCts.Token))).ToArray();
             _isSessionActive = true;
@@ -517,6 +519,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         _slowFrameWaits = null;
         _gameFocus = null;
         _antiCheatCost = null;
+        _systemMemory = null;
         _verdicts = null;
         _gameSettings = null;
         _nextGameSettingsCheck = DateTimeOffset.MaxValue;
@@ -821,6 +824,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// names something fixable before the next session. Every session so far has warned only about
     /// processes whose VRAM grew, which is silent on the evening where the memory was taken before the
     /// game started — and that was the evening.
+    /// <para>
+    /// Info when the minutes inside the band hitched less than the minutes outside it. That is the
+    /// measurement clearing VRAM rather than accusing it, and <see cref="VramPressureBandReport.IsPressured"/>
+    /// says so.
+    /// </para>
     /// </remarks>
     private void FinalizeVramPressure(bool final)
     {
@@ -954,7 +962,29 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         FinalizeSlowFrameWaits(final);
         FinalizeGameFocus(final);
         FinalizeAntiCheatCost(final);
+        FinalizeSystemMemory(final);
         FinalizeVerdicts(final);
+    }
+
+    /// <summary>
+    /// Writes how little RAM the machine had, which the interim lines already report on a cadence.
+    /// </summary>
+    /// <remarks>
+    /// Repeated at session end so the last line of a journal carries the session's own minimum. The
+    /// cadence lines each describe the session so far, and the interesting one is whichever came after
+    /// the worst minute.
+    /// </remarks>
+    private void FinalizeSystemMemory(bool final)
+    {
+        if (_systemMemory?.Summary() is { } report && ShouldWriteSummary("SystemMemory", report.Message))
+        {
+            Report(report.IsTight ? StatusLevel.Warning : StatusLevel.Info, "SystemMemory", report.Message);
+        }
+
+        if (final)
+        {
+            _systemMemory = null;
+        }
     }
 
     /// <summary>Whether this summary says anything its own last line did not.</summary>
@@ -1462,9 +1492,17 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
         // After the annotation rather than before it: a row already proved impossible needs no second
         // verdict, and the drift watch reads the same adapter reading the annotation just used.
-        foreach (var drifting in accounting.ObserveDrift(annotated))
+        if (accounting.ObserveDrift(annotated) is { } drift)
         {
-            Report(StatusLevel.Warning, "GpuProcessMemory.Accounting", drifting.Message);
+            foreach (var row in drift.Rows)
+            {
+                Report(StatusLevel.Warning, "GpuProcessMemory.Accounting", row.Message);
+            }
+
+            if (drift.SteadySummary is { } steady)
+            {
+                Report(StatusLevel.Info, "GpuProcessMemory.Accounting", steady);
+            }
         }
 
         foreach (var row in newlyProven)
@@ -1644,9 +1682,34 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         LiveVramUpdated?.Invoke(this, snapshot);
     }
 
-    private async Task PumpAsync(ChannelReader<TelemetryEvent> reader, CancellationToken cancellationToken)
+    /// <summary>
+    /// Drains the telemetry channel until the writer says there is no more, rather than until the
+    /// session token fires.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="StopSessionAsync"/> cancels the token, waits for the collectors, and only then
+    /// completes the writer — so a pump that observed the token abandoned whatever was still queued at
+    /// the moment of the cancel, and the exception it threw was caught and discarded one frame later.
+    /// Everything in that queue was lost: the ring buffer never saw it, no incident window collected it,
+    /// and nothing reached the journal.
+    /// </para>
+    /// <para>
+    /// It is the tail of a session that goes, which is where a stop usually happens — somebody closes
+    /// the app because the game just froze. The end-to-end test for a dropped-frame freeze near the end
+    /// of its timeline failed about one run in three for exactly this reason, on a queue of a few
+    /// thousand events; a real session's queue is shorter and loses less, but it loses it the same way.
+    /// </para>
+    /// <para>
+    /// Completion is guaranteed on both teardown paths — <see cref="StopSessionAsync"/> and
+    /// <c>AbortStartAsync</c> both complete the writer after the collectors have stopped — so this
+    /// terminates. <c>AnalysisLoopAsync</c> has drained on completion rather than on cancellation since
+    /// it was written, and for the same reason.
+    /// </para>
+    /// </remarks>
+    private async Task PumpAsync(ChannelReader<TelemetryEvent> reader)
     {
-        while (await reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+        while (await reader.WaitToReadAsync(CancellationToken.None).ConfigureAwait(false))
         {
             while (reader.TryRead(out var telemetryEvent))
             {
@@ -1662,6 +1725,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
                 if (telemetryEvent is SystemTelemetrySample systemSample)
                 {
+                    if (_systemMemory?.Observe(systemSample) is { } memory)
+                    {
+                        Report(memory.IsTight ? StatusLevel.Warning : StatusLevel.Info, "SystemMemory", memory.Message);
+                    }
+
                     SystemTelemetryUpdated?.Invoke(this, systemSample);
                 }
                 else if (telemetryEvent is GpuTelemetrySample gpuSample)

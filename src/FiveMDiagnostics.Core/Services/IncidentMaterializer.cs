@@ -140,6 +140,11 @@ public sealed class IncidentMaterializer
             {
                 Severity = severity > open.Marker.Severity ? severity : open.Marker.Severity,
                 Label = LabelWithFrameTime(label, open.Marker.MarkedAt, timestamp),
+
+                // Carried as a field and not only in the label's text. The analysis has to classify at
+                // the frame it is explaining, and reading a time back out of a formatted label is not a
+                // way to do that.
+                EscalatedFrameAt = timestamp,
             };
 
             open.Marker = escalated;

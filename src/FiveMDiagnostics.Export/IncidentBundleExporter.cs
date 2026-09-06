@@ -348,6 +348,10 @@ public sealed class IncidentBundleExporter : IIncidentExporter
         yield return ("availableMemoryMb", system.AvailableMemoryMb.ToString(CultureInfo.InvariantCulture));
         yield return ("diskAverageLatencyMs", system.DiskAverageLatencyMs?.ToString("F2", CultureInfo.InvariantCulture) ?? string.Empty);
         yield return ("diskQueueLength", system.DiskQueueLength?.ToString("F2", CultureInfo.InvariantCulture) ?? string.Empty);
+
+        // Which disk the two figures above came from. They are one physical disk's own readings rather
+        // than an average over the machine's, and without the name the bundle cannot say which.
+        yield return ("worstDiskInstance", system.WorstDiskInstance ?? string.Empty);
         yield return ("hardFaultPagesPerSecond", system.HardFaultPagesPerSecond?.ToString("F2", CultureInfo.InvariantCulture) ?? string.Empty);
         yield return ("topCpuProcesses", string.Join(';', system.TopCpuProcesses.Select(item => FormattableString.Invariant($"{item.ProcessName}:{item.CpuPercent:F1}%"))));
         yield return ("topDiskProcesses", string.Join(';', system.TopDiskProcesses.Select(item => FormattableString.Invariant($"{item.ProcessName}:{item.IoBytesPerSecond}"))));
