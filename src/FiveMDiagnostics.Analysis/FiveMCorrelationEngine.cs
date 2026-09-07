@@ -19,6 +19,55 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
     private const double VramPressurePercent = 90;
     private const double VramCriticalPercent = 95;
 
+    /// <summary>Utilization at or below which the card is not computing anything.</summary>
+    private const double StalledGpuUtilizationPercent = 5;
+
+    /// <summary>
+    /// Memory bandwidth at or below which the card is not moving anything either.
+    /// </summary>
+    /// <remarks>
+    /// The reading that separates a card under load from a card that has stopped, and until now nothing
+    /// in the app read it at all. NVML reports it beside utilization every half second and the column has
+    /// been written to <c>gpu_*.csv</c> for the whole investigation. On 6 September it went to 0 for over
+    /// a second while utilization went to 2 %, which is what made that evening's verdict unambiguous
+    /// instead of an argument about a busy GPU.
+    /// </remarks>
+    private const double StalledGpuBandwidthPercent = 3;
+
+    /// <summary>
+    /// Utilization the window has to reach somewhere before a zero reading means anything.
+    /// </summary>
+    /// <remarks>
+    /// A card that never did any work in the window is idle, not stalled — a loading screen, a minimised
+    /// game, a session paused. Requiring the same window to show the card working is what keeps the rule
+    /// describing a stop rather than a quiet evening.
+    /// </remarks>
+    private const double WorkingGpuUtilizationPercent = 25;
+
+    /// <summary>How far before the frame the VRAM step is looked for.</summary>
+    /// <remarks>
+    /// The step measured on 6 September took one second — 87.4 % to 88.8 % — and the card was above the
+    /// band for three seconds before the frame. Ten seconds covers that several times over and is short
+    /// enough that it cannot reach back into an unrelated excursion.
+    /// </remarks>
+    private static readonly TimeSpan ResidencyRunUp = TimeSpan.FromSeconds(10);
+
+    /// <summary>Prefix under which a trace names what the thread that blocked the game was executing.</summary>
+    private const string BlockerModuleCoresPrefix = "gameThreadBlockerCores_";
+
+    /// <summary>
+    /// Modules the graphics driver runs in user mode, which is where a render thread waiting for
+    /// residency spins.
+    /// </summary>
+    /// <remarks>
+    /// Short on purpose, like the glossary the traces' own summaries use. Two of these were measured on
+    /// the blocking thread of 6 September — <c>d3d11.dll</c> at 12 % of its samples and
+    /// <c>nvwgf2umx.dll</c> at 5 % — and the other two are where the same thread runs on a machine
+    /// presenting through D3D12 or DXGI. A module outside the list carries no signal either way.
+    /// </remarks>
+    private static readonly string[] GraphicsDriverModules =
+        ["d3d11.dll", "d3d12.dll", "dxgi.dll", "nvwgf2umx.dll"];
+
     /// <summary>Ceiling for a storage verdict backed by the disk counters that were supposed to measure it.</summary>
     private const double MeasuredConfidenceCeiling = 0.88;
 
@@ -225,6 +274,27 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
     private const double PagingReadStallMs = 50;
 
     /// <summary>
+    /// Latency at which a physical disk is queueing rather than answering.
+    /// </summary>
+    /// <remarks>
+    /// The level the 6 September review set for the machine's own storage — "slowest disk operation in a
+    /// trace: under 20 ms" — and an order of magnitude above what its NVMe answers in, which is 0.03 to
+    /// 0.06 ms across twelve thousand operations. A figure below this on the disk line is the sentence
+    /// that clears storage, which is most of what the line is for.
+    /// </remarks>
+    private const double SlowDiskLatencyMs = 20;
+
+    /// <summary>
+    /// Share of the card's capacity at which the per-process table is describing a full card.
+    /// </summary>
+    /// <remarks>
+    /// Not the eviction threshold and deliberately higher than it: <see cref="VramPressurePercent"/> is
+    /// where the adapter's own occupancy starts to matter, and this is where the processes alone account
+    /// for the whole card. On 6 September that sum reached 10.2 GB of 10.0.
+    /// </remarks>
+    private const double CardFullShare = 0.95;
+
+    /// <summary>
     /// How far apart a paging read and the thread's wait may be and still describe the same stall.
     /// </summary>
     /// <remarks>
@@ -296,6 +366,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
 
         AddThreadWaitHypothesis(hypotheses, correlatedThreadWait, metrics);
         AddVramHypothesis(hypotheses, metrics, gpu, correlatedThreadWait, gpuProcessMemory, videoMemory);
+        AddGpuResidencyStallHypothesis(hypotheses, gpuSamples, frameSamples, gpu, artifacts);
         AddObsHypothesis(hypotheses, metrics, obsSamples, gpu);
         AddGpuHypothesis(hypotheses, metrics, obsSamples, systemSamples, gpu, correlatedThreadWait);
         AddResourceHypothesis(hypotheses, metrics, processSamples, artifacts, obsSamples, systemSamples, cores, correlatedThreadWait);
@@ -334,7 +405,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         // and the window mode can have moved twice since these frames were presented.
         var composedPresentExplained = ComposedPresentExplainedAt?.Invoke(incident.Marker.MarkedAt) ?? false;
 
-        var highlights = BuildHighlights(incident, metrics, hypotheses.First(), artifacts, obsSamples, gpu, networkProbes, suspectedProcesses, gpuProcessMemory, composedPresentExplained);
+        var highlights = BuildHighlights(incident, metrics, hypotheses.First(), artifacts, obsSamples, gpu, networkProbes, suspectedProcesses, gpuProcessMemory, focusState, composedPresentExplained);
         var top = hypotheses[0];
         var summary = BuildSummary(top, runnerUp, secondPlace, metrics, obsSamples, gpu, artifacts, networkProbes, suspectedProcesses, gpuProcessMemory, composedPresentExplained);
 
@@ -584,11 +655,23 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
     /// The largest holders of VRAM as one sentence, or null when the breakdown was not collected.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Three entries, and only those holding at least a tenth of a gigabyte. The tail is a dozen
     /// processes with a few megabytes of desktop composition each, and listing them turns the one line
     /// that answers "what do I close" into something nobody reads.
+    /// </para>
+    /// <para>
+    /// The sum is the finding, and for six sessions the line printed the parts without it. On
+    /// 6 September the game held 8.4 GB, the desktop 1.0 and the stream stack 0.8 on a 10 GB card: three
+    /// unremarkable rows that add up to more card than there is, which is the whole of that evening's
+    /// verdict said before anybody read a GPU log by hand.
+    /// </para>
     /// </remarks>
-    private static string? DescribeGpuProcessMemory(GpuProcessMemorySample? sample)
+    /// <param name="totalVramGb">
+    /// The card's own capacity, which is what the sum has to be read against. Zero when the adapter was
+    /// not measured, and the sum is then left off rather than compared against nothing.
+    /// </param>
+    private static string? DescribeGpuProcessMemory(GpuProcessMemorySample? sample, double totalVramGb)
     {
         if (sample is null)
         {
@@ -601,7 +684,30 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             .Select(process => $"{process.ProcessName} {process.DedicatedGigabytes:F1} GB")
             .ToArray();
 
-        return owners.Length > 0 ? string.Join(", ", owners) + "." : null;
+        if (owners.Length == 0)
+        {
+            return null;
+        }
+
+        var line = string.Join(", ", owners) + ".";
+        if (totalVramGb <= 0)
+        {
+            return line;
+        }
+
+        // The whole believable table rather than the three rows named, so the figure answers how full the
+        // card is and not how full the three largest made it. Deliberately not AccountedDedicatedBytes,
+        // which is every process on the adapter: that one is the reconciliation figure and it still
+        // contains the rows this session has proved count the same memory twice, which is gigabytes on
+        // the machine under investigation and would fire "the card is full" on a card that is not. The
+        // twenty-five largest holders minus the unbelievable ones understate by a tail of a few
+        // megabytes, which is the safe direction for a verdict with a threshold.
+        var sumGb = sample.TotalDedicatedBytes / 1024d / 1024 / 1024;
+        var verdict = sumGb >= totalVramGb * CardFullShare
+            ? " Kortet är fullt — det är vid den nivån drivrutinen gör plats genom att evakuera ytor över PCIe."
+            : string.Empty;
+
+        return $"{line} Summa {sumGb:F1} av {totalVramGb:F1} GB.{verdict}";
     }
 
     /// <summary>
@@ -734,10 +840,123 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             }
         }
 
-        evidence.Add(DescribeGpuProcessMemory(gpuProcessMemory) is { } owners
+        evidence.Add(DescribeGpuProcessMemory(gpuProcessMemory, gpu.TotalVramGb) is { } owners
             ? $"Fördelningen vid trycket: {owners}"
             : "Obs: VRAM mäts per grafikkort, inte per process, så andra program bidrar till siffran.");
         hypotheses.Add(new HypothesisScore(RootCauseCategory.GpuVramPressure, Math.Min(confidence, 0.95), evidence));
+    }
+
+    /// <summary>
+    /// The driver stopping the card to make room in VRAM, rather than the card merely being full.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Three signals, each from an instrument that knows nothing about the others, and the same shape as
+    /// <see cref="RootCauseCategory.MemoryPagingStall"/>: a reading in which the card's utilization and
+    /// its memory bandwidth are both at the floor, VRAM stepping into the band in the seconds before it,
+    /// and the game's main thread blocked by a thread executing inside the graphics driver. The first is
+    /// required — it is the observation, and without it the other two are the correlation
+    /// <see cref="AddVramHypothesis"/> already reports. The other two are what turn it into a mechanism.
+    /// </para>
+    /// <para>
+    /// Anchored on the worst frame of the window rather than on the marker, for the reason the focus
+    /// verdict is: an escalated incident's marker can sit most of a minute from the frame it is named
+    /// after, and the card's readings around the marker then describe a different moment entirely.
+    /// </para>
+    /// </remarks>
+    private static void AddGpuResidencyStallHypothesis(
+        List<HypothesisScore> hypotheses,
+        IReadOnlyList<GpuTelemetrySample> gpuSamples,
+        IReadOnlyList<FrameTelemetrySample> frameSamples,
+        GpuMetrics gpu,
+        IReadOnlyList<ArtifactEvidence> artifacts)
+    {
+        if (!gpu.HasData || gpu.PeakUtilizationPercent < WorkingGpuUtilizationPercent)
+        {
+            return;
+        }
+
+        var worstFrame = frameSamples.OrderByDescending(frame => frame.FrameTimeMs).FirstOrDefault();
+        if (worstFrame is null || worstFrame.FrameTimeMs < SlowFrameFloorMs)
+        {
+            return;
+        }
+
+        var at = worstFrame.Timestamp;
+        var available = gpuSamples.Where(sample => sample.IsAvailable).ToArray();
+
+        // Both readings required, and the pairing allowed the same clock skew a thread wait is: the
+        // frame's timestamp comes from PresentMon's anchor and the adapter's from the wall clock.
+        var stopped = available
+            .Where(sample => (sample.Timestamp - at).Duration().TotalMilliseconds <= AnchorSkewToleranceMs)
+            .FirstOrDefault(sample => sample.UtilizationPercent is { } utilization
+                && utilization <= StalledGpuUtilizationPercent
+                && sample.MemoryBandwidthUtilizationPercent is { } bandwidth
+                && bandwidth <= StalledGpuBandwidthPercent);
+        if (stopped is null)
+        {
+            return;
+        }
+
+        var runUp = available
+            .Where(sample => sample.VramUsagePercent is not null
+                && sample.Timestamp <= at
+                && at - sample.Timestamp <= ResidencyRunUp)
+            .Select(sample => sample.VramUsagePercent!.Value)
+            .ToArray();
+        var peakVram = runUp.DefaultIfEmpty(0).Max();
+        var risePercent = runUp.Length > 0 ? peakVram - runUp.Min() : 0;
+        var vramInBand = peakVram >= VramPressureBandMonitor.BandPercent;
+
+        var driverModules = artifacts
+            .Where(item => item.Kind == ArtifactKind.EtlTrace)
+            .SelectMany(item => item.Metrics)
+            .Where(entry => entry.Value > 0 && entry.Key.StartsWith(BlockerModuleCoresPrefix, StringComparison.Ordinal))
+            .Select(entry => entry.Key[BlockerModuleCoresPrefix.Length..])
+            .Where(module => GraphicsDriverModules.Contains(module, StringComparer.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        var confidence = 0.5;
+        var evidence = new List<string>
+        {
+            $"Kortet slutade räkna kl. {stopped.Timestamp.ToLocalTime():HH:mm:ss}: utnyttjande "
+            + $"{stopped.UtilizationPercent:F0} % och minnesbandbredd "
+            + $"{stopped.MemoryBandwidthUtilizationPercent:F0} % i samma mätpunkt, "
+            + $"{(at - stopped.Timestamp).Duration().TotalMilliseconds:F0} ms från framen på "
+            + $"{worstFrame.FrameTimeMs:F0} ms. Ett hårt belastat kort har bandbredd; ett kort som står "
+            + "still har ingen — det är den siffran som skiljer en överbelastad GPU från en stannad.",
+        };
+
+        if (vramInBand)
+        {
+            confidence += 0.2;
+            var rise = risePercent >= 0.5
+                ? $", efter en uppgång på {risePercent:F1} procentenheter under de sista "
+                    + $"{ResidencyRunUp.TotalSeconds:F0} sekunderna"
+                : string.Empty;
+            evidence.Add(
+                $"VRAM låg på {peakVram:F1} % strax före framen{rise}. Över "
+                + $"{VramPressureBandMonitor.BandPercent:F0} % är det inte längre kortet som fylls, det är "
+                + "drivrutinen som måste göra plats innan nästa yta får plats i minnet.");
+        }
+
+        if (driverModules.Length > 0)
+        {
+            confidence += 0.25;
+            evidence.Add(
+                $"Spelets huvudtråd väntade på en tråd som låg i {string.Join(" och ", driverModules)} — "
+                + "spelets egen rendertråd, inne i drivrutinen och på processorn hela tiden. Den snurrar "
+                + "alltså i D3D11 medan kortet inte räknar någonting, vilket är hur residenshantering ser "
+                + "ut från processorns håll.");
+        }
+
+        evidence.Add(
+            "Åtgärden är att ta minne av kortet — texturbudgeten, webbkällor, ett fönster mindre — inte "
+            + "att leta efter en process som växer. Ingen enskild process gjorde något fel; de fick "
+            + "tillsammans inte plats.");
+
+        hypotheses.Add(new HypothesisScore(RootCauseCategory.GpuResidencyStall, Math.Min(confidence, 0.95), evidence));
     }
 
     private static void AddObsHypothesis(List<HypothesisScore> hypotheses, FrameMetrics metrics, IReadOnlyList<ObsTelemetrySample> obsSamples, GpuMetrics gpu)
@@ -1564,16 +1783,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             return;
         }
 
-        // The window that had the foreground at that frame, or the one that took it just after — the
-        // second case is the Windows key, where the cost lands before Windows finishes the handover.
-        var holder = focusSamples
-            .Where(sample => !sample.GameHasFocus && sample.Timestamp <= frameAt + GameFocusMonitor.LossGrace)
-            .OrderByDescending(sample => sample.Timestamp)
-            .FirstOrDefault();
-
-        var named = holder is null || string.IsNullOrWhiteSpace(holder.ForegroundProcessName)
-            ? "ett annat fönster"
-            : holder.ForegroundProcessName;
+        var named = ForegroundHolderAt(focusSamples, frameAt);
 
         var evidence = focusState == GameFocusState.NotInFocus
             ? new List<string>
@@ -1817,11 +2027,16 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         IReadOnlyList<NetworkProbeSample> probes,
         IReadOnlyList<SuspectedProcessImpact> suspectedProcesses,
         GpuProcessMemorySample? gpuProcessMemory,
+        GameFocusState focusState,
         bool composedPresentExplained)
     {
+        // Local time, because the label beside it is already local. The label formats its own "kl."
+        // suffix from ToLocalTime and the marker time did not, so the worst incident of 6 September read
+        // "Auto: 425 ms frame (baslinje 16,9 ms) kl. 00:14:01 markerad 22:13:49" — two hours apart in the
+        // same sentence, describing two moments twelve seconds apart.
         var highlights = new List<TimelineHighlight>
         {
-            new(incident.Marker.MarkedAt, "Marker", $"{incident.Marker.Label} markerad {incident.Marker.MarkedAt:HH:mm:ss}."),
+            new(incident.Marker.MarkedAt, "Marker", $"{incident.Marker.Label} markerad {incident.Marker.MarkedAt.ToLocalTime():HH:mm:ss}."),
             new(incident.Marker.MarkedAt, "Frame", $"Baseline {metrics.BaselineFrameTime:F1} ms, P95 {metrics.P95FrameTime:F1} ms, P99 {metrics.P99FrameTime:F1} ms, {metrics.SpikeCount} spikes över {metrics.SpikeThresholdMs:F0} ms."),
         };
 
@@ -1872,12 +2087,26 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         // Unconditional, like the frame line. Free RAM is collected every second and used to reach no
         // incident at all, which is why the paging stall of 5 September was unmeasurable afterwards
         // despite the app having sampled its cause all evening.
-        if (DescribeSystemMemory(incident.GetEvents<SystemTelemetrySample>()) is { } memory)
+        var systemSamples = incident.GetEvents<SystemTelemetrySample>();
+        if (DescribeSystemMemory(systemSamples) is { } memory)
         {
             highlights.Add(new(incident.Marker.MarkedAt, "Memory", memory));
         }
 
-        if (DescribeGpuProcessMemory(gpuProcessMemory) is { } vramOwners)
+        // Unconditional for the same reason, and it is the same failure one instrument later: the disk
+        // counters were collected per physical disk all through 6 September and reached no incident, so
+        // six windows were ranked as storage stalls without naming a drive or a latency.
+        if (DescribeDisk(systemSamples) is { } disk)
+        {
+            highlights.Add(new(incident.Marker.MarkedAt, "Disk", disk));
+        }
+
+        if (DescribeFocus(focusState, incident.GetEvents<WindowFocusSample>(), incident.Marker.WorstFrameAt) is { } focus)
+        {
+            highlights.Add(new(incident.Marker.WorstFrameAt, "Focus", focus));
+        }
+
+        if (DescribeGpuProcessMemory(gpuProcessMemory, gpu.TotalVramGb) is { } vramOwners)
         {
             highlights.Add(new(gpuProcessMemory!.Timestamp, "VRAM per process", vramOwners));
         }
@@ -1934,6 +2163,102 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             : string.Empty;
 
         return $"Minst {lowestMb / 1024d:F1} GB ledigt RAM i fönstret, högsta commit {highestCommit:F0} %.{tight}";
+    }
+
+    /// <summary>
+    /// The slowest physical disk inside the window, or null when no sample carried the counters.
+    /// </summary>
+    /// <remarks>
+    /// Built like the memory line above and added for the same reason it was: the figures were collected
+    /// and reached nothing. <see cref="SystemTelemetrySample"/> has carried latency, queue depth and the
+    /// name of the slowest disk since 5 September, and six incidents of the following evening were still
+    /// ranked <see cref="RootCauseCategory.StreamingOrDiskStall"/> without a drive or a millisecond
+    /// anywhere in their timeline. The worst sample rather than a mean over the window, because the
+    /// sample already holds the worst disk rather than a mean over the machine's disks, and for the same
+    /// reason: a stall is an excursion and an average over ninety seconds hides it.
+    /// </remarks>
+    private static string? DescribeDisk(IReadOnlyList<SystemTelemetrySample> systemSamples)
+    {
+        var measured = systemSamples.Where(item => item.DiskAverageLatencyMs is not null).ToArray();
+        if (measured.Length == 0)
+        {
+            return null;
+        }
+
+        var worst = measured.OrderByDescending(item => item.DiskAverageLatencyMs!.Value).First();
+        var latencyMs = worst.DiskAverageLatencyMs!.Value;
+        var disk = string.IsNullOrWhiteSpace(worst.WorstDiskInstance) ? "okänd disk" : worst.WorstDiskInstance;
+        var queue = worst.DiskQueueLength is { } depth ? $", kö {depth:F1}" : string.Empty;
+
+        var hardFaults = systemSamples
+            .Where(item => item.HardFaultPagesPerSecond is not null)
+            .Select(item => item.HardFaultPagesPerSecond!.Value)
+            .DefaultIfEmpty(double.NaN)
+            .Max();
+        var faults = double.IsNaN(hardFaults)
+            ? string.Empty
+            : $" Sidinläsningar högst {hardFaults:F0}/s.";
+
+        var verdict = latencyMs >= SlowDiskLatencyMs
+            ? $" Över {SlowDiskLatencyMs:F0} ms per operation är en disk som köar, inte en som svarar."
+            : string.Empty;
+
+        return $"Långsammaste disk i fönstret: {disk} på {latencyMs:F1} ms{queue}.{faults}{verdict}";
+    }
+
+    /// <summary>
+    /// Whether the game owned the foreground at the frame the incident is named after.
+    /// </summary>
+    /// <remarks>
+    /// The verdict is already decided on this and the timeline said nothing about it either way. Of the
+    /// 140 incidents of 6 September, 92 were classified as game lag on focus readings the timeline
+    /// carried 18 to 23 of and printed none of; this is the line that makes that verdict checkable by
+    /// somebody reading the report rather than the code.
+    /// </remarks>
+    private static string? DescribeFocus(
+        GameFocusState focusState,
+        IReadOnlyList<WindowFocusSample> focusSamples,
+        DateTimeOffset frameAt)
+    {
+        // Silence when nothing measured it, rather than a line saying the game was in front. The monitor
+        // fails open by design, and a timeline that printed that default as an observation would be
+        // stating the absence of a collector as evidence about the window.
+        if (focusSamples.Count == 0 || focusState == GameFocusState.Unknown)
+        {
+            return null;
+        }
+
+        var at = $"kl. {frameAt.ToLocalTime():HH:mm:ss}";
+
+        return focusState switch
+        {
+            GameFocusState.InPlay =>
+                $"Spelet låg i förgrunden vid den värsta framen ({at}); frametiderna beskriver spelet som spelades.",
+            GameFocusState.Settling =>
+                $"Spelet hade just fått tillbaka förgrunden vid den värsta framen ({at}) — inom "
+                + $"{GameFocusMonitor.RegainGrace.TotalSeconds:F0} s efter en växling, och den kostnaden är växlingens.",
+            _ =>
+                $"Spelet låg inte i förgrunden vid den värsta framen ({at}): "
+                + $"{ForegroundHolderAt(focusSamples, frameAt)} ägde fönstret.",
+        };
+    }
+
+    /// <summary>
+    /// The window that had the foreground at that frame, or the one that took it just after.
+    /// </summary>
+    /// <remarks>
+    /// The second case is the Windows key, where the cost lands before Windows finishes the handover.
+    /// </remarks>
+    private static string ForegroundHolderAt(IReadOnlyList<WindowFocusSample> focusSamples, DateTimeOffset frameAt)
+    {
+        var holder = focusSamples
+            .Where(sample => !sample.GameHasFocus && sample.Timestamp <= frameAt + GameFocusMonitor.LossGrace)
+            .OrderByDescending(sample => sample.Timestamp)
+            .FirstOrDefault();
+
+        return holder is null || string.IsNullOrWhiteSpace(holder.ForegroundProcessName)
+            ? "ett annat fönster"
+            : holder.ForegroundProcessName;
     }
 
     /// <summary>Adds the worst probe of one host class to the timeline, named as that class.</summary>
@@ -2665,6 +2990,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             RootCauseCategory.PossibleCacheOrResourceCorruption => "Possible cache/resource corruption",
             RootCauseCategory.GameNotInFocus => "Game not in focus",
             RootCauseCategory.MemoryPagingStall => "Sidfel mot växlingsfilen (slut på RAM)",
+            RootCauseCategory.GpuResidencyStall => "GPU-residens: drivrutinen gjorde plats i VRAM",
             _ => "Insufficient evidence",
         };
     }

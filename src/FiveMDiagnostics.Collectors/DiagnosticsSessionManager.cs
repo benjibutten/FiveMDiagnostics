@@ -69,6 +69,9 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private SlowFrameWaitProfile? _slowFrameWaits;
     private GameFocusMonitor? _gameFocus;
     private AntiCheatCostMonitor? _antiCheatCost;
+
+    /// <summary>Whether this session has already retired the anti-cheat question. See ShouldWriteAntiCheatCost.</summary>
+    private bool _antiCheatCostWritten;
     private SystemMemoryMonitor? _systemMemory;
     private IncidentVerdictTally? _verdicts;
     private GameGraphicsSettingsMonitor? _gameSettings;
@@ -343,6 +346,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _slowFrameWaits = new SlowFrameWaitProfile();
             _gameFocus = new GameFocusMonitor(Environment?.DisplayRefreshRateHz);
             _antiCheatCost = new AntiCheatCostMonitor();
+            _antiCheatCostWritten = false;
             _systemMemory = new SystemMemoryMonitor();
             _verdicts = new IncidentVerdictTally();
             _liveVram = new LiveVramTracker();
@@ -901,7 +905,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// </remarks>
     private void FinalizeAntiCheatCost(bool final)
     {
-        if (_antiCheatCost?.Summary() is { } report && ShouldWriteSummary("AntiCheat.Cost", report.Message))
+        if (_antiCheatCost?.Summary() is { } report && ShouldWriteAntiCheatCost(report))
         {
             Report(
                 report.IsUnusual ? StatusLevel.Warning : StatusLevel.Info,
@@ -913,6 +917,35 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         {
             _antiCheatCost = null;
         }
+    }
+
+    /// <summary>Whether the anti-cheat line still has something to say.</summary>
+    /// <remarks>
+    /// A retired entry is written once. The line has ended in "Posten är därmed avförd" for six sessions
+    /// running, and on 6 September it was written six times — once a quarter of an hour, each copy
+    /// getting past the repeat check on the two decimals that had moved since the last trace. Once an
+    /// answer is "nothing to do here" it does not become more true by being repeated, and the standing
+    /// items it belongs with — cooling, DPC, present mode, the network — are each stated once too.
+    /// <para>
+    /// The exception is the case the line exists for. A figure outside the range every measured session
+    /// has stayed inside is news every time it moves, and the ordinary repeat check is the right gate
+    /// for it.
+    /// </para>
+    /// </remarks>
+    private bool ShouldWriteAntiCheatCost(AntiCheatCostReport report)
+    {
+        if (report.IsUnusual)
+        {
+            return ShouldWriteSummary("AntiCheat.Cost", report.Message);
+        }
+
+        if (_antiCheatCostWritten)
+        {
+            return false;
+        }
+
+        _antiCheatCostWritten = true;
+        return true;
     }
 
     /// <summary>
@@ -967,12 +1000,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     }
 
     /// <summary>
-    /// Writes how little RAM the machine had, which the interim lines already report on a cadence.
+    /// Writes how little RAM the machine had.
     /// </summary>
     /// <remarks>
-    /// Repeated at session end so the last line of a journal carries the session's own minimum. The
-    /// cadence lines each describe the session so far, and the interesting one is whichever came after
-    /// the worst minute.
+    /// The only writer of that line. Each one describes the session so far, and the interesting one is
+    /// whichever came after the worst minute, so it is repeated at session end as well.
     /// </remarks>
     private void FinalizeSystemMemory(bool final)
     {
@@ -1184,8 +1216,114 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// </summary>
     private bool TryReserveAutoCapture(DateTimeOffset timestamp, double frameTimeMs)
     {
-        var budget = _autoCaptureBudget;
-        return budget is not null && ReportRefusal(budget.TryReserve(timestamp, frameTimeMs, out var refusal), refusal);
+        if (_autoCaptureBudget is not { } budget)
+        {
+            return false;
+        }
+
+        var reserved = budget.TryReserve(timestamp, frameTimeMs, out var refusal, out var replaced);
+        if (replaced is not null)
+        {
+            DiscardReplacedCapture(replaced, frameTimeMs);
+        }
+
+        return ReportRefusal(reserved, refusal);
+    }
+
+    /// <summary>
+    /// Removes the trace a worse hitch has just taken the place of.
+    /// </summary>
+    /// <remarks>
+    /// The budget's ceiling is a ceiling on flushes and on disk both, and only the flush is unrecoverable
+    /// once it has happened. So the slot changes hands in the budget and the file the slot produced is
+    /// deleted here, which keeps six captures meaning six files. What the incident keeps is everything
+    /// the trace was parsed into when it was written — the evidence, the wait chain, the volumes — since
+    /// that was folded into its analysis at the time and does not live in the file.
+    /// </remarks>
+    private void DiscardReplacedCapture(CaptureReplacement replaced, double frameTimeMs)
+    {
+        var message = $"Deep capture för en {frameTimeMs:F0} ms hitch tog platsen från capturen för "
+            + $"{replaced.FrameTimeMs:F0} ms kl. {replaced.At.ToLocalTime():HH:mm:ss}: taket på "
+            + $"{_settings.DeepCapture.MaxAutoCapturesPerSession} captures står kvar, och den minst "
+            + "allvarliga får ge plats för den värre.";
+
+        if (replaced.Path is { } path)
+        {
+            string? failure = null;
+            try
+            {
+                File.Delete(path);
+            }
+            catch (Exception ex)
+            {
+                failure = ex.Message;
+            }
+
+            message += failure is null
+                ? $" {Path.GetFileName(path)} togs bort."
+                : $" {Path.GetFileName(path)} kunde inte tas bort: {failure}";
+
+            // Detached only once it is actually gone. A file that could not be deleted is still evidence
+            // and the incident holding it should still name it.
+            if (failure is null)
+            {
+                DetachTrace(path);
+            }
+        }
+
+        Report(StatusLevel.Info, "DeepCapture.Budget", message);
+    }
+
+    /// <summary>
+    /// Removes a trace that no longer exists from the session's attachments and from the incidents
+    /// carrying it.
+    /// </summary>
+    /// <remarks>
+    /// An attachment pointing at nothing follows the incident all the way into the export bundle, whose
+    /// manifest then lists a trace the archive does not contain — the same failure
+    /// <see cref="CaptureDeepTraceAsync"/> guards against before attaching one at all. Nothing is
+    /// re-analysed: what the incident keeps is what the trace was parsed into, which lives in its events
+    /// and its analysis and never depended on the file.
+    /// </remarks>
+    private void DetachTrace(string path)
+    {
+        static bool Matches(ArtifactAttachment attachment, string path) =>
+            string.Equals(attachment.FilePath, path, StringComparison.OrdinalIgnoreCase);
+
+        var updated = new List<IncidentRecord>();
+
+        lock (_sync)
+        {
+            _attachments.RemoveAll(item => Matches(item, path));
+            InvalidateAttachmentsSnapshot();
+
+            for (var index = 0; index < _incidents.Count; index++)
+            {
+                var incident = _incidents[index];
+                if (!incident.Attachments.Any(item => Matches(item, path)))
+                {
+                    continue;
+                }
+
+                _incidents[index] = incident with
+                {
+                    Attachments = incident.Attachments.Where(item => !Matches(item, path)).ToArray(),
+                };
+
+                updated.Add(_incidents[index]);
+            }
+        }
+
+        foreach (var incident in updated)
+        {
+            _journal?.WriteIncidentUpdate(incident);
+            IncidentUpdated?.Invoke(this, incident);
+        }
+
+        if (updated.Count > 0)
+        {
+            OnStateChanged();
+        }
     }
 
     /// <summary>
@@ -1725,11 +1863,10 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
                 if (telemetryEvent is SystemTelemetrySample systemSample)
                 {
-                    if (_systemMemory?.Observe(systemSample) is { } memory)
-                    {
-                        Report(memory.IsTight ? StatusLevel.Warning : StatusLevel.Info, "SystemMemory", memory.Message);
-                    }
-
+                    // Folded in only. FinalizeSystemMemory writes the line, on the session's own cadence;
+                    // this path had a cadence of its own that started in the same second and wrote the
+                    // same sentence a second later, all evening.
+                    _systemMemory?.Observe(systemSample);
                     SystemTelemetryUpdated?.Invoke(this, systemSample);
                 }
                 else if (telemetryEvent is GpuTelemetrySample gpuSample)
@@ -2309,8 +2446,9 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 _captureCost?.RecordCaptureWritten(DateTimeOffset.UtcNow);
 
                 // And the budget, which otherwise has to assume this capture is still recording and
-                // holds the next extreme frame off for the longest tail the options allow.
-                _autoCaptureBudget?.NoteCaptureWritten(DateTimeOffset.UtcNow);
+                // holds the next extreme frame off for the longest tail the options allow. With the file
+                // named, the slot it spent can also hand the file over if a worse frame takes the slot.
+                _autoCaptureBudget?.NoteCaptureWritten(DateTimeOffset.UtcNow, result.CapturePath);
 
                 lock (_sync)
                 {

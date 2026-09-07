@@ -66,8 +66,17 @@ public sealed record IncidentVerdictCount(RootCauseCategory Category, int Count)
 public sealed record IncidentVerdictReport(int Incidents, IReadOnlyList<IncidentVerdictCount> ByCategory)
 {
     /// <summary>Incidents where the card's memory was the top-ranked explanation.</summary>
+    /// <remarks>
+    /// Both verdicts about the card's memory, because they are the same finding at two strengths and
+    /// they call for the same thing: take memory off the card. Counting only the occupancy verdict left
+    /// this line silent on exactly the sessions where the sharper one won — a
+    /// <see cref="RootCauseCategory.GpuResidencyStall"/> outranks
+    /// <see cref="RootCauseCategory.GpuVramPressure"/> in every incident it fires on, so an evening
+    /// whose mechanism was measured three times over would report less VRAM pressure than one where it
+    /// was only correlated.
+    /// </remarks>
     public int VramPressureIncidents => ByCategory
-        .Where(item => item.Category == RootCauseCategory.GpuVramPressure)
+        .Where(item => item.Category is RootCauseCategory.GpuVramPressure or RootCauseCategory.GpuResidencyStall)
         .Sum(item => item.Count);
 
     /// <summary>

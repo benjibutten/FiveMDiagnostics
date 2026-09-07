@@ -1,6 +1,15 @@
 ﻿namespace FiveMDiagnostics.Core;
 
 /// <summary>
+/// A capture that a worse hitch took the place of.
+/// </summary>
+/// <param name="Path">
+/// The trace it wrote, or null when it never reported one. The caller deletes it — the ceiling is a
+/// ceiling on files as much as on flushes, and a replacement that left both on disk would raise it.
+/// </param>
+public sealed record CaptureReplacement(DateTimeOffset At, double FrameTimeMs, string? Path);
+
+/// <summary>
 /// Decides whether an automatically detected hitch may spend one of the session's deep captures.
 /// </summary>
 /// <remarks>
@@ -41,9 +50,18 @@
 /// gates stricter on an evening that is producing large frames routinely.
 /// </para>
 /// <para>
-/// Reservations all come from the telemetry pump, which is single-reader, so the counters need no
-/// synchronisation. <see cref="Remaining"/> is also read from the UI thread, where a stale value is
-/// harmless — it is a status line, not a decision.
+/// The ceiling is a set of slots rather than a count, because a session spends it chronologically and
+/// the evening's worst frames do not arrive first. The reservation held back for extreme frames covers
+/// part of that and ran out on 6 September at 00:32, after which three hitches were skipped — one of
+/// them a 281 ms frame with the game in the foreground, the second worst of the night. So a hitch worse
+/// than the least severe capture already taken now takes its place: the count stays at six, and the six
+/// that survive are the six worst rather than the six earliest. See <see cref="CaptureReplacement"/>.
+/// </para>
+/// <para>
+/// Reservations all come from the telemetry pump, which is single-reader, so it is the only writer to
+/// the slots. The lock is there for the two readers that are not on it — <see cref="Remaining"/> from
+/// the UI thread, and <see cref="NoteCaptureWritten"/> from the capture's own task, which fills in the
+/// file a slot produced.
 /// </para>
 /// </remarks>
 public sealed class AutoDeepCaptureBudget
@@ -87,6 +105,12 @@ public sealed class AutoDeepCaptureBudget
     private readonly DeepCaptureOptions _options;
     private readonly List<DateTimeOffset> _spentAt = [];
 
+    /// <summary>The captures this session has spent, one entry per slot of the ceiling.</summary>
+    private readonly List<SpentCapture> _captures = [];
+
+    /// <summary>Guards <see cref="_captures"/> against the two threads that are not the pump.</summary>
+    private readonly object _sync = new();
+
     /// <summary>
     /// The largest frame times of the session so far, descending. Bounded by
     /// <see cref="AdaptiveSampleCapacity"/>, which is what the two rates need at the longest session
@@ -94,7 +118,6 @@ public sealed class AutoDeepCaptureBudget
     /// </summary>
     private readonly List<double> _largestFrames = [];
 
-    private int _spent;
     private DateTimeOffset? _lastCaptureAt;
 
     /// <summary>
@@ -127,7 +150,16 @@ public sealed class AutoDeepCaptureBudget
     }
 
     /// <summary>Captures the detector has spent so far this session.</summary>
-    public int Spent => _spent;
+    public int Spent
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _captures.Count;
+            }
+        }
+    }
 
     /// <summary>
     /// Notes that the capture reserved most recently has finished writing its file.
@@ -136,13 +168,39 @@ public sealed class AutoDeepCaptureBudget
     /// Optional: a caller that never says so is treated as one whose capture may still be running, and
     /// gets <see cref="DeepCaptureOptions.ExtremeCaptureSpacing"/> in full.
     /// </remarks>
-    public void NoteCaptureWritten(DateTimeOffset timestamp)
+    /// <param name="capturePath">
+    /// The file it wrote, when it wrote one. Kept against the slot so that a later frame taking that
+    /// slot can say which trace it replaced, and the session's cap on captures stays a cap on files.
+    /// </param>
+    /// <remarks>
+    /// The slot it belongs to is the most recent one reserved at or before the write. A capture is
+    /// started immediately after its slot is reserved, and the spacing gates keep two of them from
+    /// writing at once, so that is the one that produced this file. Taking the oldest slot without a
+    /// file instead would be right until a capture failed: a capture that writes nothing never calls
+    /// this, its slot stays empty for the rest of the session, and every later path would be filed
+    /// against it — after which a replacement would delete a trace belonging to a different incident.
+    /// </remarks>
+    public void NoteCaptureWritten(DateTimeOffset timestamp, string? capturePath = null)
     {
         _lastCaptureWrittenAt = timestamp;
+
+        if (capturePath is null)
+        {
+            return;
+        }
+
+        lock (_sync)
+        {
+            var slot = _captures.LastOrDefault(capture => capture.At <= timestamp);
+            if (slot is not null)
+            {
+                slot.Path = capturePath;
+            }
+        }
     }
 
     /// <summary>Captures still available, for the UI to show rather than leaving the user to guess.</summary>
-    public int Remaining => Math.Max(0, _options.MaxAutoCapturesPerSession - _spent);
+    public int Remaining => Math.Max(0, _options.MaxAutoCapturesPerSession - Spent);
 
     /// <summary>
     /// Frame time a hitch has to reach right now, which is the configured threshold until the session
@@ -279,11 +337,21 @@ public sealed class AutoDeepCaptureBudget
     /// </remarks>
     public bool TryReserve(DateTimeOffset timestamp, double frameTimeMs, out string? refusal)
     {
+        return TryReserve(timestamp, frameTimeMs, out refusal, out _);
+    }
+
+    /// <param name="replaced">
+    /// The capture this one took the place of, when the ceiling was already spent and this frame was
+    /// worse than the least severe capture in it. The caller owns what happens to the file it names.
+    /// </param>
+    public bool TryReserve(DateTimeOffset timestamp, double frameTimeMs, out string? refusal, out CaptureReplacement? replaced)
+    {
         if (frameTimeMs < EffectiveFrameTimeMs)
         {
             // Not a refusal worth reporting: the overwhelming majority of incidents land here, and
             // saying so every time would bury the two cases the user does need to know about.
             refusal = null;
+            replaced = null;
             return false;
         }
 
@@ -294,7 +362,8 @@ public sealed class AutoDeepCaptureBudget
             mayOverrideRefill: SkipsRefillFor(frameTimeMs),
             maySpendReserve: frameTimeMs >= EffectiveExtremeFrameTimeMs,
             frameTimeMs,
-            out refusal);
+            out refusal,
+            out replaced);
     }
 
     /// <summary>
@@ -348,7 +417,8 @@ public sealed class AutoDeepCaptureBudget
             mayOverrideRefill: false,
             maySpendReserve: false,
             frameTimeMs: 0,
-            out refusal);
+            out refusal,
+            out _);
     }
 
     /// <summary>
@@ -365,7 +435,8 @@ public sealed class AutoDeepCaptureBudget
             mayOverrideRefill: false,
             maySpendReserve: false,
             frameTimeMs: 0,
-            out refusal);
+            out refusal,
+            out _);
     }
 
     /// <param name="mayOverrideCooldown">
@@ -404,19 +475,28 @@ public sealed class AutoDeepCaptureBudget
         bool mayOverrideRefill,
         bool maySpendReserve,
         double frameTimeMs,
-        out string? refusal)
+        out string? refusal,
+        out CaptureReplacement? replaced)
     {
+        replaced = null;
+
         if (!_options.Enabled || !_options.CaptureAutoIncidents)
         {
             refusal = null;
             return false;
         }
 
-        if (_spent >= _options.MaxAutoCapturesPerSession)
+        // The ceiling, and the one way through it. A spent budget used to refuse everything that came
+        // after it, which on 6 September meant the second worst frame of the evening — 281 ms with the
+        // game in front — was skipped at 01:00 because six smaller hitches had arrived first. A frame
+        // worse than the least severe capture already taken takes that capture's slot instead, so the
+        // ceiling still holds at six and the six it holds are the six worst.
+        var displaced = Spent < _options.MaxAutoCapturesPerSession ? null : WeakestCaptureBelow(frameTimeMs);
+        if (Spent >= _options.MaxAutoCapturesPerSession && displaced is null)
         {
             refusal = $"Deep capture hoppades över för {description}: sessionens budget på "
-                + $"{_options.MaxAutoCapturesPerSession} automatiska captures är förbrukad. Höj "
-                + $"DeepCapture.MaxAutoCapturesPerSession om fler behövs.";
+                + $"{_options.MaxAutoCapturesPerSession} automatiska captures är förbrukad"
+                + $"{DescribeReplacementBar()}. Höj DeepCapture.MaxAutoCapturesPerSession om fler behövs.";
             return false;
         }
 
@@ -441,10 +521,14 @@ public sealed class AutoDeepCaptureBudget
         // first. Captures used to be granted in arrival order, which is how 5 September spent all six
         // before 00:19 and then refused everything that came after — a 1 133 ms frame at 02:45 among
         // them, the largest of the evening. An ordinary frame therefore stops here and leaves the last
-        // captures for the frames this session's own material calls extreme.
-        if (!maySpendReserve && _spent >= _options.MaxAutoCapturesPerSession - _options.ReservedSevereCaptures)
+        // captures for the frames this session's own material calls extreme. A frame taking another
+        // capture's slot passes: the reserve exists to keep room for a frame worse than the ones already
+        // traced, and a replacement is that frame by definition.
+        if (displaced is null
+            && !maySpendReserve
+            && Spent >= _options.MaxAutoCapturesPerSession - _options.ReservedSevereCaptures)
         {
-            refusal = $"Deep capture hoppades över för {description}: {_spent} av sessionens budget på "
+            refusal = $"Deep capture hoppades över för {description}: {Spent} av sessionens budget på "
                 + $"{_options.MaxAutoCapturesPerSession} automatiska captures är tagna, och de sista "
                 + $"{_options.ReservedSevereCaptures} är reserverade för frames över "
                 + $"{EffectiveExtremeFrameTimeMs:F0} ms — så kvällens värsta hitch kan spåras även när den "
@@ -479,7 +563,17 @@ public sealed class AutoDeepCaptureBudget
             }
         }
 
-        _spent++;
+        lock (_sync)
+        {
+            if (displaced is not null)
+            {
+                _captures.Remove(displaced);
+                replaced = new CaptureReplacement(displaced.At, displaced.FrameTimeMs, displaced.Path);
+            }
+
+            _captures.Add(new SpentCapture(timestamp, frameTimeMs));
+        }
+
         _lastCaptureAt = timestamp;
         _lastCaptureFrameTimeMs = frameTimeMs;
 
@@ -574,6 +668,60 @@ public sealed class AutoDeepCaptureBudget
         }
 
         return count;
+    }
+
+    /// <summary>
+    /// The least severe capture already taken, when this frame is worse than it and may take its slot.
+    /// </summary>
+    /// <remarks>
+    /// Strictly worse, and only for a reservation that has a frame time at all: a saturation window or a
+    /// run of dropped frames is not comparable with a hitch and may not displace one. Each replacement
+    /// raises the bar the next one has to clear, which is what keeps a degrading evening from replacing
+    /// its way through the disk.
+    /// </remarks>
+    private SpentCapture? WeakestCaptureBelow(double frameTimeMs)
+    {
+        if (frameTimeMs <= 0)
+        {
+            return null;
+        }
+
+        lock (_sync)
+        {
+            var weakest = _captures.OrderBy(capture => capture.FrameTimeMs).FirstOrDefault();
+            return weakest is not null && frameTimeMs > weakest.FrameTimeMs ? weakest : null;
+        }
+    }
+
+    /// <summary>What a frame would have to reach to take a slot, for the refusal to say so.</summary>
+    private string DescribeReplacementBar()
+    {
+        lock (_sync)
+        {
+            var weakest = _captures.OrderBy(capture => capture.FrameTimeMs).FirstOrDefault();
+            return weakest is { FrameTimeMs: > 0 } bar
+                ? $", och den minst allvarliga av dem togs för {bar.FrameTimeMs:F0} ms — en frame över det "
+                    + "hade tagit dess plats"
+                : string.Empty;
+        }
+    }
+
+    /// <summary>One slot of the session ceiling: what it was spent on, and the file it produced.</summary>
+    private sealed class SpentCapture
+    {
+        public SpentCapture(DateTimeOffset at, double frameTimeMs)
+        {
+            At = at;
+            FrameTimeMs = frameTimeMs;
+        }
+
+        public DateTimeOffset At { get; }
+
+        /// <summary>Zero for a capture taken for something with no frame time, which nothing may displace.</summary>
+        public double FrameTimeMs { get; }
+
+        /// <summary>Filled in by <see cref="NoteCaptureWritten"/> once the trace is on disk.</summary>
+        public string? Path { get; set; }
     }
 
     /// <summary>Keeps <see cref="_largestFrames"/> sorted largest first, so rank <c>n</c> is index <c>n-1</c>.</summary>

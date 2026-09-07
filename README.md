@@ -34,6 +34,10 @@ The analysis engine ranks these categories:
 7. External process interference
 8. OS/driver latency
 9. Possible cache/resource corruption
+10. FiveM thread blocked in Waiting
+11. Game not in focus
+12. Paging stall against the paging file (out of RAM)
+13. GPU residency stall (the driver evacuating VRAM)
 
 ### External interference is ranked by how much of the machine it took
 
@@ -667,12 +671,18 @@ had every input for, and each now a line in the session summary.
 
 **The VRAM band, with its measured cost.** Every previous session warned only about processes whose VRAM
 grew, which is silent on the evening where the memory was taken before the game started. `VramPressureBandMonitor`
-buckets the session into minutes, counts the minutes whose adapter readings were mostly above 88% and
-above 91%, and compares the hitch rate inside the band against outside it — "the card was above 88% in 33
-of 278 minutes; in those minutes the hitch rate was 4.1× higher than in the rest". The 88% band is no
-longer a guess from 26 August: it is these minutes compared with each other, and the gradient behind it
-was 82 against 794 hitches ≥33 ms per hour. The hitch threshold follows the cadence the session actually
-holds, as `CaptureCostMonitor`'s does.
+counts each frame against the adapter reading nearest it in time, counts the readings above 88% and above
+91%, and compares the hitch rate inside the band against outside it — "the card was above 88% in 33 of
+278 minutes; in those minutes the hitch rate was 4.1× higher than in the rest". The 88% band is no longer
+a guess from 26 August: it is these minutes compared with each other, and the gradient behind it was 82
+against 794 hitches ≥33 ms per hour. The hitch threshold follows the cadence the session actually holds,
+as `CaptureCostMonitor`'s does.
+
+Pairing per reading rather than per time bucket is what makes the figure exact. A bucket has to be filed
+on one side of the band, so every bucket the card crossed inside took its hitches with it to the wrong
+side: at a minute, 125 of 351 minutes on 2 September; at fifteen seconds, 235 of about 1 480 intervals on
+6 September, a sixth of the evening counted approximately. A frame paired with its own reading cannot
+straddle anything.
 
 **The `MsCPUWait` distribution of the largest frames.** "None of the 35 frames over 100 ms waited" was the
 sharpest single observation of that review and is one subtraction away from data every session already

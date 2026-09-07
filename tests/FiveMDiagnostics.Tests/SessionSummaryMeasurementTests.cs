@@ -38,8 +38,9 @@ public sealed class SessionSummaryMeasurementTests
         Assert.Equal(3, report.MinutesInDeepBand, 1);
         Assert.True(report.IsPressured);
 
-        // Neither stretch crosses the band inside an interval, so the split is exact.
-        Assert.Equal(0, report.MixedIntervals);
+        // Every frame found a reading of its own, so nothing is estimated and nothing is discarded.
+        Assert.Equal(0, report.UnpairedFrames);
+        Assert.True(report.PairedFrames > 40_000, $"{report.PairedFrames} frames paired against a reading");
 
         // Ten an hour outside, six hundred inside.
         Assert.NotNull(report.HitchRatio);
@@ -49,15 +50,17 @@ public sealed class SessionSummaryMeasurementTests
     }
 
     /// <summary>
-    /// The failure the interval was shortened for: a card that crosses the band for half a minute at a
-    /// time, which a minute-long bucket filed entirely as "outside" along with every hitch in it.
+    /// The failure the time bucket produced: a card that crosses the band for half a minute at a time,
+    /// which a bucket filed on whichever side it leant to along with every hitch in it.
     /// </summary>
     /// <remarks>
     /// Built to the shape of 2 September, where 125 of 351 minutes touched the band without a single one
     /// of them counting as inside it. Those minutes carried 654 of the session's 1 246 hitches, and the
-    /// report came out at 1.4× against 3.4× measured per sample. Here the arithmetic is exact: half of
-    /// every minute is spent at 92% carrying twenty times the hitches of the half at 70%, and a monitor
-    /// that cannot see it reports no pressure at all.
+    /// report came out at 1.4× against 3.4× measured per sample. Shortening the bucket to fifteen seconds
+    /// reduced the error and did not remove it — 235 of the 1 480 intervals of 6 September still straddled
+    /// the line. Pairing each frame with the reading nearest it removes it: half of every minute here is
+    /// spent at 92% carrying twenty times the hitches of the half at 70%, and none of those hitches may
+    /// land outside the band.
     /// </remarks>
     [Fact]
     public void HalfMinuteExcursionsIntoTheBandAreNotFiledAsTimeOutsideIt()
@@ -302,17 +305,26 @@ public sealed class SessionSummaryMeasurementTests
         {
             var minuteStart = from.AddSeconds(minute * seconds);
 
-            for (var reading = 0; reading * 5 < seconds; reading++)
+            // Twice a second, the rate NVML is actually polled at. It matters at a crossing: a frame is
+            // counted against the reading nearest it, so each crossing carries up to half a sampling
+            // interval of frames over to the other side — a quarter of a second here, and five seconds
+            // if the fixture pretended the card was read once every ten.
+            for (var reading = 0; reading * 0.5 < seconds; reading++)
             {
-                monitor.Observe(Adapter(minuteStart.AddSeconds(reading * 5), vramPercent));
+                monitor.Observe(Adapter(minuteStart.AddSeconds(reading * 0.5), vramPercent));
             }
 
-            // A frame a second is enough to settle the cadence without making the fixture a hundred
-            // thousand samples; the threshold only needs the median.
-            for (var frame = 0; frame < seconds; frame++)
+            // Frames that tile the time they are meant to cover, because the hitch rate is measured
+            // against their own intervals: a fixture presenting one frame a second and calling it 16.7 ms
+            // would describe a minute as a second of play.
+            var at = minuteStart;
+            var emitted = 0;
+            while ((at - minuteStart).TotalSeconds < seconds)
             {
-                var isHitch = frame < hitchesPerMinute;
-                monitor.Observe(Frame(minuteStart.AddSeconds(frame), isHitch ? 90 : 16.7, cpuWaitMs: 6));
+                var frameTimeMs = emitted < hitchesPerMinute ? 90 : 16.7;
+                monitor.Observe(Frame(at, frameTimeMs, cpuWaitMs: 6));
+                at = at.AddMilliseconds(frameTimeMs);
+                emitted++;
             }
         }
     }

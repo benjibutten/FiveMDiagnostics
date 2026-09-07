@@ -647,4 +647,127 @@ public sealed class AutoDeepCaptureBudgetTests
 
         Assert.Equal(4, budget.Spent);
     }
+
+    /// <summary>
+    /// The frame of 01:00:39 on 6 September: 281 ms with the game in front, the second worst of the
+    /// evening, skipped because six smaller hitches had arrived before it.
+    /// </summary>
+    /// <remarks>
+    /// The reserve covers part of this and it ran out at 00:32. What was left was a ceiling spent in
+    /// arrival order, and the evening's worst frames do not arrive first. So the ceiling holds and the
+    /// least severe capture in it gives up its slot — six captures, and the six worst of the night.
+    /// </remarks>
+    [Fact]
+    public void AWorseHitchTakesTheSlotOfTheLeastSevereCapture()
+    {
+        var budget = SpentSession();
+
+        Assert.Equal(6, budget.Spent);
+        Assert.Equal(0, budget.Remaining);
+
+        Assert.True(budget.TryReserve(Start.AddHours(4), frameTimeMs: 281, out var refusal, out var replaced));
+
+        Assert.Null(refusal);
+        Assert.NotNull(replaced);
+        Assert.Equal(255, replaced!.FrameTimeMs);
+        Assert.Equal(Start.AddMinutes(30), replaced.At);
+
+        // The file it wrote, so the ceiling on captures stays a ceiling on files.
+        Assert.Equal("deep_1.etl", replaced.Path);
+
+        // And the ceiling itself does not move.
+        Assert.Equal(6, budget.Spent);
+    }
+
+    /// <summary>
+    /// A hitch no worse than the weakest capture still gets nothing, and the refusal says what it would
+    /// have taken — the figure somebody reading the log would otherwise have to work out.
+    /// </summary>
+    [Fact]
+    public void AHitchThatIsNotWorseThanWhatIsAlreadyTracedIsStillRefused()
+    {
+        var budget = SpentSession();
+
+        Assert.False(budget.TryReserve(Start.AddHours(4), frameTimeMs: 240, out var refusal, out var replaced));
+
+        Assert.Null(replaced);
+        Assert.Contains("255 ms", refusal!, StringComparison.Ordinal);
+        Assert.Equal(6, budget.Spent);
+    }
+
+    /// <summary>
+    /// Each replacement raises the bar the next one has to clear, so a degrading evening cannot replace
+    /// its way through the disk.
+    /// </summary>
+    [Fact]
+    public void EachReplacementRaisesTheBarForTheNext()
+    {
+        var budget = SpentSession();
+
+        Assert.True(budget.TryReserve(Start.AddHours(4), frameTimeMs: 281, out _, out _));
+
+        // 255 is gone; the weakest is now the 260 ms capture, and a 258 ms frame no longer clears it.
+        Assert.False(budget.TryReserve(Start.AddHours(5), frameTimeMs: 258, out var refusal, out _));
+        Assert.Contains("260 ms", refusal!, StringComparison.Ordinal);
+
+        Assert.True(budget.TryReserve(Start.AddHours(6), frameTimeMs: 262, out _, out var replaced));
+        Assert.Equal(260, replaced!.FrameTimeMs);
+    }
+
+    /// <summary>
+    /// A saturation window has no frame time and is not comparable with a hitch, so it may not take a
+    /// hitch's slot however long it lasted.
+    /// </summary>
+    [Fact]
+    public void SomethingWithNoFrameTimeMayNotDisplaceACapture()
+    {
+        var budget = SpentSession();
+
+        Assert.False(budget.TryReserveForSustainedSaturation(Start.AddHours(4), out var refusal));
+
+        Assert.Contains("förbrukad", refusal!, StringComparison.Ordinal);
+        Assert.Equal(6, budget.Spent);
+    }
+
+    /// <summary>
+    /// A capture that writes no file never reports one, and its slot stays empty for the rest of the
+    /// session. Filing each path against the oldest empty slot therefore put every later trace against
+    /// the failed one — and a replacement would then have deleted a file belonging to another incident.
+    /// </summary>
+    [Fact]
+    public void APathBelongsToTheCaptureThatWroteIt()
+    {
+        // The first capture of the evening is reserved, started, and writes nothing.
+        var budget = SpentSession(failedIndex: 0);
+
+        Assert.True(budget.TryReserve(Start.AddHours(4), frameTimeMs: 281, out _, out var replaced));
+
+        // The 255 ms capture gives up its slot, and the file named is the one that capture wrote.
+        Assert.Equal(255, replaced!.FrameTimeMs);
+        Assert.Equal("deep_1.etl", replaced.Path);
+    }
+
+    /// <summary>
+    /// Six captures across three hours, each one having reported the file it wrote. The weakest of them
+    /// is the 255 ms one, half an hour in.
+    /// </summary>
+    /// <param name="failedIndex">A capture that wrote no file and so reported none.</param>
+    private static AutoDeepCaptureBudget SpentSession(int? failedIndex = null)
+    {
+        var budget = new AutoDeepCaptureBudget(Options());
+        var frameTimes = new[] { 300d, 255, 290, 280, 270, 260 };
+
+        for (var index = 0; index < frameTimes.Length; index++)
+        {
+            var at = Start.AddMinutes(index * 30);
+            Assert.True(budget.TryReserve(at, frameTimes[index], out _));
+
+            if (index != failedIndex)
+            {
+                budget.NoteCaptureWritten(at.AddSeconds(30), $"deep_{index}.etl");
+            }
+        }
+
+        return budget;
+    }
 }

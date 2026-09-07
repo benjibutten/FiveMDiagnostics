@@ -27,6 +27,7 @@ internal static class ModuleGlossary
         ["adhesive.dll"] = "FiveM:s anti-cheat",
         ["nvlddmkm.sys"] = "NVIDIA kärndrivrutin",
         ["nvwgf2umx.dll"] = "NVIDIA D3D-drivrutin",
+        ["d3d11.dll"] = "Direct3D 11 i användarläge",
         ["dxgkrnl.sys"] = "DirectX-kärnschemaläggare",
         ["dxgmms2.sys"] = "DirectX minneshanterare",
         ["win32kfull.sys"] = "fönster- och GDI-vägen",

@@ -387,7 +387,21 @@ public sealed class GameFocusMonitor
 
         // The game has the foreground. It is still settling if it only just got it back — and only if it
         // got it back, rather than having held it since the session began.
-        if (index > 0 && at - current.Timestamp < RegainGrace)
+        //
+        // The moment it got it back is the start of the unbroken run of readings that say it has it, not
+        // the previous reading. The live path holds transitions only, where the two are the same; the
+        // engine classifies over the raw samples in an incident window, and the collector writes a
+        // heartbeat every five seconds as well as on change. Against those, "there is an earlier
+        // reading" is true of every moment, and two seconds out of every five came out as Settling — a
+        // verdict that rules the window out at 95% confidence, on an evening where the game never left
+        // the foreground at all.
+        var regainedAt = index;
+        while (regainedAt > 0 && readings[regainedAt - 1].GameHasFocus)
+        {
+            regainedAt--;
+        }
+
+        if (regainedAt > 0 && at - readings[regainedAt].Timestamp < RegainGrace)
         {
             return GameFocusState.Settling;
         }

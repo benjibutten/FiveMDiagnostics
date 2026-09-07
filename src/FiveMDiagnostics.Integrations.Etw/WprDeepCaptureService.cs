@@ -911,6 +911,15 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
                     // everything behind it was not. It is the subject of the sentence the investigation
                     // has been writing by hand since 25 August.
                     metrics["gameThreadBlockedByThreadId"] = blocker.ThreadId;
+
+                    // And what it was executing, keyed by module the way the busiest thread's are. This
+                    // is the difference between two verdicts: a render thread spinning in d3d11.dll and
+                    // nvwgf2umx.dll while the card reports no work and no memory bandwidth at all is the
+                    // driver making room in VRAM, and the analysis cannot see that from anywhere else.
+                    foreach (var module in cpu.ModulesForThread(blocker.ThreadId))
+                    {
+                        metrics[$"gameThreadBlockerCores_{module.Module}"] = Math.Round(module.Cores, 4);
+                    }
                 }
 
                 for (var index = 0; index < threadWait.Intervals.Count; index++)

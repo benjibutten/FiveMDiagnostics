@@ -19,47 +19,46 @@ namespace FiveMDiagnostics.Core;
 /// separates.
 /// </para>
 /// <para>
-/// An interval, not a sample, is the unit. Frame times and adapter readings arrive at wildly different
-/// rates and from two different clocks — PresentMon's anchor runs about a second behind the wall clock
-/// — so pairing them per sample would compare a frame against whichever reading happened to be nearest.
-/// The interval has to be far longer than that skew and short enough that a bad patch does not average
-/// away.
+/// The unit is one adapter reading, and each frame is counted against the reading nearest it in time.
+/// It was a bucket of wall clock instead — a minute, then fifteen seconds — because the two clocks
+/// disagree and a bucket wide enough to absorb the disagreement was the cheap way to pair them. The
+/// cost of that is a bucket the card crossed the band inside: it was filed on whichever side it leant
+/// to, with every hitch in it. A minute filed 125 of 350 minutes on the wrong side on 2 September;
+/// fifteen seconds still left 235 of 1 480 intervals of 6 September straddling the line, a sixth of the
+/// evening counted approximately. Pairing each frame with the reading nearest it removes the question:
+/// nothing straddles anything, and the same evening's analysis done by hand this way is what the report
+/// now reproduces.
 /// </para>
 /// <para>
-/// It was a minute, and a minute was too long. The card crosses the band in bursts of twenty or thirty
-/// seconds, so most of the minutes it spent there were minutes it spent partly there — and the majority
-/// rule below then filed every one of them as "outside", with their hitches. Measured over 350 minutes
-/// on 2 September: 22 minutes in the band, 125 minutes that touched it and were counted as outside, and
-/// those 125 carried 654 of the session's 1 246 hitches. The report came out at 1.4× where the same
-/// data, matched per sample, says 3.4×; at fifteen seconds it says 2.5× and discards nothing. A ratio
-/// of 1.4 reads as noise and this one is not noise, so the interval is the difference between a line
-/// somebody acts on and a line somebody skips.
+/// What remains is the clock skew itself, and it is small enough to name. PresentMon's anchor can run
+/// about a second behind the wall clock the adapter is sampled on, so a frame near a crossing can be
+/// counted against the reading on the other side of it. That misplaces roughly a second of frames per
+/// crossing rather than the fifteen seconds a bucket misplaced, and it does not accumulate.
 /// </para>
 /// </remarks>
 public sealed class VramPressureBandMonitor
 {
     /// <summary>
-    /// The bucket both series are folded into.
+    /// How far a frame may be from the nearest adapter reading before it is not described by it.
     /// </summary>
     /// <remarks>
-    /// Fifteen seconds is fifteen times the clock skew between the two collectors and about half the
-    /// length of the shortest excursion into the band that the sessions show. Shorter would start to
-    /// pair frames against the wrong side of a crossing; longer is what this class already tried.
+    /// Readings arrive about twice a second, so this is a missed poll or two plus the clock skew several
+    /// times over. Beyond it the nearest reading is stale rather than near, and a frame is counted as
+    /// unpaired — which the report states — instead of being attributed to a VRAM level that was
+    /// measured somewhere else entirely.
     /// </remarks>
-    private const int IntervalSeconds = 15;
+    private static readonly TimeSpan MaxPairingGap = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    /// Share of an interval's adapter readings that has to be inside the band before it counts.
+    /// Frames the queue may hold before the oldest are given up as unpairable.
     /// </summary>
     /// <remarks>
-    /// An interval in which the card touched the band once is not an interval spent in it. Half is the
-    /// point at which it is more inside than outside, which is what the comparison below needs it to
-    /// mean. Intervals that are genuinely split are still counted on the side they lean to rather than
-    /// discarded — <see cref="VramPressureBandReport.MixedIntervals"/> says how many there were, so a
-    /// reader can see how sharp the split was without any of the session being thrown away to make it
-    /// look sharper.
+    /// The queue holds the frames since the last adapter reading, which is a few hundred at any frame
+    /// rate a game produces. It only reaches this on a machine where the adapter is not being measured at
+    /// all — no NVML, or a GPU collector that never started — and there the frames can never be paired
+    /// with anything. Without the bound they would accumulate for the length of the session.
     /// </remarks>
-    private const double IntervalShareInBand = 0.5;
+    private const int MaxPendingFrames = 4096;
 
     /// <summary>
     /// Frames held back before the hitch threshold is fixed, so it follows the cadence the session
@@ -91,7 +90,28 @@ public sealed class VramPressureBandMonitor
     public const double DeepBandPercent = 91;
 
     private readonly object _sync = new();
-    private readonly Dictionary<long, Interval> _intervals = [];
+
+    /// <summary>
+    /// Every adapter reading of the session, each carrying the frames counted against it.
+    /// </summary>
+    /// <remarks>
+    /// Kept rather than folded into running totals because the loading split is decided at the end: the
+    /// caller learns about a game start a poll or two after it happened, and a reading has to be able to
+    /// change sides afterwards. Two readings a second is 43 000 entries over the longest session
+    /// measured, which is a couple of megabytes beside a ring buffer holding ninety seconds of every
+    /// event the app collects.
+    /// </remarks>
+    private readonly List<Reading> _readings = [];
+
+    /// <summary>
+    /// Frames waiting for a reading at or after them, so the nearest one can be decided.
+    /// </summary>
+    /// <remarks>
+    /// A frame cannot be paired the moment it arrives: the reading nearest it may not have been taken
+    /// yet. It holds the frames since the last reading — a few hundred at most — and is drained whenever
+    /// one arrives.
+    /// </remarks>
+    private readonly List<(DateTimeOffset At, double FrameTimeMs)> _pending = [];
 
     /// <summary>
     /// When the game was seen to start, oldest first. One or two entries on an ordinary evening.
@@ -106,6 +126,8 @@ public sealed class VramPressureBandMonitor
     private readonly double _refreshIntervalMs;
 
     private double _hitchThresholdMs;
+    private double _peakPercent;
+    private int _unpairedFrames;
 
     /// <param name="refreshRateHz">
     /// The display's rate, which sets the floor under what can count as a hitch: two refreshes rather
@@ -137,7 +159,7 @@ public sealed class VramPressureBandMonitor
         }
     }
 
-    /// <summary>Folds one adapter reading into the minute it belongs to.</summary>
+    /// <summary>Records one adapter reading, and pairs the frames that were waiting for it.</summary>
     public void Observe(GpuTelemetrySample sample)
     {
         if (!sample.IsAvailable || sample.VramUsagePercent is not { } percent)
@@ -147,33 +169,28 @@ public sealed class VramPressureBandMonitor
 
         lock (_sync)
         {
-            var interval = IntervalOf(sample.Timestamp);
-            interval.AdapterReadings++;
-            if (percent >= BandPercent)
-            {
-                interval.ReadingsInBand++;
-            }
-
-            if (percent >= DeepBandPercent)
-            {
-                interval.ReadingsInDeepBand++;
-            }
-
-            if (percent > interval.PeakPercent)
-            {
-                interval.PeakPercent = percent;
-            }
+            _readings.Add(new Reading(sample.Timestamp, percent));
+            _peakPercent = Math.Max(_peakPercent, percent);
+            DrainPending(final: false);
         }
     }
 
-    /// <summary>Folds one frame into the minute it belongs to.</summary>
+    /// <summary>Holds one frame until the reading nearest it is known.</summary>
     public void Observe(FrameTelemetrySample sample)
     {
         lock (_sync)
         {
             if (_hitchThresholdMs > 0)
             {
-                Count(sample.Timestamp, sample.FrameTimeMs);
+                _pending.Add((sample.Timestamp, sample.FrameTimeMs));
+
+                if (_pending.Count > MaxPendingFrames)
+                {
+                    var unpairable = _pending.Count - (MaxPendingFrames / 2);
+                    _unpairedFrames += unpairable;
+                    _pending.RemoveRange(0, unpairable);
+                }
+
                 return;
             }
 
@@ -186,7 +203,7 @@ public sealed class VramPressureBandMonitor
     }
 
     /// <summary>
-    /// The comparison, or null when the session never produced minutes on both sides of the band.
+    /// The comparison, or null when the session never produced readings on both sides of the band.
     /// </summary>
     /// <remarks>
     /// Both sides are required. An evening spent entirely inside the band, or entirely outside it, has
@@ -203,76 +220,178 @@ public sealed class VramPressureBandMonitor
                 SettleThreshold();
             }
 
-            var measuredPairs = _intervals.Where(entry => entry.Value.AdapterReadings > 0).ToArray();
-            if (measuredPairs.Length == 0)
+            DrainPending(final: true);
+
+            if (_readings.Count == 0)
             {
                 return null;
             }
 
-            var measured = measuredPairs.Select(entry => entry.Value).ToArray();
+            var inBand = _readings.Where(reading => reading.IsInBand).ToArray();
+            var outside = _readings.Where(reading => !reading.IsInBand).ToArray();
 
-            // Split by whether the interval fell inside the loading window after a game start. Done here
-            // rather than when the interval was created, because the caller can learn about a start a
-            // poll or two after it happened and the intervals it affects are already open.
-            var loading = measuredPairs.Count(entry => IsLoading(entry.Key));
-            var loadingInBand = measuredPairs.Count(entry => IsLoading(entry.Key) && entry.Value.IsInBand);
-            var loadingHitches = measuredPairs
-                .Where(entry => IsLoading(entry.Key) && entry.Value.IsInBand)
-                .Sum(entry => entry.Value.Hitches);
+            // The denominator is the time the frames themselves cover, not a count of readings. A
+            // reading stands for the sampling cadence only while the collector is sampling: one taken
+            // either side of a gap absorbs every frame within the pairing window, five seconds of them
+            // against a cadence of half a second, and counting it as one reading would weight its
+            // hitches ten times. A frame's own interval is exactly the time it occupied, whatever
+            // reading it was counted against, and a reading that carried no frames contributes nothing
+            // to either side.
+            var inBandHours = inBand.Sum(reading => reading.FrameMs) / 3_600_000d;
+            var outsideHours = outside.Sum(reading => reading.FrameMs) / 3_600_000d;
 
-            var inBand = measured.Where(interval => interval.IsInBand).ToArray();
-            var outside = measured.Where(interval => !interval.IsInBand).ToArray();
+            double? inBandRate = inBandHours > 0 ? inBand.Sum(reading => reading.Hitches) / inBandHours : null;
+            double? outsideRate = outsideHours > 0 ? outside.Sum(reading => reading.Hitches) / outsideHours : null;
+            var secondsPerReading = MedianReadingGapSeconds();
 
-            // Only intervals that carried frames can carry a hitch rate; one where the capture was down
-            // is an interval about PresentMon rather than about the card.
-            var inBandWithFrames = inBand.Where(interval => interval.Frames > 0).ToArray();
-            var outsideWithFrames = outside.Where(interval => interval.Frames > 0).ToArray();
-
-            var perHour = 3600d / IntervalSeconds;
-            double? inBandRate = inBandWithFrames.Length > 0
-                ? inBandWithFrames.Sum(interval => interval.Hitches) * perHour / inBandWithFrames.Length
-                : null;
-            double? outsideRate = outsideWithFrames.Length > 0
-                ? outsideWithFrames.Sum(interval => interval.Hitches) * perHour / outsideWithFrames.Length
-                : null;
+            // Decided here rather than when the reading arrived, because the caller can learn about a
+            // start a poll or two after it happened and the readings it affects are already recorded.
+            var loading = _readings.Where(IsLoading).ToArray();
 
             return new VramPressureBandReport(
-                IntervalSeconds,
-                measured.Length,
+                _readings.Count,
                 inBand.Length,
-                measured.Count(interval => interval.IsInDeepBand),
-                measured.Count(interval => interval.IsMixed),
-                measured.Max(interval => interval.PeakPercent),
+                _readings.Count(reading => reading.IsInDeepBand),
+                secondsPerReading,
+                _peakPercent,
                 _hitchThresholdMs,
-                inBandWithFrames.Sum(interval => interval.Hitches),
-                outsideWithFrames.Sum(interval => interval.Hitches),
+                inBand.Sum(reading => reading.Hitches),
+                outside.Sum(reading => reading.Hitches),
                 inBandRate,
                 outsideRate,
+                _readings.Sum(reading => reading.Frames),
+                _unpairedFrames,
                 _gameStarts.Count,
-                loading,
-                loadingInBand,
-                loadingHitches);
+                loading.Length,
+                loading.Count(reading => reading.IsInBand),
+                loading.Where(reading => reading.IsInBand).Sum(reading => reading.Hitches));
         }
     }
 
     /// <summary>
-    /// Whether an interval fell inside the loading window after a game start. Called under the lock.
+    /// Counts every frame that can no longer find a nearer reading than the ones already recorded.
     /// </summary>
     /// <remarks>
-    /// The interval's own start is recoverable from its key, which is what lets this be decided at the
-    /// end from a list of starts that was still being appended to while the intervals were filling.
+    /// A frame after the newest reading has to wait: the next reading may be closer to it than the last
+    /// one was. Everything at or before the newest reading is decided, and on the final pass the whole
+    /// queue is, because no further readings are coming. Called under the lock.
     /// </remarks>
-    private bool IsLoading(long key)
+    private void DrainPending(bool final)
     {
-        if (_gameStarts.Count == 0)
+        if (_pending.Count == 0 || _readings.Count == 0)
         {
-            return false;
+            return;
         }
 
-        var at = DateTimeOffset.FromUnixTimeSeconds(key * IntervalSeconds);
+        var newest = _readings[^1].At;
+
+        // Compacted in place rather than rebuilt: this runs twice a second against the frames since the
+        // last reading, and the frames that stay are the tail of the list.
+        var kept = 0;
+        for (var index = 0; index < _pending.Count; index++)
+        {
+            var frame = _pending[index];
+            if (!final && frame.At > newest)
+            {
+                _pending[kept++] = frame;
+                continue;
+            }
+
+            Count(frame.At, frame.FrameTimeMs);
+        }
+
+        _pending.RemoveRange(kept, _pending.Count - kept);
+    }
+
+    /// <summary>Counts one frame against the reading nearest it. Called under the lock.</summary>
+    private void Count(DateTimeOffset at, double frameTimeMs)
+    {
+        var nearest = NearestReading(at);
+        if (nearest is null || (nearest.At - at).Duration() > MaxPairingGap)
+        {
+            _unpairedFrames++;
+            return;
+        }
+
+        nearest.Frames++;
+        nearest.FrameMs += frameTimeMs;
+        if (frameTimeMs >= _hitchThresholdMs)
+        {
+            nearest.Hitches++;
+        }
+    }
+
+    /// <summary>
+    /// The reading closest in time to a frame, or null when there are none. Called under the lock.
+    /// </summary>
+    /// <remarks>
+    /// Binary search rather than a cursor: frame timestamps are derived from PresentMon's anchor and can
+    /// step backwards slightly when it converges, and a cursor that only moves forwards would then pair
+    /// a re-anchored batch against whatever it had reached.
+    /// </remarks>
+    private Reading? NearestReading(DateTimeOffset at)
+    {
+        var low = 0;
+        var high = _readings.Count - 1;
+        if (high < 0)
+        {
+            return null;
+        }
+
+        while (low < high)
+        {
+            var middle = (low + high) / 2;
+            if (_readings[middle].At < at)
+            {
+                low = middle + 1;
+            }
+            else
+            {
+                high = middle;
+            }
+        }
+
+        // low is the first reading at or after the frame; its predecessor may still be the nearer one.
+        var candidate = _readings[low];
+        if (low > 0 && (at - _readings[low - 1].At).Duration() <= (candidate.At - at).Duration())
+        {
+            return _readings[low - 1];
+        }
+
+        return candidate;
+    }
+
+    /// <summary>
+    /// How much wall clock one reading stands for, as the session's own cadence rather than a constant.
+    /// </summary>
+    /// <remarks>
+    /// The median gap and not the mean: a session contains gaps where the collector was restarted or the
+    /// machine slept, and a mean over those would stretch every reading to cover time nothing measured.
+    /// Called under the lock.
+    /// </remarks>
+    private double MedianReadingGapSeconds()
+    {
+        if (_readings.Count < 2)
+        {
+            return 0;
+        }
+
+        var gaps = new double[_readings.Count - 1];
+        for (var index = 1; index < _readings.Count; index++)
+        {
+            gaps[index - 1] = (_readings[index].At - _readings[index - 1].At).TotalSeconds;
+        }
+
+        Array.Sort(gaps);
+        return gaps[gaps.Length / 2];
+    }
+
+    /// <summary>Whether a reading fell inside the loading window after a game start. Called under the lock.</summary>
+    private bool IsLoading(Reading reading)
+    {
         foreach (var start in _gameStarts)
         {
-            if (at >= start - TimeSpan.FromSeconds(IntervalSeconds) && at - start < LoadingWindow)
+            if (reading.At >= start && reading.At - start < LoadingWindow)
             {
                 return true;
             }
@@ -281,22 +400,9 @@ public sealed class VramPressureBandMonitor
         return false;
     }
 
-    /// <summary>Called under the lock.</summary>
-    private Interval IntervalOf(DateTimeOffset timestamp)
-    {
-        var key = timestamp.ToUnixTimeSeconds() / IntervalSeconds;
-        if (!_intervals.TryGetValue(key, out var interval))
-        {
-            interval = new Interval();
-            _intervals[key] = interval;
-        }
-
-        return interval;
-    }
-
     /// <summary>
     /// Fixes what counts as a hitch at twice the interval the session is actually running at, never
-    /// below twice the display's own refresh, and counts the held-back frames against it.
+    /// below twice the display's own refresh, and returns the held-back frames to the queue.
     /// </summary>
     private void SettleThreshold()
     {
@@ -307,101 +413,104 @@ public sealed class VramPressureBandMonitor
         var cadenceMs = frameTimes.Length > 0 ? frameTimes[frameTimes.Length / 2] : _refreshIntervalMs;
         _hitchThresholdMs = Math.Max(cadenceMs, _refreshIntervalMs) * 2;
 
-        foreach (var (at, frameTimeMs) in _warmup)
-        {
-            Count(at, frameTimeMs);
-        }
-
+        _pending.InsertRange(0, _warmup);
         _warmup.Clear();
         _warmup.TrimExcess();
+        DrainPending(final: false);
     }
 
-    /// <summary>Counts one frame into its interval. Called under the lock.</summary>
-    private void Count(DateTimeOffset at, double frameTimeMs)
+    /// <summary>One adapter reading, and what the frames nearest it did.</summary>
+    private sealed class Reading
     {
-        var interval = IntervalOf(at);
-        interval.Frames++;
-        if (frameTimeMs >= _hitchThresholdMs)
+        public Reading(DateTimeOffset at, double percent)
         {
-            interval.Hitches++;
+            At = at;
+            Percent = percent;
         }
-    }
 
-    private sealed class Interval
-    {
-        public int AdapterReadings;
-        public int ReadingsInBand;
-        public int ReadingsInDeepBand;
+        public DateTimeOffset At { get; }
+
+        public double Percent { get; }
+
         public int Frames;
+
+        /// <summary>Wall clock those frames covered, which is what a hitch rate is measured against.</summary>
+        public double FrameMs;
+
         public int Hitches;
-        public double PeakPercent;
 
-        public bool IsInBand => AdapterReadings > 0 && ReadingsInBand >= AdapterReadings * IntervalShareInBand;
+        public bool IsInBand => Percent >= BandPercent;
 
-        public bool IsInDeepBand => AdapterReadings > 0 && ReadingsInDeepBand >= AdapterReadings * IntervalShareInBand;
-
-        /// <summary>The card crossed the band inside this interval rather than spending it on one side.</summary>
-        public bool IsMixed => ReadingsInBand > 0 && ReadingsInBand < AdapterReadings;
+        public bool IsInDeepBand => Percent >= DeepBandPercent;
     }
 }
 
 /// <summary>What the session spent inside the VRAM band, and what it cost while it was there.</summary>
-/// <param name="IntervalSeconds">The bucket the two series were folded into, so the minutes below can be derived.</param>
-/// <param name="MixedIntervals">
-/// Intervals in which the card was on both sides of the band. They are counted on whichever side they
-/// lean to rather than discarded; this figure is how the reader judges how clean the split was.
+/// <param name="AdapterReadings">Readings that carried a VRAM percentage — the unit everything below is counted in.</param>
+/// <param name="SecondsPerReading">
+/// The session's own sampling cadence, as the median gap between readings. It is what turns a count of
+/// readings into minutes, and it is measured rather than assumed so that a collector polling at a
+/// different rate still reports the right amount of time. The hitch rates do not use it: those are
+/// measured against the frames' own intervals, which stay right across a gap in the sampling.
+/// </param>
+/// <param name="PairedFrames">Frames counted against a reading.</param>
+/// <param name="UnpairedFrames">
+/// Frames with no reading within five seconds, which are counted nowhere. Stated rather than hidden: it
+/// is how a reader tells a session where the two instruments overlapped from one where the GPU collector
+/// was down for a stretch.
 /// </param>
 /// <param name="InBandHitchesPerHour">
-/// Null when no interval inside the band carried frames, which is the only honest answer then.
+/// Null when no reading inside the band carried frames, which is the only honest answer then.
 /// </param>
 /// <param name="GameStarts">
 /// How many times the game was seen to start during the session. Carried because it is what makes the
 /// loading split readable: two restarts is eighty minutes of loading, and an evening's share of pressure
 /// cannot be compared with another evening's without knowing that.
 /// </param>
-/// <param name="LoadingIntervals">Measured intervals inside <see cref="VramPressureBandMonitor.LoadingWindow"/> of a start.</param>
-/// <param name="LoadingIntervalsInBand">Of those, the ones spent inside the band.</param>
+/// <param name="LoadingReadings">Readings taken inside <see cref="VramPressureBandMonitor.LoadingWindow"/> of a start.</param>
+/// <param name="LoadingReadingsInBand">Of those, the ones inside the band.</param>
 /// <param name="LoadingInBandHitches">Hitches inside the band during loading, which the steady figure excludes.</param>
 public sealed record VramPressureBandReport(
-    int IntervalSeconds,
-    int MeasuredIntervals,
-    int IntervalsInBand,
-    int IntervalsInDeepBand,
-    int MixedIntervals,
+    int AdapterReadings,
+    int ReadingsInBand,
+    int ReadingsInDeepBand,
+    double SecondsPerReading,
     double PeakPercent,
     double HitchThresholdMs,
     int InBandHitches,
     int OutsideHitches,
     double? InBandHitchesPerHour,
     double? OutsideHitchesPerHour,
+    int PairedFrames,
+    int UnpairedFrames,
     int GameStarts = 0,
-    int LoadingIntervals = 0,
-    int LoadingIntervalsInBand = 0,
+    int LoadingReadings = 0,
+    int LoadingReadingsInBand = 0,
     int LoadingInBandHitches = 0)
 {
     /// <summary>Minutes above the band inside the loading window after a game start.</summary>
-    public double MinutesInBandLoading => LoadingIntervalsInBand * IntervalSeconds / 60d;
+    public double MinutesInBandLoading => Minutes(LoadingReadingsInBand);
 
     /// <summary>Minutes above the band during the rest of the session — the figure to compare evenings on.</summary>
-    public double MinutesInBandSteady => (IntervalsInBand - LoadingIntervalsInBand) * IntervalSeconds / 60d;
+    public double MinutesInBandSteady => Minutes(ReadingsInBand - LoadingReadingsInBand);
 
     /// <summary>Minutes of the session spent loading.</summary>
-    public double LoadingMinutes => LoadingIntervals * IntervalSeconds / 60d;
+    public double LoadingMinutes => Minutes(LoadingReadings);
 
     /// <summary>Minutes of the session spent running.</summary>
-    public double SteadyMinutes => (MeasuredIntervals - LoadingIntervals) * IntervalSeconds / 60d;
+    public double SteadyMinutes => Minutes(AdapterReadings - LoadingReadings);
 
     /// <summary>The measured session in minutes, which is the unit the line is read in.</summary>
-    public double MeasuredMinutes => MeasuredIntervals * IntervalSeconds / 60d;
+    public double MeasuredMinutes => Minutes(AdapterReadings);
 
     /// <summary>Minutes spent inside the band.</summary>
-    public double MinutesInBand => IntervalsInBand * IntervalSeconds / 60d;
+    public double MinutesInBand => Minutes(ReadingsInBand);
 
     /// <summary>Minutes spent inside the deeper band.</summary>
-    public double MinutesInDeepBand => IntervalsInDeepBand * IntervalSeconds / 60d;
+    public double MinutesInDeepBand => Minutes(ReadingsInDeepBand);
 
     /// <summary>Share of the measured session spent inside the band.</summary>
-    public double InBandShare => MeasuredIntervals > 0 ? (double)IntervalsInBand / MeasuredIntervals : 0;
+    public double InBandShare => AdapterReadings > 0 ? (double)ReadingsInBand / AdapterReadings : 0;
 
     /// <summary>
     /// How much worse the band was, or null when there is no finite ratio to state.
@@ -430,19 +539,19 @@ public sealed record VramPressureBandReport(
 
     /// <summary>True once the band was occupied enough to be worth acting on rather than noting.</summary>
     public bool IsPressured =>
-        IntervalsInBand > 0 && !BandCostNothing && (IntervalsInDeepBand > 0 || InBandShare >= 0.05);
+        ReadingsInBand > 0 && !BandCostNothing && (ReadingsInDeepBand > 0 || InBandShare >= 0.05);
 
     public string Message
     {
         get
         {
-            if (IntervalsInBand == 0)
+            if (ReadingsInBand == 0)
             {
                 return $"VRAM-tryck: kortet höll sig under {VramPressureBandMonitor.BandPercent:F0} % hela sessionen "
                     + $"({MeasuredMinutes:F0} mätta minuter, högst {PeakPercent:F1} %). Texturinställningen har marginal.";
             }
 
-            var deep = IntervalsInDeepBand > 0
+            var deep = ReadingsInDeepBand > 0
                 ? $" och över {VramPressureBandMonitor.DeepBandPercent:F0} % i {MinutesInDeepBand:F1} minuter"
                 : string.Empty;
 
@@ -457,10 +566,21 @@ public sealed record VramPressureBandReport(
 
             return $"{lead}VRAM-tryck: kortet låg över {VramPressureBandMonitor.BandPercent:F0} % i {MinutesInBand:F1} av "
                 + $"{MeasuredMinutes:F0} minuter ({InBandShare:P0}){deep}; högst {PeakPercent:F1} %.{split}{gradient} "
-                + $"Mätt i {IntervalSeconds}-sekundersintervall, varav {MixedIntervals} låg på båda sidor om "
-                + "gränsen och räknats dit de lutar. Bandet är den här sessionens egen tid jämförd mot sig "
-                + "själv, inte en gissad gräns.";
+                + $"Mätt per frame mot närmaste GPU-avläsning — {PairedFrames:N0} frames mot "
+                + $"{AdapterReadings:N0} mätpunkter{DescribeUnpaired()}, ingen tidsbucket att hamna på fel "
+                + "sida om. Bandet är den här sessionens egen tid jämförd mot sig själv, inte en gissad gräns.";
         }
+    }
+
+    /// <summary>Minutes a number of readings stands for, at the session's own cadence.</summary>
+    private double Minutes(int readings) => readings * SecondsPerReading / 60d;
+
+    /// <summary>The clause naming the frames no reading was near enough to describe.</summary>
+    private string DescribeUnpaired()
+    {
+        return UnpairedFrames == 0
+            ? string.Empty
+            : $", varav {UnpairedFrames:N0} frames saknade avläsning och räknas inte";
     }
 
     /// <summary>
@@ -474,7 +594,7 @@ public sealed record VramPressureBandReport(
     /// </remarks>
     private string DescribeLoadingSplit()
     {
-        if (GameStarts == 0 || LoadingIntervals == 0 || LoadingIntervals >= MeasuredIntervals)
+        if (GameStarts == 0 || LoadingReadings == 0 || LoadingReadings >= AdapterReadings)
         {
             return string.Empty;
         }

@@ -267,6 +267,28 @@ public sealed class GameFocusMonitorTests
         Assert.Equal(GameFocusState.Unknown, GameFocusMonitor.Classify(readings, Start.AddSeconds(-5)));
     }
 
+    /// <summary>
+    /// A heartbeat is not a switch back.
+    /// </summary>
+    /// <remarks>
+    /// The collector writes the foreground every five seconds whether it changed or not, and the engine
+    /// classifies an incident over those raw samples rather than over the transitions the live monitor
+    /// keeps. Reading "there is an earlier reading" as "the game just got the foreground back" made two
+    /// seconds in every five of an undisturbed evening come out as Settling — and Settling rules the
+    /// window out at 95% confidence, as an alt-tab that never happened.
+    /// </remarks>
+    [Fact]
+    public void HeartbeatsDuringUninterruptedPlayAreNotASwitchBack()
+    {
+        var readings = Enumerable.Range(0, 12)
+            .Select(index => Focus(Start.AddSeconds(index * 5), gameHasFocus: true, "FiveM_b3407_GTAProcess"))
+            .ToArray();
+
+        Assert.Equal(GameFocusState.InPlay, GameFocusMonitor.Classify(readings, Start.AddSeconds(30.5)));
+        Assert.Equal(GameFocusState.InPlay, GameFocusMonitor.Classify(readings, Start.AddSeconds(33)));
+        Assert.Equal(GameFocusState.InPlay, GameFocusMonitor.Classify(readings, Start.AddSeconds(55)));
+    }
+
     private static WindowFocusSample Focus(DateTimeOffset at, bool gameHasFocus, string process) =>
         new(at, gameHasFocus, gameHasFocus ? 24400 : 9876, process);
 }

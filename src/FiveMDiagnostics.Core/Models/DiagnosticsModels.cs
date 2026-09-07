@@ -52,6 +52,26 @@ public enum RootCauseCategory
     /// </para>
     /// </remarks>
     MemoryPagingStall,
+
+    /// <summary>
+    /// The card ran out of room and the driver stopped everything while it made some.
+    /// </summary>
+    /// <remarks>
+    /// Sharper than <see cref="GpuVramPressure"/>, which is a statistical claim that high occupancy and
+    /// stutter travel together. This is the mechanism caught in the act, in three instruments that know
+    /// nothing about each other: VRAM steps up into the band in the seconds before the frame, the card's
+    /// utilization <em>and</em> its memory bandwidth both fall to zero in the same reading, and the
+    /// game's main thread is off the processor waiting for its own render thread — which is on the
+    /// processor the whole time, spinning inside <c>d3d11.dll</c> and <c>nvwgf2umx.dll</c>. A card that
+    /// is merely busy has bandwidth; a card that has stopped has none.
+    /// <para>
+    /// Its own category rather than a flavour of <see cref="GpuVramPressure"/> because the two say
+    /// different things to whoever reads them. "The card is often full" is a trend. "The driver
+    /// evacuated surfaces over PCIe and the game stood still for 425 ms while it happened" is an event
+    /// with a time on it, and on 6 September it was the only mechanism left in the evening.
+    /// </para>
+    /// </remarks>
+    GpuResidencyStall,
 }
 
 public enum ArtifactKind
