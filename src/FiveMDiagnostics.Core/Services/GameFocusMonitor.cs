@@ -410,6 +410,55 @@ public sealed class GameFocusMonitor
     }
 
     /// <summary>
+    /// A window worth flagging on an <see cref="GameFocusState.InPlay"/> frame, even though it already
+    /// counts as play. Longer than <see cref="RegainGrace"/> on purpose.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="RegainGrace"/> decides what still costs the switch itself and is excluded; this decides
+    /// what is worth a caveat once a frame has cleared that bar and counts as spellagg regardless. GTA V
+    /// runs with <c>PauseOnFocusLoss 1</c>, so regaining the foreground restarts the simulation and streams
+    /// back in whatever had evicted while it was away — a cost that does not always finish inside two
+    /// seconds. The 738 ms frame at 22:19:04 on 7 September landed 3.2 seconds after such a return, just
+    /// past <see cref="RegainGrace"/>, and lengthening that grace period would have hidden a real stall
+    /// behind the same excuse instead of only explaining the switch. Five seconds is long enough to cover
+    /// the observed case with margin while leaving the frame counted, tagged, and countable either way.
+    /// </remarks>
+    public static readonly TimeSpan ExtendedRegainWindow = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// How long the game has held the foreground continuously as of <paramref name="at"/>, or null when it
+    /// does not have it then, or has held it since the first reading with nothing to measure the return
+    /// from.
+    /// </summary>
+    /// <param name="readings">Focus readings in ascending order of time. Out-of-order input is not handled.</param>
+    public static TimeSpan? TimeSinceRegainedFocus(IReadOnlyList<WindowFocusSample> readings, DateTimeOffset at)
+    {
+        if (readings.Count == 0 || at < readings[0].Timestamp)
+        {
+            return null;
+        }
+
+        var index = readings.Count - 1;
+        while (index > 0 && readings[index].Timestamp > at)
+        {
+            index--;
+        }
+
+        if (!readings[index].GameHasFocus)
+        {
+            return null;
+        }
+
+        var regainedAt = index;
+        while (regainedAt > 0 && readings[regainedAt - 1].GameHasFocus)
+        {
+            regainedAt--;
+        }
+
+        return regainedAt > 0 ? at - readings[regainedAt].Timestamp : null;
+    }
+
+    /// <summary>
     /// Moves the frames counted just before a focus loss into the excluded tally. Called under the lock.
     /// </summary>
     private void ReclaimFramesBefore(DateTimeOffset lostAt)

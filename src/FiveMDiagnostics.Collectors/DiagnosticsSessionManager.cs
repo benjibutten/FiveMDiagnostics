@@ -967,6 +967,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 Report(StatusLevel.Info, "Analysis.Verdicts", focus);
             }
 
+            if (report.InsufficientEvidenceMessage is { } gap && ShouldWriteSummary("Analysis.Verdicts.InsufficientEvidence", gap))
+            {
+                Report(StatusLevel.Info, "Analysis.Verdicts", gap);
+            }
+
             if (ShouldWriteSummary("Analysis.Verdicts", report.Message))
             {
                 Report(StatusLevel.Info, "Analysis.Verdicts", report.Message);
@@ -1227,7 +1232,42 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             DiscardReplacedCapture(replaced, frameTimeMs);
         }
 
+        if (!reserved && budget.LastRefusalReason == CaptureRefusalReason.PreviousCaptureStillWriting)
+        {
+            NoteDeferredCapture(timestamp, frameTimeMs);
+        }
+
         return ReportRefusal(reserved, refusal);
+    }
+
+    /// <summary>
+    /// Leaves a note on the incident's own window when its capture was declined because another one was
+    /// still writing, so the analysis is not left to notice by luck that the seconds it wanted are
+    /// probably sitting in that other file.
+    /// </summary>
+    /// <remarks>
+    /// Two failures landed on the same frame on 7 September: the reserve refused four smaller hitches in
+    /// the same cluster, and the 458 ms frame that finally cleared it was then refused again here, by a
+    /// capture still writing from 41 seconds earlier. The only reason that incident could still be read
+    /// at all was that an unrelated marker five seconds earlier happened to pull the right seconds into
+    /// its own ring-buffer window — <see cref="IncidentMaterializer"/> keeps that window regardless of
+    /// whether a capture was taken. Writing the note explicitly stops the next reader from needing the
+    /// same luck.
+    /// </remarks>
+    private void NoteDeferredCapture(DateTimeOffset timestamp, double frameTimeMs)
+    {
+        var windowStart = timestamp - _settings.PreIncidentWindow;
+        var windowEnd = timestamp + _settings.PostIncidentWindow;
+        var note = new ArtifactEvidence(
+            timestamp,
+            ArtifactKind.CaptureDeferred,
+            $"Deep capture för en {frameTimeMs:F0} ms hitch sköts upp: föregående capture skrev fortfarande. "
+                + $"Incidentens eget fönster ({windowStart.ToLocalTime():HH:mm:ss}–{windowEnd.ToLocalTime():HH:mm:ss}) "
+                + "sparas ändå ur telemetri-ringbufferten. Kontrollera om filen som skrivs just nu täcker samma "
+                + "sekunder innan du antar att spåret saknas helt.",
+            new Dictionary<string, double>());
+
+        _ = _channel?.Writer.TryWrite(note);
     }
 
     /// <summary>
@@ -1535,7 +1575,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         // Counted like every other incident. A demo scenario added during a live session ends up in the
         // session's own history, so leaving it out of the tally made the end-of-session ranking
         // disagree with the incident list it is supposed to summarise.
-        _verdicts?.Record(analyzed.Marker.Id, analyzed.Analysis?.Hypotheses.FirstOrDefault()?.Category);
+        _verdicts?.Record(analyzed.Marker.Id, analyzed.Analysis?.Hypotheses.FirstOrDefault()?.Category, analyzed.Analysis?.EvidenceGap);
 
         IncidentCompleted?.Invoke(this, analyzed);
 
@@ -1641,6 +1681,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             {
                 Report(StatusLevel.Info, "GpuProcessMemory.Accounting", steady);
             }
+
+            foreach (var recovered in drift.RecoveredMessages)
+            {
+                Report(StatusLevel.Info, "GpuProcessMemory.Accounting", recovered);
+            }
         }
 
         foreach (var row in newlyProven)
@@ -1658,8 +1703,10 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 StatusLevel.Warning,
                 "GpuProcessMemory.Accounting",
                 $"{process.ProcessName} {proof} — typiskt kompositorn som håller en referens till spelets ytor. "
-                + "Raden loggas men utesluts ur rapporternas topplistor och ur VRAM-budgeten för resten av "
-                + "sessionen, så att den process som faktiskt växer syns.");
+                + "Raden loggas men utesluts ur rapporternas topplistor och ur alla summor som räknas radvis för "
+                + "resten av sessionen, så att den process som faktiskt växer syns. Minnet den håller räknas "
+                + $"ändå med i VRAM-budgeten, som mäts mot kortets egen siffra, och namnet visas fortsatt där "
+                + "det förklarar en incident.");
         }
 
         return annotated;
@@ -2266,7 +2313,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
         // Counted by marker rather than by publication, so a re-analysis replaces the verdict instead of
         // adding a second one for the same incident.
-        _verdicts?.Record(analyzed.Marker.Id, analyzed.Analysis?.Hypotheses.FirstOrDefault()?.Category);
+        _verdicts?.Record(analyzed.Marker.Id, analyzed.Analysis?.Hypotheses.FirstOrDefault()?.Category, analyzed.Analysis?.EvidenceGap);
 
         // Written before the history is touched by anything else: an incident evicted by the retention
         // cap, or dropped when the app closes, still leaves its summary on disk.
@@ -2418,7 +2465,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _incidents[index] = updated;
         }
 
-        _verdicts?.Record(updated.Marker.Id, updated.Analysis?.Hypotheses.FirstOrDefault()?.Category);
+        _verdicts?.Record(updated.Marker.Id, updated.Analysis?.Hypotheses.FirstOrDefault()?.Category, updated.Analysis?.EvidenceGap);
 
         // The journal line written when the incident completed describes the analysis as it stood before
         // this import, so the conclusion the import produced — usually the one that actually explains

@@ -23,9 +23,14 @@ public sealed class IncidentVerdictTally
 {
     private readonly object _sync = new();
     private readonly Dictionary<Guid, RootCauseCategory> _verdicts = [];
+    private readonly Dictionary<Guid, InsufficientEvidenceReason> _evidenceGaps = [];
 
     /// <summary>Records, or replaces, the top-ranked category for one incident.</summary>
-    public void Record(Guid markerId, RootCauseCategory? category)
+    /// <param name="evidenceGap">
+    /// Why the category is <see cref="RootCauseCategory.InsufficientEvidence"/>, when it is. Ignored
+    /// otherwise, and cleared on a re-analysis that no longer classifies the incident that way.
+    /// </param>
+    public void Record(Guid markerId, RootCauseCategory? category, InsufficientEvidenceReason? evidenceGap = null)
     {
         if (category is not { } verdict)
         {
@@ -35,6 +40,15 @@ public sealed class IncidentVerdictTally
         lock (_sync)
         {
             _verdicts[markerId] = verdict;
+
+            if (verdict == RootCauseCategory.InsufficientEvidence && evidenceGap is { } gap)
+            {
+                _evidenceGaps[markerId] = gap;
+            }
+            else
+            {
+                _evidenceGaps.Remove(markerId);
+            }
         }
     }
 
@@ -54,7 +68,12 @@ public sealed class IncidentVerdictTally
                 .OrderByDescending(item => item.Count)
                 .ToArray();
 
-            return new IncidentVerdictReport(_verdicts.Count, byCategory);
+            var byGap = _evidenceGaps.Values
+                .GroupBy(reason => reason)
+                .Select(group => new EvidenceGapCount(group.Key, group.Count()))
+                .ToArray();
+
+            return new IncidentVerdictReport(_verdicts.Count, byCategory, byGap);
         }
     }
 }
@@ -62,8 +81,14 @@ public sealed class IncidentVerdictTally
 /// <summary>How often one category came out on top.</summary>
 public sealed record IncidentVerdictCount(RootCauseCategory Category, int Count);
 
+/// <summary>How often one reason stood behind an <see cref="RootCauseCategory.InsufficientEvidence"/> verdict.</summary>
+public sealed record EvidenceGapCount(InsufficientEvidenceReason Reason, int Count);
+
 /// <summary>What the engine concluded across a whole session.</summary>
-public sealed record IncidentVerdictReport(int Incidents, IReadOnlyList<IncidentVerdictCount> ByCategory)
+public sealed record IncidentVerdictReport(
+    int Incidents,
+    IReadOnlyList<IncidentVerdictCount> ByCategory,
+    IReadOnlyList<EvidenceGapCount> ByEvidenceGap)
 {
     /// <summary>Incidents where the card's memory was the top-ranked explanation.</summary>
     /// <remarks>
@@ -118,6 +143,58 @@ public sealed record IncidentVerdictReport(int Incidents, IReadOnlyList<Incident
             + $"({(double)NotInFocusIncidents / Incidents:P0}) inföll medan spelet låg bakom ett annat "
             + $"fönster — alt-tab eller Windows-tangenten. De räknas inte som spellagg. Kvar i spelet: "
             + $"{IncidentsInPlay} incidenter.";
+
+    /// <summary>Incidents the engine could not classify at all.</summary>
+    public int InsufficientEvidenceIncidents => ByCategory
+        .Where(item => item.Category == RootCauseCategory.InsufficientEvidence)
+        .Sum(item => item.Count);
+
+    /// <summary>
+    /// The line that splits an "insufficient evidence" count by why, or null when the session had none.
+    /// </summary>
+    /// <remarks>
+    /// On 8 September this verdict was 38% of a session's incidents and appeared in the ranking below as
+    /// one entry among many, with no way to tell a session that is short on deep captures from one whose
+    /// windows were simply too quiet to classify. The two call for different responses — more budget, or
+    /// none at all — so the count is worth nothing until it is split.
+    /// </remarks>
+    public string? InsufficientEvidenceMessage
+    {
+        get
+        {
+            if (InsufficientEvidenceIncidents == 0)
+            {
+                return null;
+            }
+
+            var byReason = ByEvidenceGap.ToDictionary(item => item.Reason, item => item.Count);
+            var parts = new List<string>();
+
+            if (byReason.GetValueOrDefault(InsufficientEvidenceReason.NoFrameData) is > 0 and var noFrames)
+            {
+                parts.Add($"{noFrames} hade ingen framedata alls");
+            }
+
+            if (byReason.GetValueOrDefault(InsufficientEvidenceReason.NoTrace) is > 0 and var noTrace)
+            {
+                parts.Add($"{noTrace} hade ingen trace");
+            }
+
+            if (byReason.GetValueOrDefault(InsufficientEvidenceReason.TooFewSpikes) is > 0 and var tooFewSpikes)
+            {
+                parts.Add($"{tooFewSpikes} hade för få spikes i fönstret");
+            }
+
+            if (byReason.GetValueOrDefault(InsufficientEvidenceReason.Inconclusive) is > 0 and var inconclusive)
+            {
+                parts.Add($"{inconclusive} hade både trace och spikes men gick ändå inte att klassificera");
+            }
+
+            var breakdown = parts.Count > 0 ? $": {string.Join(", ", parts)}" : string.Empty;
+            return $"Insufficient evidence: {InsufficientEvidenceIncidents} av {Incidents} incidenter "
+                + $"({(double)InsufficientEvidenceIncidents / Incidents:P0}) saknade underlag för en dom{breakdown}.";
+        }
+    }
 
     /// <summary>The whole ranking, largest first, for the reader who wants the rest of it.</summary>
     public string Message

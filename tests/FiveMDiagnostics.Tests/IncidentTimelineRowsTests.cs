@@ -19,6 +19,35 @@ public sealed class IncidentTimelineRowsTests
 
     private static readonly DateTimeOffset FrameAt = Start.AddSeconds(21);
 
+    [Theory]
+    [InlineData("wpr", 0, 1000, true)]
+    [InlineData("WPR.exe", 0, 1000, true)]
+    [InlineData("wpr", 10, 1000, false)]
+    [InlineData("wpr", 0, 0, false)]
+    [InlineData("wprOther", 0, 1000, false)]
+    public void HardFaultAttributionUsesSystemProcessActivity(string name, int offsetSeconds, long io, bool expected)
+    {
+        var incident = Incident();
+        var peak = incident.GetEvents<SystemTelemetrySample>().First();
+        incident = incident with
+        {
+            Events = incident.Events.Where(item => item is not SystemTelemetrySample)
+                .Concat(new TelemetryEvent[]
+                {
+                    peak with { HardFaultPagesPerSecond = 250000, TopDiskProcesses = [] },
+                    peak with
+                    {
+                        Timestamp = peak.Timestamp.AddSeconds(offsetSeconds),
+                        HardFaultPagesPerSecond = 0,
+                        TopDiskProcesses = [new ProcessActivity(name, 123, 0, io)],
+                    },
+                }).ToArray(),
+        };
+
+        var disk = new FiveMCorrelationEngine().Analyze(incident).TimelineHighlights.Single(item => item.Category == "Disk");
+        Assert.Equal(expected, disk.Summary.Contains("sammanfaller med", StringComparison.Ordinal));
+    }
+
     /// <summary>
     /// The counters have been collected per physical disk since 5 September and reached nothing. The
     /// line names the disk, its latency and its queue, which is what a storage verdict has to rest on.

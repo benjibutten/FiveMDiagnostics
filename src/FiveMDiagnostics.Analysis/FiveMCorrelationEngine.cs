@@ -52,6 +52,20 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
     /// </remarks>
     private static readonly TimeSpan ResidencyRunUp = TimeSpan.FromSeconds(10);
 
+    /// <summary>
+    /// A single-reading VRAM fall this size is the eviction itself, not the build-up toward it.
+    /// </summary>
+    /// <remarks>
+    /// Added on 8 September, after the rule missed two of the three residency stalls a session actually
+    /// contained. Both misses had the card already sitting in the pressure band before the frame rather
+    /// than crossing into it during <see cref="ResidencyRunUp"/> — 90.9 % for six seconds, then 87.9 % —
+    /// and one of them never dropped utilization below 9 %, above <see cref="StalledGpuUtilizationPercent"/>.
+    /// A card that is full and then loses 300 MB in one reading has just been evacuated regardless of what
+    /// its utilization counter says at that instant; 2.5 points is comfortably under the observed 3.0 and
+    /// well above the noise a steady-state reading shows between polls.
+    /// </remarks>
+    private const double VramEvictionDropPercentPoints = 2.5;
+
     /// <summary>Prefix under which a trace names what the thread that blocked the game was executing.</summary>
     private const string BlockerModuleCoresPrefix = "gameThreadBlockerCores_";
 
@@ -244,6 +258,15 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
     private const double ClassificationFloor = 0.35;
 
     /// <summary>
+    /// Severe spikes a window needs before a verdict that falls short of <see cref="ClassificationFloor"/>
+    /// is called inconclusive rather than simply thin. Below this, the window itself did not offer enough
+    /// material to classify — a quiet ninety seconds with a trace attached is not a failure of the engine,
+    /// and separating the two is what turns a session's 38% "insufficient evidence" figure from a single
+    /// unexplained number into one an evening can act on.
+    /// </summary>
+    private const int MinSevereSpikesForConfidentVerdict = 2;
+
+    /// <summary>
     /// Prefix under which a deep capture's per-process CPU arrives in an artifact's metrics.
     /// </summary>
     private const string TraceProcessCoresPrefix = "cpuProcessCores_";
@@ -350,7 +373,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
                 true,
                 "Insufficient evidence. PresentMon levererade inga frames i incidentfönstret.",
                 [new TimelineHighlight(incident.Marker.MarkedAt, "Capture health", "0 frames i incidentfönstret; rotorsak klassificerades inte.")],
-                []);
+                [],
+                InsufficientEvidenceReason.NoFrameData);
         }
 
         var metrics = BuildFrameMetrics(frameSamples, incident.Environment.DisplayRefreshRateHz);
@@ -393,12 +417,40 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         // background.
         var secondPlace = hypotheses.Skip(1).FirstOrDefault();
 
+        // Set only on the fallback below, so a session that never reaches it leaves this null rather than
+        // reporting a reason for a verdict that never happened.
+        InsufficientEvidenceReason? evidenceGap = null;
+
         if (hypotheses.Count == 0 || hypotheses[0].Confidence < ClassificationFloor)
         {
+            // A verdict of "insufficient evidence" was, on 8 September, 38% of a session's incidents and
+            // appeared nowhere except as one line among many in the verdict tally — a number with no way
+            // to act on it. Splitting the reason three ways is what turns it back into something the next
+            // session can do something about: no trace at all is a capture-budget question, a trace with
+            // too few spikes to classify confidently is expected on a quiet window, and a trace with
+            // plenty of both that still failed to converge is the one case actually worth a closer look.
+            var hasTrace = artifacts.Any(item => item.Kind == ArtifactKind.EtlTrace
+                && OverlapsWindow(item, incident.WindowStart, incident.WindowEnd));
+            evidenceGap = !hasTrace
+                ? InsufficientEvidenceReason.NoTrace
+                : metrics.SevereSpikeCount < MinSevereSpikesForConfidentVerdict
+                    ? InsufficientEvidenceReason.TooFewSpikes
+                    : InsufficientEvidenceReason.Inconclusive;
+
+            var detail = evidenceGap switch
+            {
+                InsufficientEvidenceReason.NoTrace =>
+                    "Ingen ETL-trace täckte fönstret, så varje hypotes som läser en trace hade inget att gå på.",
+                InsufficientEvidenceReason.TooFewSpikes =>
+                    $"{metrics.SevereSpikeCount} spikes ≥{metrics.SevereThresholdMs:F0} ms i fönstret, under de "
+                        + $"{MinSevereSpikesForConfidentVerdict} som ger ett säkert underlag.",
+                _ => "Trace och spikes fanns båda, men inget enskilt spår pekade tydligt nog åt ett håll.",
+            };
+
             hypotheses.Insert(0, new HypothesisScore(
                 RootCauseCategory.InsufficientEvidence,
                 0.2,
-                ["Det fanns inte tillräckligt med samstämmig telemetry för en säker klassificering."]));
+                [$"Det fanns inte tillräckligt med samstämmig telemetry för en säker klassificering. {detail}"]));
         }
 
         // Asked about the moment the incident was marked, not about now. The analysis runs off a queue
@@ -414,7 +466,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             top.Category == RootCauseCategory.InsufficientEvidence,
             summary,
             highlights,
-            suspectedProcesses);
+            suspectedProcesses,
+            evidenceGap);
     }
 
     private static FrameMetrics BuildFrameMetrics(IReadOnlyList<FrameTelemetrySample> frameSamples, double? refreshRateHz)
@@ -684,13 +737,24 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             .Select(process => $"{process.ProcessName} {process.DedicatedGigabytes:F1} GB")
             .ToArray();
 
-        if (owners.Length == 0)
+        // Excluded from the top three and from the sum below because the row cannot be trusted as a
+        // number, which is right — but a row proven to double count still holds real memory, and dropping
+        // it from every line that names owners is how dwm at 13% of a card, and the process that grew
+        // most of a session, stopped being readable out of the app the moment the exclusion fired on
+        // 8 September. "Don't count it" and "don't show it" are different decisions.
+        var doubleCounted = sample.Processes
+            .Where(process => !process.IsImplausible && sample.IsUnbelievable(process))
+            .Where(process => process.DedicatedGigabytes >= 0.1)
+            .Select(process => $"{process.ProcessName} {process.DedicatedGigabytes:F1} GB (dubbelräknar, ingår inte i summan)")
+            .ToArray();
+
+        if (owners.Length == 0 && doubleCounted.Length == 0)
         {
             return null;
         }
 
-        var line = string.Join(", ", owners) + ".";
-        if (totalVramGb <= 0)
+        var line = string.Join(", ", owners.Concat(doubleCounted)) + ".";
+        if (owners.Length == 0 || totalVramGb <= 0)
         {
             return line;
         }
@@ -884,15 +948,55 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
 
         var at = worstFrame.Timestamp;
         var available = gpuSamples.Where(sample => sample.IsAvailable).ToArray();
+        var ordered = available.OrderBy(sample => sample.Timestamp).ToArray();
 
-        // Both readings required, and the pairing allowed the same clock skew a thread wait is: the
-        // frame's timestamp comes from PresentMon's anchor and the adapter's from the wall clock.
-        var stopped = available
-            .Where(sample => (sample.Timestamp - at).Duration().TotalMilliseconds <= AnchorSkewToleranceMs)
-            .FirstOrDefault(sample => sample.UtilizationPercent is { } utilization
-                && utilization <= StalledGpuUtilizationPercent
-                && sample.MemoryBandwidthUtilizationPercent is { } bandwidth
-                && bandwidth <= StalledGpuBandwidthPercent);
+        // The clock skew tolerance is the same one a thread wait allows: the frame's timestamp comes from
+        // PresentMon's anchor and the adapter's from the wall clock.
+        //
+        // Two ways in, not one. The hard stop (bandwidth at floor, plus either utilization at floor or the
+        // card already sitting in the pressure band) covers a card that has stopped outright; the sudden
+        // drop covers the reading immediately after, where the driver has already freed a couple hundred
+        // megabytes and utilization has not necessarily collapsed all the way — 9 % measured at 22:19:04
+        // on 8 September, above StalledGpuUtilizationPercent and missed entirely before this. The drop is
+        // evidence on its own regardless of what utilization was doing: nothing but eviction moves that
+        // much VRAM in one reading.
+        GpuTelemetrySample? stopped = null;
+        var stoppedByDrop = false;
+        for (var i = 0; i < ordered.Length; i++)
+        {
+            var sample = ordered[i];
+            if ((sample.Timestamp - at).Duration().TotalMilliseconds > AnchorSkewToleranceMs)
+            {
+                continue;
+            }
+
+            var bandwidthAtFloor = sample.MemoryBandwidthUtilizationPercent is { } bandwidth
+                && bandwidth <= StalledGpuBandwidthPercent;
+            var utilizationAtFloor = sample.UtilizationPercent is { } utilization
+                && utilization <= StalledGpuUtilizationPercent;
+            var vramSittingInBand = sample.VramUsagePercent is { } vram
+                && vram >= VramPressureBandMonitor.BandPercent;
+
+            if (bandwidthAtFloor && (utilizationAtFloor || vramSittingInBand))
+            {
+                stopped = sample;
+                break;
+            }
+
+            var previous = i > 0 ? ordered[i - 1] : null;
+            if (previous?.VramUsagePercent is { } before
+                && sample.VramUsagePercent is { } after
+                && before >= VramPressureBandMonitor.BandPercent
+                && sample.Timestamp > previous.Timestamp
+                && sample.Timestamp - previous.Timestamp <= TimeSpan.FromSeconds(2)
+                && before - after >= VramEvictionDropPercentPoints)
+            {
+                stopped = sample;
+                stoppedByDrop = true;
+                break;
+            }
+        }
+
         if (stopped is null)
         {
             return;
@@ -906,6 +1010,10 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             .ToArray();
         var peakVram = runUp.DefaultIfEmpty(0).Max();
         var risePercent = runUp.Length > 0 ? peakVram - runUp.Min() : 0;
+
+        // "Sits at or above" the band, not "crossed into it during the run-up": the card can arrive at the
+        // frame already having spent several seconds above the line, which is exactly what the 8 September
+        // misses looked like — 90+ % for six seconds before the stall, no crossing inside the window at all.
         var vramInBand = peakVram >= VramPressureBandMonitor.BandPercent;
 
         var driverModules = artifacts
@@ -920,12 +1028,18 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         var confidence = 0.5;
         var evidence = new List<string>
         {
-            $"Kortet slutade räkna kl. {stopped.Timestamp.ToLocalTime():HH:mm:ss}: utnyttjande "
-            + $"{stopped.UtilizationPercent:F0} % och minnesbandbredd "
-            + $"{stopped.MemoryBandwidthUtilizationPercent:F0} % i samma mätpunkt, "
-            + $"{(at - stopped.Timestamp).Duration().TotalMilliseconds:F0} ms från framen på "
-            + $"{worstFrame.FrameTimeMs:F0} ms. Ett hårt belastat kort har bandbredd; ett kort som står "
-            + "still har ingen — det är den siffran som skiljer en överbelastad GPU från en stannad.",
+            stoppedByDrop
+                ? $"VRAM föll {VramEvictionDropPercentPoints:F1} procentenheter eller mer i en enda mätpunkt kl. "
+                    + $"{stopped.Timestamp.ToLocalTime():HH:mm:ss} — utnyttjande {stopped.UtilizationPercent:F0} % "
+                    + $"i samma mätpunkt, {(at - stopped.Timestamp).Duration().TotalMilliseconds:F0} ms från framen "
+                    + $"på {worstFrame.FrameTimeMs:F0} ms. Ett fall av den storleken i en enda avläsning är "
+                    + "evakueringen själv, inte en process som växer."
+                : $"Kortet slutade räkna kl. {stopped.Timestamp.ToLocalTime():HH:mm:ss}: utnyttjande "
+                    + $"{stopped.UtilizationPercent:F0} % och minnesbandbredd "
+                    + $"{stopped.MemoryBandwidthUtilizationPercent:F0} % i samma mätpunkt, "
+                    + $"{(at - stopped.Timestamp).Duration().TotalMilliseconds:F0} ms från framen på "
+                    + $"{worstFrame.FrameTimeMs:F0} ms. Ett hårt belastat kort har bandbredd; ett kort som står "
+                    + "still har ingen — det är den siffran som skiljer en överbelastad GPU från en stannad.",
         };
 
         if (vramInBand)
@@ -2190,20 +2304,61 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         var disk = string.IsNullOrWhiteSpace(worst.WorstDiskInstance) ? "okänd disk" : worst.WorstDiskInstance;
         var queue = worst.DiskQueueLength is { } depth ? $", kö {depth:F1}" : string.Empty;
 
-        var hardFaults = systemSamples
-            .Where(item => item.HardFaultPagesPerSecond is not null)
-            .Select(item => item.HardFaultPagesPerSecond!.Value)
-            .DefaultIfEmpty(double.NaN)
-            .Max();
-        var faults = double.IsNaN(hardFaults)
-            ? string.Empty
-            : $" Sidinläsningar högst {hardFaults:F0}/s.";
+        var faults = DescribeHardFaults(systemSamples);
 
         var verdict = latencyMs >= SlowDiskLatencyMs
             ? $" Över {SlowDiskLatencyMs:F0} ms per operation är en disk som köar, inte en som svarar."
             : string.Empty;
 
         return $"Långsammaste disk i fönstret: {disk} på {latencyMs:F1} ms{queue}.{faults}{verdict}";
+    }
+
+    /// <summary>
+    /// How far a process's own sample may sit from the hard-fault peak and still be read as its cause.
+    /// </summary>
+    private static readonly TimeSpan HardFaultAttributionTolerance = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// The hard-fault rate is a system-wide counter with no process breakdown, so <c>wpr.exe</c> flushing
+    /// the deep-capture ring buffer to disk shows up in the same figure as the game paging.
+    /// </summary>
+    /// <remarks>
+    /// Measured across five sessions: the reading topped 243 000-285 000/s in exactly the five incidents
+    /// that were also deep-capture windows, against a median of 2 445/s everywhere else. That is
+    /// <c>wpr.exe</c> writing out a 768 MB ring buffer, not the game streaming — and unlike the disk
+    /// latency line above, which already names the volume and the process behind the slowest operation,
+    /// this counter said nothing about who was reading. It still cannot say for certain — the counter
+    /// itself carries no process id — but a capture tool with heavy disk throughput at the same second the
+    /// peak was read is a strong enough correlation to say so rather than leave the number looking like a
+    /// finding about the game.
+    /// </remarks>
+    private static string DescribeHardFaults(IReadOnlyList<SystemTelemetrySample> systemSamples)
+    {
+        var peak = systemSamples
+            .Where(item => item.HardFaultPagesPerSecond is not null)
+            .OrderByDescending(item => item.HardFaultPagesPerSecond!.Value)
+            .FirstOrDefault();
+
+        if (peak is null)
+        {
+            return string.Empty;
+        }
+
+        var hardFaults = peak.HardFaultPagesPerSecond!.Value;
+
+        var capturing = systemSamples
+            .Where(sample => (sample.Timestamp - peak.Timestamp).Duration() <= HardFaultAttributionTolerance)
+            .SelectMany(sample => sample.TopDiskProcesses)
+            .FirstOrDefault(process =>
+                (string.Equals(process.ProcessName, "wpr", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(process.ProcessName, "wpr.exe", StringComparison.OrdinalIgnoreCase))
+                && process.IoBytesPerSecond > 0);
+
+        return capturing is null
+            ? $" Sidinläsningar högst {hardFaults:F0}/s."
+            : $" Sidinläsningar högst {hardFaults:F0}/s — sammanfaller med {capturing.ProcessName} som använder "
+                + "disk i samma sekund, sannolikt en deep capture som flushar sin ringbuffert snarare än "
+                + "spelet som strömmar.";
     }
 
     /// <summary>
@@ -2232,6 +2387,17 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
 
         return focusState switch
         {
+            // Still spellagg — the frame cleared RegainGrace and counts as play — but a frame this close to
+            // a focus return is worth its own caveat rather than reading identically to one an hour into an
+            // unbroken session. See ExtendedRegainWindow for why this is longer than the grace period that
+            // decides InPlay in the first place.
+            GameFocusState.InPlay when GameFocusMonitor.TimeSinceRegainedFocus(focusSamples, frameAt) is { } sinceRegain
+                    && sinceRegain <= GameFocusMonitor.ExtendedRegainWindow =>
+                $"Spelet låg i förgrunden vid den värsta framen ({at}), {sinceRegain.TotalSeconds:F1} s efter en "
+                + "fokusåtergång — utanför de "
+                + $"{GameFocusMonitor.RegainGrace.TotalSeconds:F0} s som räknas som växlingens egen kostnad, men "
+                + "fortfarande inom perioden då simuleringen och strömmaren hämtar igen det som evakuerades. "
+                + "Räknas som spellagg; går att räkna bort separat om du vill jämföra med och utan.",
             GameFocusState.InPlay =>
                 $"Spelet låg i förgrunden vid den värsta framen ({at}); frametiderna beskriver spelet som spelades.",
             GameFocusState.Settling =>

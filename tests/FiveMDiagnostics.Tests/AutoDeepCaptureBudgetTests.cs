@@ -104,6 +104,12 @@ public sealed class AutoDeepCaptureBudgetTests
 
         for (var i = 0; i < 23; i++)
         {
+            if (i == 8)
+            {
+                // The nominal tail, six-second drain margin and write have completed.
+                budget.NoteCaptureWritten(Start.AddSeconds(38));
+            }
+
             budget.TryReserve(timestamp, frameTimeMs: i is 4 or 9 ? 606 : 180, out _);
             timestamp = timestamp.AddSeconds(5);
         }
@@ -158,7 +164,7 @@ public sealed class AutoDeepCaptureBudgetTests
         var options = Options();
         var budget = new AutoDeepCaptureBudget(options);
 
-        Assert.Equal(options.MaxPostMarkerTail + TimeSpan.FromSeconds(30), options.ExtremeCaptureSpacing);
+        Assert.Equal(TimeSpan.FromSeconds(48), options.ExtremeCaptureSpacing);
         Assert.True(budget.TryReserve(Start, frameTimeMs: 160, out _));
 
         // Nothing has said the file is written, so the twelve second tail is still in play.
@@ -166,7 +172,9 @@ public sealed class AutoDeepCaptureBudgetTests
         Assert.Contains("skrivit klart", refusal!, StringComparison.Ordinal);
         Assert.Equal(1, budget.Spent);
 
-        Assert.True(budget.TryReserve(Start.AddSeconds(43), frameTimeMs: 356, out _));
+        Assert.False(budget.TryReserve(Start.AddSeconds(43), frameTimeMs: 356, out _));
+        Assert.Equal(1, budget.Spent);
+        Assert.True(budget.TryReserve(Start.AddSeconds(49), frameTimeMs: 356, out _));
     }
 
     /// <summary>
@@ -472,13 +480,13 @@ public sealed class AutoDeepCaptureBudgetTests
             item.AutoCaptureOverrideCooldown = TimeSpan.FromSeconds(60);
         });
 
-        // Refill plus the tail plus the drain — 28 s is the fastest of the five measured captures, so
-        // clearing it is the weakest claim that is still true.
-        var mustClear = large.EstimatedRingBufferSeconds + large.PostMarkerTail.TotalSeconds + 28;
+        // Compare durations at tick precision, including both the CKCL margin and the write.
+        var mustClear = TimeSpan.FromSeconds(large.EstimatedRingBufferSeconds) + large.PostMarkerTail
+            + DeepCaptureOptions.CkclDrainMargin + TimeSpan.FromSeconds(30);
         Assert.True(
-            large.AutoCaptureOverrideCooldown.TotalSeconds >= mustClear,
+            large.AutoCaptureOverrideCooldown >= mustClear,
             $"override spacing {large.AutoCaptureOverrideCooldown.TotalSeconds:F0}s does not clear the "
-            + $"{mustClear:F0}s a capture costs before the buffer is worth reading again");
+            + $"{mustClear.TotalSeconds:F0}s a capture costs before the buffer is worth reading again");
 
         var budget = new AutoDeepCaptureBudget(large);
         Assert.True(budget.TryReserve(Start, frameTimeMs: 900, out _));

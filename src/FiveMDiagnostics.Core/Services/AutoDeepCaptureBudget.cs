@@ -9,6 +9,31 @@
 /// </param>
 public sealed record CaptureReplacement(DateTimeOffset At, double FrameTimeMs, string? Path);
 
+/// <summary>Why the most recent reservation was refused, for a caller that wants more than the sentence.</summary>
+public enum CaptureRefusalReason
+{
+    /// <summary>The reservation succeeded, or nothing has been asked for yet.</summary>
+    None,
+
+    /// <summary>The session ceiling is spent and no taken capture was weak enough to replace.</summary>
+    SessionBudgetSpent,
+
+    /// <summary>The per-window allowance is used up for now.</summary>
+    WindowBudgetExhausted,
+
+    /// <summary>The last slots are held for a worse frame than this one.</summary>
+    ReservedForSevereFrames,
+
+    /// <summary>
+    /// The previous capture is still writing its file, so this one has nowhere to record to yet — the
+    /// window it would have covered may still turn up inside that file once it finishes.
+    /// </summary>
+    PreviousCaptureStillWriting,
+
+    /// <summary>The ordinary or extreme cooldown since the previous capture has not elapsed.</summary>
+    CooldownActive,
+}
+
 /// <summary>
 /// Decides whether an automatically detected hitch may spend one of the session's deep captures.
 /// </summary>
@@ -143,11 +168,23 @@ public sealed class AutoDeepCaptureBudget
     private double _lastCaptureFrameTimeMs;
     private DateTimeOffset? _firstFrameAt;
     private DateTimeOffset? _lastFrameAt;
+    private CaptureRefusalReason _lastRefusalReason = CaptureRefusalReason.None;
 
     public AutoDeepCaptureBudget(DeepCaptureOptions options)
     {
         _options = options;
     }
+
+    /// <summary>
+    /// Why the most recent call to <see cref="TryReserve"/> or one of its siblings refused, for a caller
+    /// that needs to act on the reason rather than just report its sentence.
+    /// </summary>
+    /// <remarks>
+    /// Read after the call it describes: the budget is written from the single-reader telemetry pump, the
+    /// same thread every reservation is made from, so there is nothing between setting this and a caller
+    /// reading it back.
+    /// </remarks>
+    public CaptureRefusalReason LastRefusalReason => _lastRefusalReason;
 
     /// <summary>Captures the detector has spent so far this session.</summary>
     public int Spent
@@ -350,6 +387,7 @@ public sealed class AutoDeepCaptureBudget
         {
             // Not a refusal worth reporting: the overwhelming majority of incidents land here, and
             // saying so every time would bury the two cases the user does need to know about.
+            _lastRefusalReason = CaptureRefusalReason.None;
             refusal = null;
             replaced = null;
             return false;
@@ -479,6 +517,7 @@ public sealed class AutoDeepCaptureBudget
         out CaptureReplacement? replaced)
     {
         replaced = null;
+        _lastRefusalReason = CaptureRefusalReason.None;
 
         if (!_options.Enabled || !_options.CaptureAutoIncidents)
         {
@@ -491,9 +530,11 @@ public sealed class AutoDeepCaptureBudget
         // game in front — was skipped at 01:00 because six smaller hitches had arrived first. A frame
         // worse than the least severe capture already taken takes that capture's slot instead, so the
         // ceiling still holds at six and the six it holds are the six worst.
-        var displaced = Spent < _options.MaxAutoCapturesPerSession ? null : WeakestCaptureBelow(frameTimeMs);
-        if (Spent >= _options.MaxAutoCapturesPerSession && displaced is null)
+        var atCeiling = Spent >= _options.MaxAutoCapturesPerSession;
+        var displaced = atCeiling ? WeakestCaptureBelow(frameTimeMs) : null;
+        if (atCeiling && displaced is null)
         {
+            _lastRefusalReason = CaptureRefusalReason.SessionBudgetSpent;
             refusal = $"Deep capture hoppades över för {description}: sessionens budget på "
                 + $"{_options.MaxAutoCapturesPerSession} automatiska captures är förbrukad"
                 + $"{DescribeReplacementBar()}. Höj DeepCapture.MaxAutoCapturesPerSession om fler behövs.";
@@ -508,6 +549,7 @@ public sealed class AutoDeepCaptureBudget
         var perWindow = Math.Max(1, _options.MaxAutoCapturesPerWindow);
         if (!mayOverrideCooldown && CountWithin(timestamp, _options.CaptureBudgetWindow) >= perWindow)
         {
+            _lastRefusalReason = CaptureRefusalReason.WindowBudgetExhausted;
             var window = _options.CaptureBudgetWindow;
             var freesAt = _spentAt[^perWindow] + window;
             refusal = $"Deep capture hoppades över för {description}: {perWindow} "
@@ -524,16 +566,26 @@ public sealed class AutoDeepCaptureBudget
         // captures for the frames this session's own material calls extreme. A frame taking another
         // capture's slot passes: the reserve exists to keep room for a frame worse than the ones already
         // traced, and a replacement is that frame by definition.
-        if (displaced is null
-            && !maySpendReserve
-            && Spent >= _options.MaxAutoCapturesPerSession - _options.ReservedSevereCaptures)
+        //
+        // Replacement is tried here too, not only once the ceiling is spent outright. On 7 September the
+        // budget held four of six slots, so the ceiling gate above never got a chance to displace anything
+        // — and four ordinary hitches inside the same cluster were refused by this gate alone, one of them
+        // the frame the session's own worst stall needed a trace for. A frame worse than the weakest slot
+        // already spent may take it here as well; only a frame that beats nothing already taken is left to
+        // the reserve.
+        if (displaced is null && !maySpendReserve && Spent >= _options.MaxAutoCapturesPerSession - _options.ReservedSevereCaptures)
         {
-            refusal = $"Deep capture hoppades över för {description}: {Spent} av sessionens budget på "
-                + $"{_options.MaxAutoCapturesPerSession} automatiska captures är tagna, och de sista "
-                + $"{_options.ReservedSevereCaptures} är reserverade för frames över "
-                + $"{EffectiveExtremeFrameTimeMs:F0} ms — så kvällens värsta hitch kan spåras även när den "
-                + "kommer sist.";
-            return false;
+            displaced = WeakestCaptureBelow(frameTimeMs);
+            if (displaced is null)
+            {
+                _lastRefusalReason = CaptureRefusalReason.ReservedForSevereFrames;
+                refusal = $"Deep capture hoppades över för {description}: {Spent} av sessionens budget på "
+                    + $"{_options.MaxAutoCapturesPerSession} automatiska captures är tagna, och de sista "
+                    + $"{_options.ReservedSevereCaptures} är reserverade för frames över "
+                    + $"{EffectiveExtremeFrameTimeMs:F0} ms — så kvällens värsta hitch kan spåras även när den "
+                    + "kommer sist.";
+                return false;
+            }
         }
 
         if (_lastCaptureAt is { } last)
@@ -547,6 +599,9 @@ public sealed class AutoDeepCaptureBudget
 
             if (elapsed < cooldown)
             {
+                _lastRefusalReason = mayOverrideRefill
+                    ? CaptureRefusalReason.PreviousCaptureStillWriting
+                    : CaptureRefusalReason.CooldownActive;
                 var remaining = cooldown - elapsed;
                 refusal = mayOverrideRefill
                     ? $"Deep capture hoppades över för {description}: {remaining.TotalSeconds:F0} s kvar innan "

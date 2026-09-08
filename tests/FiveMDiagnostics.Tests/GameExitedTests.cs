@@ -106,8 +106,10 @@ public sealed class GameExitedTests
         Assert.Contains("Störst i VRAM: FiveM_b3407_GTAProcess", analysis.Summary, StringComparison.Ordinal);
         Assert.Contains("baseline", analysis.Summary, StringComparison.Ordinal);
 
-        // And how close it came, which is what separates "nothing here" from "one point short".
-        Assert.Contains("under tröskeln 35 %", analysis.Summary, StringComparison.Ordinal);
+        // The evidence gap now explains why the measurements did not support a verdict.
+        Assert.Equal(InsufficientEvidenceReason.NoTrace, analysis.EvidenceGap);
+        Assert.Contains(analysis.Hypotheses[0].Evidence,
+            item => item.Contains("Ingen ETL-trace täckte fönstret", StringComparison.Ordinal));
     }
 
     private static IncidentRecord BuildThinIncident()

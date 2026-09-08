@@ -39,6 +39,22 @@ public sealed class WprDeepCaptureService : IDeepCaptureService, IStallAwareDeep
     /// <summary>How often the tail asks whether the stall is over. Half a second is a few frames.</summary>
     private const double RecoveryPollMs = 500;
 
+    /// <summary>
+    /// Extra time <c>-stop</c> is delayed past the ordinary tail, to keep a stall's own wait chains clear
+    /// of a Windows quirk rather than to record more of the recovery.
+    /// </summary>
+    /// <remarks>
+    /// Context switches and stack walks route through the Circular Kernel Context Logger, which flushes
+    /// its own buffer on a timer independent of when <c>-stop</c> asks WPR to merge the ETL. Four of five
+    /// captures on 8 September lost their last 4–5 seconds of both streams with <c>EventsLost</c> at zero
+    /// the whole time — not data dropped on the wire, data never flushed before the merge ran, and half of
+    /// that session's wait chains sat in exactly that gap. Calling <c>-stop</c> later does not avoid the
+    /// loss; the ring buffer is live, so the same few seconds go missing wherever <c>-stop</c> happens to
+    /// land. What moves is which seconds those are: this margin spends them on the tail's own recovery,
+    /// which nothing reads closely, instead of on the stall the capture exists to explain.
+    /// </remarks>
+    private static readonly TimeSpan CkclDrainMargin = DeepCaptureOptions.CkclDrainMargin;
+
     /// <inheritdoc />
     public Func<bool>? StallInProgress { get; set; }
 
@@ -217,6 +233,10 @@ public sealed class WprDeepCaptureService : IDeepCaptureService, IStallAwareDeep
             // The run-up is already in the buffer; this waits only for the recovery, which is why a
             // marker costs seconds rather than the old fifteen.
             var tail = await WaitForRecoveryAsync(settings.DeepCapture, cancellationToken).ConfigureAwait(false);
+
+            // See CkclDrainMargin: spends the seconds a Windows flush quirk will lose on the recovery
+            // rather than on the stall the capture was taken for.
+            await Task.Delay(CkclDrainMargin, cancellationToken).ConfigureAwait(false);
 
             var stop = await RunWprAsync(wprPath, $"-stop \"{capturePath}\"", cancellationToken).ConfigureAwait(false);
             _ringBufferArguments = null;
@@ -1026,9 +1046,11 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
     /// </summary>
     /// <remarks>
     /// <c>EventsLost = 0</c> is not evidence that nothing was lost: it counts events the consumer failed
-    /// to drain, not a provider that stopped emitting because another session took the keyword. A trace
-    /// with full duration and half the context switches looks healthy by every summary statistic there
-    /// is, and every conclusion drawn from its second half is worthless.
+    /// to drain, not a provider whose buffer was never flushed before the merge ran. A trace with full
+    /// duration and half the context switches looks healthy by every summary statistic there is, and every
+    /// conclusion drawn from its second half is worthless. See
+    /// <see cref="WprDeepCaptureService.CkclDrainMargin"/> for the mechanism this was tracked down to and
+    /// the mitigation on the recording side.
     /// </remarks>
     private static string BuildCoverageSummary(
         CoverageTracker contextSwitches,
@@ -1067,7 +1089,9 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
 
         var lostNote = eventsLost > 0
             ? $"EventsLost var {eventsLost}."
-            : "EventsLost var 0, så det är inte buffertöverskrivning — mer sannolikt tog en annan ETW-session över keywordet.";
+            : "EventsLost var 0, så det är inte buffertöverskrivning — Context switches och stackar går via "
+                + "Circular Kernel Context Logger, som flushar på egen timer. Stoppas sessionen mitt i den "
+                + "cykeln missar mergen den sista periodens data utan att något gick förlorat på vägen dit.";
 
         return $" VARNING, ofullständig täckning: {string.Join(" ", parts)} {lostNote} "
             + "Slutsatser om den senare delen av fönstret vilar på data som inte finns.";

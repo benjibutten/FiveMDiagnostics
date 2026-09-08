@@ -34,6 +34,14 @@
 /// hole the card's own figure fills — see <see cref="Observe(GpuProcessMemorySample)"/> — and the free
 /// space reported can never exceed total minus what the card says is used, whatever the table claims.
 /// </para>
+/// <para>
+/// The refusal above needed a way back, and did not have one until 8 September. A session that marked
+/// the game's own row drifting once at 22:32 got a "kan inte delas upp" line and then no budget line at
+/// all for the remaining five hours, because nothing was watching for the row to start tracking the card
+/// again. <see cref="VramAccountingMonitor.ObserveDrift"/> now lifts a drift exclusion once a row has
+/// agreed with the card for as long as the original proof needed, and this forces a line on the next
+/// sample after that even when nothing else changed.
+/// </para>
 /// </remarks>
 public sealed class VramBudgetMonitor
 {
@@ -454,9 +462,14 @@ public sealed class VramBudgetMonitor
 
         // Cleared once the table adds up again, so a second spell of drift or double counting later in the
         // evening is reported rather than swallowed by the first one.
+        var resumed = _reportedUnusableTable;
         _reportedUnusableTable = false;
 
-        if (_reported && transition is null)
+        // The refusal above used to be the last budget line of the evening: nothing forced a new one once
+        // the table started agreeing with the card again, so a session that refused once at 22:32 could
+        // go five hours without another split even after the row it refused over had long since recovered
+        // — see VramAccountingMonitor.ObserveDrift, which is what lifts the exclusion this now answers to.
+        if (_reported && transition is null && !resumed)
         {
             return null;
         }
@@ -484,8 +497,12 @@ public sealed class VramBudgetMonitor
         var bandBytes = (ulong)(totalBytes * VramPressureBandMonitor.BandPercent / 100);
         var bandHeadroomBytes = bandBytes > reservedBytes ? bandBytes - reservedBytes : 0;
 
+        var resumedNote = resumed
+            ? "Uppdelningen fungerar igen: processumman stämmer mot kortets egen siffra igen. "
+            : string.Empty;
+
         var message =
-            $"{transition}VRAM-budget: skrivbordet håller {Gigabytes(desktopBytes)} och streamstacken "
+            $"{transition}{resumedNote}VRAM-budget: skrivbordet håller {Gigabytes(desktopBytes)} och streamstacken "
             + $"{Gigabytes(streamBytes)}. Spelet håller nu {Gigabytes(gameBytes)} och ryms utan tryck upp till "
             + $"{Gigabytes(bandHeadroomBytes)}; kortets fysiska tak ger {Gigabytes(headroomBytes)}, men mätningarna "
             + $"säger att det börjar hacka redan när kortet passerar {VramPressureBandMonitor.BandPercent:F0} %. "

@@ -541,6 +541,19 @@ public sealed record VramPressureBandReport(
     public bool IsPressured =>
         ReadingsInBand > 0 && !BandCostNothing && (ReadingsInDeepBand > 0 || InBandShare >= 0.05);
 
+    /// <summary>
+    /// Minutes of session the comparison needs before "the band cost nothing" is stated as a conclusion
+    /// rather than as thin material.
+    /// </summary>
+    /// <remarks>
+    /// On 7 September the quarter-hourly lines early in a session wrote "Bandet kostade ingenting den här
+    /// sessionen" on 3-7 minutes of material, and the same session's closing line reported a genuine 3.1×
+    /// on 324 minutes. The conclusion was right both times; the early wording claimed a whole session's
+    /// worth of confidence for a few minutes of it. Half an hour is short beside the sessions this app
+    /// measures and long enough that a session's first quarter-hourly line, taken alone, cannot reach it.
+    /// </remarks>
+    private const double MinimumMeasuredMinutesForVerdict = 30;
+
     public string Message
     {
         get
@@ -560,9 +573,16 @@ public sealed record VramPressureBandReport(
 
             // The conclusion first when there is one, because the rest of the sentence is a large VRAM
             // percentage and a reader who stops after the first clause has to stop on the right one.
-            var lead = BandCostNothing
-                ? "Bandet kostade ingenting den här sessionen. "
-                : string.Empty;
+            //
+            // Not stated at all on thin material: exonerating the band on three minutes of a session that
+            // may run for hours is a claim the data has not earned yet, even when the sign of the ratio
+            // happens to already be right.
+            var lead = MeasuredMinutes < MinimumMeasuredMinutesForVerdict
+                ? $"Bara {MeasuredMinutes:F0} minuter mätta hittills — för tunt underlag för att fria eller "
+                    + "fälla bandet än. "
+                : BandCostNothing
+                    ? "Bandet kostade ingenting den här sessionen. "
+                    : string.Empty;
 
             return $"{lead}VRAM-tryck: kortet låg över {VramPressureBandMonitor.BandPercent:F0} % i {MinutesInBand:F1} av "
                 + $"{MeasuredMinutes:F0} minuter ({InBandShare:P0}){deep}; högst {PeakPercent:F1} %.{split}{gradient} "

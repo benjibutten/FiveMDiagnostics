@@ -147,6 +147,28 @@ public sealed class VramAccountingMonitor
     /// <summary>Rows proved to drift, kept for the session like the double counters above.</summary>
     private readonly Dictionary<int, string> _drifting = [];
 
+    /// <summary>
+    /// How long a drifting row has tracked the card again, unbroken, keyed by process id.
+    /// </summary>
+    /// <remarks>
+    /// The drift verdict itself never expired before this — once excluded, a row stayed excluded for the
+    /// rest of the session, which is what left <c>VramBudgetMonitor</c> unable to split a budget for five
+    /// hours after the game's own row was marked drifting once at 22:32 on 7 September. Reset the moment
+    /// the row disagrees with the card again, so a brief truce cannot be mistaken for a real recovery the
+    /// way a genuine one is proven below.
+    /// </remarks>
+    private readonly Dictionary<int, (DateTimeOffset Since, DateTimeOffset Last)> _recoveringSince = [];
+
+    /// <summary>
+    /// How long a drifting row has to agree with the card again before the exclusion lifts.
+    /// </summary>
+    /// <remarks>
+    /// The same span the proof itself needs. A shorter window would let the sampling skew between two
+    /// collectors end an exclusion nearly as easily as it started one, and the row would flap between
+    /// excluded and included for as long as the game's texture streaming happened to pace with the card.
+    /// </remarks>
+    private static readonly TimeSpan DriftRecoveryWindow = MinimumDriftWindow;
+
     private GpuTelemetrySample? _lastAdapter;
     private DateTimeOffset? _lastReportAt;
 
@@ -217,6 +239,7 @@ public sealed class VramAccountingMonitor
                 && !string.Equals(driftingName, process.ProcessName, StringComparison.OrdinalIgnoreCase))
             {
                 _drifting.Remove(process.ProcessId);
+                _recoveringSince.Remove(process.ProcessId);
             }
         }
 
@@ -302,16 +325,31 @@ public sealed class VramAccountingMonitor
     {
         if (!sample.IsAvailable || sample.Processes.Count == 0)
         {
+            _recoveringSince.Clear();
             return null;
         }
 
         if (_lastAdapter is not { UsedVramBytes: { } adapterBytes, IsSingleAdapterMachine: true } adapter
             || (sample.Timestamp - adapter.Timestamp).Duration() > AdapterFreshness)
         {
+            _recoveringSince.Clear();
             return null;
         }
 
+        // Missing rows and gaps are missing evidence, not time spent recovering.
+        var present = sample.Processes.Select(process => process.ProcessId).ToHashSet();
+        foreach (var id in _recoveringSince.Keys.ToArray())
+        {
+            var last = _recoveringSince[id].Last;
+            if (!present.Contains(id) || sample.Timestamp <= last
+                || sample.Timestamp - last > AdapterFreshness)
+            {
+                _recoveringSince.Remove(id);
+            }
+        }
+
         List<DriftingRow>? found = null;
+        List<string>? recovered = null;
         var steady = 0;
 
         foreach (var process in sample.Processes)
@@ -322,11 +360,13 @@ public sealed class VramAccountingMonitor
                 && !string.Equals(driftingName, process.ProcessName, StringComparison.OrdinalIgnoreCase))
             {
                 _drifting.Remove(process.ProcessId);
+                _recoveringSince.Remove(process.ProcessId);
             }
 
             if (!_growth.TryGetValue(process.ProcessId, out var anchor)
                 || !string.Equals(anchor.Name, process.ProcessName, StringComparison.OrdinalIgnoreCase))
             {
+                _recoveringSince.Remove(process.ProcessId);
                 _growth[process.ProcessId] = new GrowthAnchor(process.ProcessName, sample.Timestamp, process.DedicatedBytes, adapterBytes);
                 continue;
             }
@@ -342,10 +382,24 @@ public sealed class VramAccountingMonitor
             if (excess <= 0)
             {
                 _growth[process.ProcessId] = new GrowthAnchor(process.ProcessName, sample.Timestamp, process.DedicatedBytes, adapterBytes);
+
+                if (_drifting.ContainsKey(process.ProcessId)
+                    && TryRecoverFromDrift(process.ProcessId, sample.Timestamp))
+                {
+                    (recovered ??= []).Add(process.ProcessName);
+                }
+
                 continue;
             }
 
-            if (elapsed < MinimumDriftWindow || _drifting.ContainsKey(process.ProcessId))
+            if (_drifting.ContainsKey(process.ProcessId))
+            {
+                // Disagreed again, so any recovery streak in progress was not a real one.
+                _recoveringSince.Remove(process.ProcessId);
+                continue;
+            }
+
+            if (elapsed < MinimumDriftWindow)
             {
                 continue;
             }
@@ -379,7 +433,36 @@ public sealed class VramAccountingMonitor
             (found ??= []).Add(new DriftingRow(process, rowGrowth, cardGrowth, elapsed));
         }
 
-        return found is null ? null : new DriftReport(found, steady);
+        return found is null && recovered is null
+            ? null
+            : new DriftReport(found ?? [], steady, recovered ?? []);
+    }
+
+    /// <summary>
+    /// Advances a drifting row's recovery streak, and lifts the exclusion once it has held long enough.
+    /// </summary>
+    /// <remarks>
+    /// See <see cref="DriftRecoveryWindow"/> for why the streak has to span the same window the original
+    /// proof did. Returns true only on the sample that actually lifts the exclusion, which is the one the
+    /// caller has something to announce about.
+    /// </remarks>
+    private bool TryRecoverFromDrift(int processId, DateTimeOffset now)
+    {
+        if (!_recoveringSince.TryGetValue(processId, out var streak))
+        {
+            _recoveringSince[processId] = (now, now);
+            return false;
+        }
+
+        _recoveringSince[processId] = (streak.Since, now);
+        if (now - streak.Since < DriftRecoveryWindow)
+        {
+            return false;
+        }
+
+        _drifting.Remove(processId);
+        _recoveringSince.Remove(processId);
+        return true;
     }
 
     /// <summary>
@@ -581,7 +664,7 @@ public enum DoubleCountProof
 /// watch of 5 September wrote twenty warnings in a row and the fourteen uninteresting ones buried the
 /// two that mattered; a reader skips twenty identical paragraphs and reads one sentence.
 /// </remarks>
-public sealed record DriftReport(IReadOnlyList<DriftingRow> Rows, int SteadyRows)
+public sealed record DriftReport(IReadOnlyList<DriftingRow> Rows, int SteadyRows, IReadOnlyList<string> Recovered)
 {
     /// <summary>The sentence accounting for the rows that were checked and not named. Null when none were.</summary>
     /// <remarks>
@@ -594,6 +677,21 @@ public sealed record DriftReport(IReadOnlyList<DriftingRow> Rows, int SteadyRows
         : $"Ytterligare {SteadyRows} processrader mättes mot kortet i samma stund och räknas som stabila: de "
             + $"växte antingen långsammare än {VramAccountingMonitor.DriftBytesPerHour / 1024d / 1024 / 1024:F1} GB/h "
             + "eller i takt med kortets egen tillväxt. De driver inte och loggas inte var för sig.";
+
+    /// <summary>
+    /// One sentence per row whose exclusion just lifted, or null when none did.
+    /// </summary>
+    /// <remarks>
+    /// The other half of the fix the drift exclusion was missing: a row this session marked drifting once
+    /// stayed marked for the rest of it, which is what left <c>VramBudgetMonitor</c> unable to split a
+    /// budget for five hours after a single sample of the game's own row. A row that has tracked the card
+    /// again for as long as the original proof needed is no longer drifting, and the split it was blocking
+    /// is free to resume.
+    /// </remarks>
+    public IReadOnlyList<string> RecoveredMessages => Recovered
+        .Select(name => $"{name}s VRAM-rad följer kortet igen efter att ha drivit tidigare i sessionen. "
+            + "Uteslutningen ur uppdelningar och rekommendationer är hävd.")
+        .ToArray();
 }
 
 /// <summary>

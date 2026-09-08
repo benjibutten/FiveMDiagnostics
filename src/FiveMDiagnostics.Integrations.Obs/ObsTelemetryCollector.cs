@@ -18,6 +18,7 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
     private bool? _lastProcessRunning;
     private DateTimeOffset? _disconnectedSince;
     private bool _reportedConnectionWarning;
+    private bool _reportedRenderSkipOnset;
 
     public string Name => "OBS";
 
@@ -31,6 +32,7 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
         _lastProcessRunning = null;
         _disconnectedSince = null;
         _reportedConnectionWarning = false;
+        _reportedRenderSkipOnset = false;
 
         try
         {
@@ -42,6 +44,7 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
                     everConnected |= sample.IsConnected;
                     ReportProcessTransition(context, sample);
                     ReportConnectionHealth(context, sample);
+                    ReportRenderSkipOnset(context, sample);
                     await context.Writer.WriteAsync(sample, cancellationToken).ConfigureAwait(false);
                 }
 
@@ -163,6 +166,34 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
             + "WebSocket Server Settings i OBS (och fyll i samma lösenord här) — annars saknas render lag, "
             + "skippade renderframes och skippade outputframes för hela sessionen, vilket är den enda mätning "
             + "appen har av streamens egen hälsa.");
+    }
+
+    /// <summary>
+    /// Notes the first render-skipped frame of the session, once — the same treatment
+    /// <c>ReportProcessTransition</c> gives OBS starting or stopping.
+    /// </summary>
+    /// <remarks>
+    /// The counter is logged every poll and commented on never: it read zero in seven sessions running
+    /// and became 133 in an eighth with nothing in the app remarking on the change from "zero" to "not
+    /// zero" in a row that had been stable that long. <c>output skipped</c> is still what decides whether a
+    /// viewer noticed anything — this is not that — but the difference between a counter that has never
+    /// moved and one that just did is itself worth a line, the moment it happens rather than buried in a
+    /// per-incident delta nobody reads unless the incident already has another cause.
+    /// </remarks>
+    internal void ReportRenderSkipOnset(CollectorContext context, ObsTelemetrySample sample)
+    {
+        if (_reportedRenderSkipOnset || sample.RenderSkippedFrames is not > 0)
+        {
+            return;
+        }
+
+        _reportedRenderSkipOnset = true;
+        context.StatusSink.Report(
+            StatusLevel.Info,
+            Name,
+            $"OBS render skipped frames är inte längre noll ({sample.RenderSkippedFrames}). Output skipped "
+            + "avgör om tittarna märker något — det är en annan räknare — men det här är första gången i "
+            + "sessionen som renderkällan själv har missat en bildruta.");
     }
 
     /// <summary>

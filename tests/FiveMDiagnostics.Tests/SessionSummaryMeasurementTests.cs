@@ -105,9 +105,11 @@ public sealed class SessionSummaryMeasurementTests
     {
         var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
 
-        // Ten minutes at 92% with one hitch each, then ten at 70% with five.
-        Play(monitor, Start, minutes: 10, vramPercent: 92, hitchesPerMinute: 1);
-        Play(monitor, Start.AddMinutes(10), minutes: 10, vramPercent: 70, hitchesPerMinute: 5);
+        // Twenty minutes at 92% with one hitch each, then twenty at 70% with five — enough material to
+        // state the conclusion rather than only to gesture at it. See the thin-data test below for why
+        // the minutes matter here.
+        Play(monitor, Start, minutes: 20, vramPercent: 92, hitchesPerMinute: 1);
+        Play(monitor, Start.AddMinutes(20), minutes: 20, vramPercent: 70, hitchesPerMinute: 5);
 
         var report = monitor.Summary();
 
@@ -116,6 +118,32 @@ public sealed class SessionSummaryMeasurementTests
         Assert.False(report.IsPressured);
         Assert.StartsWith("Bandet kostade ingenting den här sessionen.", report.Message, StringComparison.Ordinal);
         Assert.Contains("motbevis", report.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The same shape as above, but with too little of the session measured to state it. Exonerating the
+    /// band on a few minutes of a session that may run for hours is a claim the data has not earned.
+    /// </summary>
+    /// <remarks>
+    /// 8 September's quarter-hourly lines wrote "Bandet kostade ingenting den här sessionen" on 3-7
+    /// minutes of material while the same session's closing line reported a genuine 3.1× on 324 minutes —
+    /// the same sentence used for a session's whole confidence and for a sliver of it.
+    /// </remarks>
+    [Fact]
+    public void ABandThatCostNothingOnThinMaterialSaysSoInsteadOfExonerating()
+    {
+        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+
+        // Same 1:5 hitch-rate shape as the test above, only a tenth of the minutes.
+        Play(monitor, Start, minutes: 2, vramPercent: 92, hitchesPerMinute: 1);
+        Play(monitor, Start.AddMinutes(2), minutes: 2, vramPercent: 70, hitchesPerMinute: 5);
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report);
+        Assert.True(report!.BandCostNothing);
+        Assert.StartsWith("Bara 4 minuter mätta hittills", report.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("Bandet kostade ingenting", report.Message, StringComparison.Ordinal);
     }
 
     /// <summary>

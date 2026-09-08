@@ -22,6 +22,47 @@ public sealed class GpuResidencyStallTests
 
     private const double StallMs = 425;
 
+    [Theory]
+    [InlineData(90.9, 0.5, true)]
+    [InlineData(50, 0.5, false)]
+    [InlineData(90.9, 20, false)]
+    public void AResidencyDropRequiresPressureAndAdjacentSamples(double before, double gapSeconds, bool expected)
+    {
+        var incident = Incident(withTrace: false);
+        incident = incident with
+        {
+            Events = incident.Events.Where(item => item is not GpuTelemetrySample)
+                .Concat(new TelemetryEvent[]
+                {
+                    Adapter(FrameAt.AddSeconds(-gapSeconds), 44, 14, before),
+                    Adapter(FrameAt, 9, 14, before - 3),
+                }).ToArray(),
+        };
+
+        var analysis = new FiveMCorrelationEngine().Analyze(incident);
+        Assert.Equal(expected, analysis.Hypotheses.Any(item => item.Category == RootCauseCategory.GpuResidencyStall));
+    }
+
+    [Theory]
+    [InlineData(-120, -60, InsufficientEvidenceReason.NoTrace)]
+    [InlineData(120, 180, InsufficientEvidenceReason.NoTrace)]
+    [InlineData(0, 30, InsufficientEvidenceReason.TooFewSpikes)]
+    public void EvidenceGapUsesTraceCoverage(int startSeconds, int endSeconds, InsufficientEvidenceReason expected)
+    {
+        var incident = Incident(withTrace: false);
+        incident = incident with
+        {
+            Events = incident.Events.OfType<FrameTelemetrySample>().Cast<TelemetryEvent>()
+                .Append(new ArtifactEvidence(FrameAt, ArtifactKind.EtlTrace, "Trace", new Dictionary<string, double>
+                {
+                    ["traceCoveredStartUnixMs"] = Start.AddSeconds(startSeconds).ToUnixTimeMilliseconds(),
+                    ["traceCoveredEndUnixMs"] = Start.AddSeconds(endSeconds).ToUnixTimeMilliseconds(),
+                })).ToArray(),
+        };
+
+        Assert.Equal(expected, new FiveMCorrelationEngine().Analyze(incident).EvidenceGap);
+    }
+
     [Fact]
     public void TheThreeSignalsTogetherAreTheVerdict()
     {

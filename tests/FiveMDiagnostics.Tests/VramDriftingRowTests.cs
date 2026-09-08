@@ -19,6 +19,41 @@ public sealed class VramDriftingRowTests
 
     private static readonly DateTimeOffset Start = new(2026, 9, 4, 21, 10, 0, TimeSpan.Zero);
 
+    [Theory]
+    [InlineData("continuous", true)]
+    [InlineData("gap", false)]
+    [InlineData("missing", false)]
+    [InlineData("unavailable", false)]
+    [InlineData("stale", false)]
+    public void RecoveryRequiresContinuousValidObservations(string interruption, bool expectedRecovery)
+    {
+        var monitor = new VramAccountingMonitor();
+        Observe(monitor, Start, 4.3, 8.0);
+        monitor.ObserveDrift(Sample(Start, 4.3));
+        var driftAt = Start.AddMinutes(40);
+        Observe(monitor, driftAt, 5.9, 8.1);
+        Assert.Single(monitor.ObserveDrift(Sample(driftAt, 5.9))!.Rows);
+
+        var recoveryAt = driftAt.AddSeconds(5);
+        for (var seconds = 0; seconds <= 900; seconds += 5)
+        {
+            if (interruption == "gap" && seconds > 0 && seconds < 900)
+                continue;
+
+            var at = recoveryAt.AddSeconds(seconds);
+            monitor.Observe(Adapter(interruption == "stale" && seconds == 450 ? at.AddSeconds(-20) : at, 8.1));
+            var sample = Sample(at, 4.3);
+            if (seconds == 450 && interruption == "missing")
+                sample = sample with { Processes = sample.Processes.Where(row => row.ProcessId != 18704).ToArray() };
+            if (seconds == 450 && interruption == "unavailable")
+                sample = sample with { IsAvailable = false };
+            monitor.ObserveDrift(sample);
+        }
+
+        var annotated = monitor.Annotate(Sample(recoveryAt.AddSeconds(900), 4.3), out _);
+        Assert.Equal(!expectedRecovery, annotated.IsDrifting(annotated.Processes[0]));
+    }
+
     /// <summary>
     /// The game's row climbs a gigabyte and a half while the card stands still. Nothing about that is
     /// arithmetically impossible; it is still the counter rather than the game.

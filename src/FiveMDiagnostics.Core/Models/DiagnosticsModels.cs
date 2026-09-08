@@ -82,6 +82,13 @@ public enum ArtifactKind
     LogFile,
     EtlTrace,
     ManualAttachment,
+
+    /// <summary>
+    /// A deep capture the budget refused because the previous one was still writing, noted anyway so the
+    /// incident's own window is on record — the ETL for these seconds may still turn up inside the
+    /// capture that was in flight when this one was asked for.
+    /// </summary>
+    CaptureDeferred,
 }
 
 public enum StatusLevel
@@ -781,6 +788,11 @@ public sealed record DeepCaptureOptions
     }
 
     /// <summary>
+    /// Extra recording time needed before stopping WPR so the context-switch tail is flushed.
+    /// </summary>
+    public static readonly TimeSpan CkclDrainMargin = TimeSpan.FromSeconds(6);
+
+    /// <summary>
     /// Shortest override spacing this configuration can support, derived from the buffer rather than
     /// fixed.
     /// </summary>
@@ -788,10 +800,10 @@ public sealed record DeepCaptureOptions
     /// A larger ring buffer takes proportionally longer to refill, so a constant would be right at one
     /// setting and wrong at the rest: at the 2 048 MB ceiling the refill alone is about 56 s, and a
     /// 60 s override would approve a capture while the previous one was still draining. The terms are
-    /// the tail the previous capture recorded, the time its buffer needs to fill again, and thirty
+    /// the tail the previous capture recorded, the CKCL drain margin, the time its buffer needs to fill again, and thirty
     /// seconds for <c>wpr -stop</c> to write the file — measured at 28–32 s across five captures.
     /// </remarks>
-    private TimeSpan MinimumOverrideCooldown => PostMarkerTail
+    private TimeSpan MinimumOverrideCooldown => PostMarkerTail + CkclDrainMargin
         + TimeSpan.FromSeconds(EstimatedRingBufferSeconds)
         + TimeSpan.FromSeconds(30);
 
@@ -818,7 +830,7 @@ public sealed record DeepCaptureOptions
     /// outcome worse than refusing it here, since a refusal here at least leaves the budget intact.
     /// </para>
     /// </remarks>
-    public TimeSpan ExtremeCaptureSpacing => MaxPostMarkerTail + TimeSpan.FromSeconds(30);
+    public TimeSpan ExtremeCaptureSpacing => MaxPostMarkerTail + CkclDrainMargin + TimeSpan.FromSeconds(30);
 
     /// <summary>
     /// Whether a frame is catastrophic enough to spend budget the ordinary cooldown would have withheld.
@@ -1571,12 +1583,32 @@ public sealed record TimelineHighlight(DateTimeOffset Timestamp, string Category
 
 public sealed record HypothesisScore(RootCauseCategory Category, double Confidence, IReadOnlyList<string> Evidence);
 
+/// <summary>
+/// Why an incident came out as <see cref="RootCauseCategory.InsufficientEvidence"/>, so a session's worth
+/// of them can be counted by cause instead of standing as one unexplained number.
+/// </summary>
+public enum InsufficientEvidenceReason
+{
+    /// <summary>No PresentMon frames landed in the incident window at all.</summary>
+    NoFrameData,
+
+    /// <summary>No ETL trace covered the window, so every hypothesis that reads one had nothing to say.</summary>
+    NoTrace,
+
+    /// <summary>A trace was attached, but the window held too few severe spikes to classify confidently.</summary>
+    TooFewSpikes,
+
+    /// <summary>Trace and spikes were both present; nothing in them pointed clearly enough at one cause.</summary>
+    Inconclusive,
+}
+
 public sealed record IncidentAnalysis(
     IReadOnlyList<HypothesisScore> Hypotheses,
     bool InsufficientEvidence,
     string Summary,
     IReadOnlyList<TimelineHighlight> TimelineHighlights,
-    IReadOnlyList<SuspectedProcessImpact> SuspectedProcesses);
+    IReadOnlyList<SuspectedProcessImpact> SuspectedProcesses,
+    InsufficientEvidenceReason? EvidenceGap = null);
 
 public sealed record IncidentRecord(
     Guid Id,
