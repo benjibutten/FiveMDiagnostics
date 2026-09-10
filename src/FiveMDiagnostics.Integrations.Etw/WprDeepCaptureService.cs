@@ -615,7 +615,7 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
     private const double CoverageWarningRatio = 0.9;
 
     /// <inheritdoc />
-    public Func<double?>? AdapterVramPercent { get; set; }
+    public Func<DateTimeOffset?, double?>? AdapterVramPercent { get; set; }
 
     public bool CanParse(string path)
     {
@@ -624,9 +624,7 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
 
     public Task<ArtifactParseResult?> ParseAsync(string path, CancellationToken cancellationToken)
     {
-        // Read before the parse rather than after it: an ETL takes tens of seconds to walk, and the
-        // reading that matters is the card's state around the capture, not around the analysis.
-        var vramPercent = AdapterVramPercent?.Invoke();
+        var adapterVramPercent = AdapterVramPercent;
 
         return Task.Run<ArtifactParseResult?>(() =>
         {
@@ -749,6 +747,14 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
             var attribution = cpu.Summarize();
             var threadWait = threadWaits.Summarize(cpu);
 
+            // Asked after the parse and about one second, not before it and about the window. The trace
+            // is the only thing that knows which second the driver was evacuating in, and that second is
+            // the whole question — a median over the window reads several points below it and turns a
+            // correct eviction verdict into a sentence denying eviction, which is what happened to the
+            // worst frame of 9 September.
+            var vramPercent = adapterVramPercent?.Invoke(
+                attribution?.VideoMemory?.PeakAt is { } peakAt ? new DateTimeOffset(peakAt) : null);
+
             var metrics = new Dictionary<string, double>
             {
                 ["eventCount"] = eventCount,
@@ -820,6 +826,19 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
                     metrics["videoMemoryManagerPeakCores"] = Math.Round(videoMemory.PeakCores, 3);
                     metrics["videoMemoryManagerBaselineCores"] = Math.Round(videoMemory.BaselineCores, 3);
                     metrics["videoMemoryManagerPressured"] = videoMemory.IsPressured ? 1 : 0;
+
+                    if (videoMemory.PeakAt is { } busiestSecond)
+                    {
+                        metrics["videoMemoryManagerPeakUnixMs"] = ToUnixTimeMilliseconds(busiestSecond);
+                    }
+
+                    // The occupancy the prose was interpreted against, as a number. Without it a reader
+                    // of the metrics cannot tell whether the sentence about eviction had a reading behind
+                    // it, and the correlation engine has to re-derive one from samples of its own.
+                    if (vramPercent is { } occupancy)
+                    {
+                        metrics["videoMemoryAdapterPercentAtPeak"] = Math.Round(occupancy, 1);
+                    }
 
                     if (videoMemory.SubjectCoresAtPeak is { } atPeak && videoMemory.SubjectBaselineCores is { } baselineCores)
                     {
@@ -931,6 +950,12 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
                     // everything behind it was not. It is the subject of the sentence the investigation
                     // has been writing by hand since 25 August.
                     metrics["gameThreadBlockedByThreadId"] = blocker.ThreadId;
+
+                    // Whether the chain ever left the game. It is the difference between "something
+                    // outside took the processor" and "the game waited on itself", and without it the
+                    // analysis reached for the busiest neighbour every time — on 9 September that made a
+                    // 465 ms frame whose chain never left FiveM into external process interference.
+                    metrics["gameThreadBlockerIsGame"] = cpu.IsGameThread(blocker.ThreadId) ? 1 : 0;
 
                     // And what it was executing, keyed by module the way the busiest thread's are. This
                     // is the difference between two verdicts: a render thread spinning in d3d11.dll and

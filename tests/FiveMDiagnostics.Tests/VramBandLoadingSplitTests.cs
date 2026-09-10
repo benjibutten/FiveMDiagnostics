@@ -113,6 +113,51 @@ public sealed class VramBandLoadingSplitTests
     }
 
     /// <summary>
+    /// The band is neither cleared nor blamed on a minute of it, however long the session has run.
+    /// </summary>
+    /// <remarks>
+    /// 02:14 on 9 September: "Det är ett motbevis mot att bandet skulle vara orsaken" on 0.9 minutes in
+    /// the band. Thirty measured minutes cleared the session-length gate the sentence was behind, and
+    /// the comparison it rests on had a minute of frames on one side.
+    /// </remarks>
+    [Fact]
+    public void AMinuteInTheBandExoneratesNothing()
+    {
+        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+
+        // Well past the session gate, and a single quiet minute inside the band.
+        Play(monitor, Start, minutes: 40, vramPercent: 70);
+        PlayQuiet(monitor, Start.AddMinutes(40), minutes: 1, vramPercent: 92);
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report);
+        Assert.True(report.BandCostNothing);
+        Assert.Contains("minuter i bandet", report.Message, StringComparison.Ordinal);
+        Assert.Contains("ingen slutsats åt något håll", report.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("Bandet kostade ingenting", report.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("Det är ett motbevis", report.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The same evening with real time in the band, where the comparison is worth making.
+    /// </summary>
+    [Fact]
+    public void EnoughTimeInTheBandRestoresTheVerdict()
+    {
+        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+
+        Play(monitor, Start, minutes: 40, vramPercent: 70);
+        PlayQuiet(monitor, Start.AddMinutes(40), minutes: 8, vramPercent: 92);
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report);
+        Assert.Contains("Bandet kostade ingenting", report.Message, StringComparison.Ordinal);
+        Assert.Contains("Det är ett motbevis", report.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// One frame a second at the session's cadence, with a hitch a minute so the threshold settles.
     /// </summary>
     private static void Play(VramPressureBandMonitor monitor, DateTimeOffset from, int minutes, double vramPercent)
@@ -129,6 +174,25 @@ public sealed class VramBandLoadingSplitTests
             for (var frame = 0; frame < 60; frame++)
             {
                 monitor.Observe(Frame(minuteStart.AddSeconds(frame), frame == 0 ? 90 : 16.7));
+            }
+        }
+    }
+
+    /// <summary>The same minutes without the hitch, so the band's own rate comes out lower.</summary>
+    private static void PlayQuiet(VramPressureBandMonitor monitor, DateTimeOffset from, int minutes, double vramPercent)
+    {
+        for (var minute = 0; minute < minutes; minute++)
+        {
+            var minuteStart = from.AddMinutes(minute);
+
+            for (var reading = 0; reading < 12; reading++)
+            {
+                monitor.Observe(Adapter(minuteStart.AddSeconds(reading * 5), vramPercent));
+            }
+
+            for (var frame = 0; frame < 60; frame++)
+            {
+                monitor.Observe(Frame(minuteStart.AddSeconds(frame), 16.7));
             }
         }
     }

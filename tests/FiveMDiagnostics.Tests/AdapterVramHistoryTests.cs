@@ -82,7 +82,7 @@ public sealed class AdapterVramHistoryTests : IDisposable
         // that ended above.
         await manager.StartSessionAsync();
         Assert.NotNull(parser.AdapterVramPercent);
-        Assert.Null(parser.AdapterVramPercent!.Invoke());
+        Assert.Null(parser.AdapterVramPercent!.Invoke(null));
 
         await manager.StopSessionAsync();
     }
@@ -105,6 +105,55 @@ public sealed class AdapterVramHistoryTests : IDisposable
     }
 
     /// <summary>
+    /// The eviction second is read at its own second, not against the window it happened in.
+    /// </summary>
+    /// <remarks>
+    /// The evening of 9 September, with its own readings. The card sat around 86% for most of the trace,
+    /// climbed to 92.6% for the two seconds the driver spent evacuating, and was back at 87.3% four
+    /// seconds later. The window median is 86% — and underneath a verdict of GPU VRAM pressure at 95%,
+    /// the trace summary said "the card was only at 86%, below the 88% where eviction begins, this was
+    /// not memory pressure" about the worst frame of the evening.
+    /// </remarks>
+    [Fact]
+    public async Task TheOccupancyIsReadForTheSecondTheDriverWasEvacuatingIn()
+    {
+        var parser = new VramAwareStubParser();
+        var eviction = Origin.AddSeconds(6);
+        var collector = new GpuSampleCollector(
+            [Sample(Origin, percent: 85.4, adapterCount: 1),
+             Sample(Origin.AddSeconds(2), percent: 86.1, adapterCount: 1),
+             Sample(Origin.AddSeconds(4), percent: 86.0, adapterCount: 1),
+             Sample(eviction, percent: 92.6, adapterCount: 1),
+             Sample(Origin.AddSeconds(8), percent: 90.0, adapterCount: 1),
+             Sample(Origin.AddSeconds(10), percent: 87.3, adapterCount: 1),
+             Sample(Origin.AddSeconds(12), percent: 86.2, adapterCount: 1)]);
+
+        await using var manager = CreateManager(parser, collector);
+        await manager.StartSessionAsync();
+        await collector.Completed;
+        await WaitForReadingAsync(parser);
+
+        var probe = parser.AdapterVramPercent!;
+
+        // The second the trace named, and the seconds either side of it. All three have to answer with
+        // the fill the driver acted on rather than the one it left behind.
+        Assert.Equal(92.6, probe.Invoke(eviction)!.Value, precision: 1);
+        Assert.Equal(92.6, probe.Invoke(eviction.AddSeconds(1))!.Value, precision: 1);
+        Assert.Equal(92.6, probe.Invoke(eviction.AddSeconds(-1))!.Value, precision: 1);
+
+        // The old answer, kept for the trace that cannot name a second — and demonstrably the wrong one
+        // to interpret this eviction against.
+        Assert.Equal(86.2, probe.Invoke(null)!.Value, precision: 1);
+
+        // A moment the history does not reach is unanswered. The median belongs to a different stretch
+        // of the evening, and the callers print whatever comes back as the fill "in that second", down
+        // to the clock time — an answer from elsewhere under that sentence is simply a false one.
+        Assert.Null(probe.Invoke(Origin.AddMinutes(-30)));
+
+        await manager.StopSessionAsync();
+    }
+
+    /// <summary>
     /// Polls until the probe has an answer, which is as soon as the pump has read the samples the
     /// collector wrote. Fails rather than hangs when it never gets one.
     /// </summary>
@@ -112,7 +161,7 @@ public sealed class AdapterVramHistoryTests : IDisposable
     {
         for (var attempt = 0; attempt < 500; attempt++)
         {
-            if (parser.AdapterVramPercent?.Invoke() is { } reading)
+            if (parser.AdapterVramPercent?.Invoke(null) is { } reading)
             {
                 return reading;
             }
@@ -197,7 +246,7 @@ public sealed class AdapterVramHistoryTests : IDisposable
     /// <summary>A parser that parses nothing and only holds the probe the session hands it.</summary>
     private sealed class VramAwareStubParser : IArtifactParser, IVramAwareTraceAnalysis
     {
-        public Func<double?>? AdapterVramPercent { get; set; }
+        public Func<DateTimeOffset?, double?>? AdapterVramPercent { get; set; }
 
         public bool CanParse(string path) => false;
 

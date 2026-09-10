@@ -538,8 +538,16 @@ public sealed record VramPressureBandReport(
     public bool BandCostNothing => HitchRatio is { } ratio && ratio < 1;
 
     /// <summary>True once the band was occupied enough to be worth acting on rather than noting.</summary>
+    /// <remarks>
+    /// The occupancy terms are measurements and need no floor; <see cref="BandCostNothing"/> is a verdict
+    /// and gets the same one <see cref="Message"/> holds it to. Ungated it downgraded the line on the
+    /// strength of a comparison the prose beside it was refusing to state — a card sitting in the deep
+    /// band reported as Info because fifty frames on one side of a ratio happened to fall the right way.
+    /// </remarks>
     public bool IsPressured =>
-        ReadingsInBand > 0 && !BandCostNothing && (ReadingsInDeepBand > 0 || InBandShare >= 0.05);
+        ReadingsInBand > 0
+        && !(BandCostNothing && HasEnoughForVerdict)
+        && (ReadingsInDeepBand > 0 || InBandShare >= 0.05);
 
     /// <summary>
     /// Minutes of session the comparison needs before "the band cost nothing" is stated as a conclusion
@@ -553,6 +561,24 @@ public sealed record VramPressureBandReport(
     /// measures and long enough that a session's first quarter-hourly line, taken alone, cannot reach it.
     /// </remarks>
     private const double MinimumMeasuredMinutesForVerdict = 30;
+
+    /// <summary>
+    /// Minutes <em>inside the band</em> before the band's own hitch rate is compared to anything.
+    /// </summary>
+    /// <remarks>
+    /// The gate above counts session time, which is the wrong quantity for the claim being made. At
+    /// 02:14 on 9 September the line read "Det är ett motbevis mot att bandet skulle vara orsaken" on
+    /// 0.9 minutes in the band — thirty measured minutes cleared the session gate, and the comparison
+    /// that sentence rests on had fifty-odd frames on one side of it. Five minutes in the band is some
+    /// eighteen thousand frames at 60 Hz, which is enough for a rate; less is a number, not a finding,
+    /// and that cuts both ways — the same floor holds back "the band cost nothing" and "the band is the
+    /// cause" alike.
+    /// </remarks>
+    private const double MinimumBandMinutesForVerdict = 5;
+
+    /// <summary>True once both the session and the band have enough time behind them for a conclusion.</summary>
+    private bool HasEnoughForVerdict =>
+        MeasuredMinutes >= MinimumMeasuredMinutesForVerdict && MinutesInBand >= MinimumBandMinutesForVerdict;
 
     public string Message
     {
@@ -577,12 +603,15 @@ public sealed record VramPressureBandReport(
             // Not stated at all on thin material: exonerating the band on three minutes of a session that
             // may run for hours is a claim the data has not earned yet, even when the sign of the ratio
             // happens to already be right.
-            var lead = MeasuredMinutes < MinimumMeasuredMinutesForVerdict
-                ? $"Bara {MeasuredMinutes:F0} minuter mätta hittills — för tunt underlag för att fria eller "
-                    + "fälla bandet än. "
-                : BandCostNothing
+            var lead = HasEnoughForVerdict
+                ? BandCostNothing
                     ? "Bandet kostade ingenting den här sessionen. "
-                    : string.Empty;
+                    : string.Empty
+                : MeasuredMinutes < MinimumMeasuredMinutesForVerdict
+                    ? $"Bara {MeasuredMinutes:F0} minuter mätta hittills — för tunt underlag för att fria eller "
+                        + "fälla bandet än. "
+                    : $"Bara {MinutesInBand:F1} minuter i bandet hittills — för tunt underlag för att fria "
+                        + "eller fälla det än, oavsett hur länge sessionen mätts. ";
 
             return $"{lead}VRAM-tryck: kortet låg över {VramPressureBandMonitor.BandPercent:F0} % i {MinutesInBand:F1} av "
                 + $"{MeasuredMinutes:F0} minuter ({InBandShare:P0}){deep}; högst {PeakPercent:F1} %.{split}{gradient} "
@@ -651,10 +680,24 @@ public sealed record VramPressureBandReport(
 
         if (HitchRatio is { } ratio)
         {
-            return ratio >= 1
-                ? $" I de minuterna var hitchfrekvensen {ratio:F1}× högre än i resten — {rates}."
-                : $" I de minuterna var hitchfrekvensen lägre än i resten — {rates}. Det är ett motbevis mot "
-                    + "att bandet skulle vara orsaken, inte en varning om det.";
+            if (ratio >= 1)
+            {
+                // The accusation needs the floor as much as the exoneration below it does, and only the
+                // exoneration was getting it: a session with 0.9 minutes in the band wrote its ratio as a
+                // finding while the identical measurement pointing the other way was held back.
+                return HasEnoughForVerdict
+                    ? $" I de minuterna var hitchfrekvensen {ratio:F1}× högre än i resten — {rates}."
+                    : $" I de minuterna var hitchfrekvensen {ratio:F1}× högre än i resten — {rates} — men på "
+                        + $"{MinutesInBand:F1} minuter i bandet är det ingen slutsats åt något håll.";
+            }
+
+            // The exoneration needs the same floor the accusation does. Read off a minute in the band it
+            // is a coin toss with a sentence attached.
+            return HasEnoughForVerdict
+                ? $" I de minuterna var hitchfrekvensen lägre än i resten — {rates}. Det är ett motbevis mot "
+                    + "att bandet skulle vara orsaken, inte en varning om det."
+                : $" I de minuterna var hitchfrekvensen lägre än i resten — {rates} — men på "
+                    + $"{MinutesInBand:F1} minuter i bandet är det ingen slutsats åt något håll.";
         }
 
         return inBand > 0

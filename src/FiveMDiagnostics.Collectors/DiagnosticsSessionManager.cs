@@ -17,6 +17,17 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// </remarks>
     private static readonly TimeSpan AdapterVramWindow = TimeSpan.FromMinutes(3);
 
+    /// <summary>
+    /// How far from a named second a reading may lie and still describe it.
+    /// </summary>
+    /// <remarks>
+    /// The adapter is sampled twice a second and the trace names a second, so two seconds either way is
+    /// four readings on each side — enough to survive the clock skew between the trace's local timestamps
+    /// and the sampler's, and short enough that an eviction and the calm ten seconds after it never land
+    /// in the same answer.
+    /// </remarks>
+    private static readonly TimeSpan AdapterVramPeakTolerance = TimeSpan.FromSeconds(2);
+
     private readonly object _adapterVramSync = new();
     private readonly List<(DateTimeOffset At, double Percent)> _adapterVram = [];
     private readonly DiagnosticsSettings _settings;
@@ -65,6 +76,9 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private LiveVramTracker? _liveVram;
     private DisplayCadenceMonitor? _displayCadence;
     private CaptureCostMonitor? _captureCost;
+    private DeepCaptureLedger? _captureLedger;
+    private NeighbourCpuTrendMonitor? _neighbourCpu;
+    private ObsVramFootprintMonitor? _obsVram;
     private VramPressureBandMonitor? _vramPressure;
     private SlowFrameWaitProfile? _slowFrameWaits;
     private GameFocusMonitor? _gameFocus;
@@ -183,6 +197,10 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// which the trace is lost.
     /// </remarks>
     private readonly Dictionary<Guid, List<(ArtifactEvidence Evidence, ArtifactAttachment Attachment)>> _pendingTraceEvidence = [];
+
+    /// <summary>Traces the session-level monitors have already been given, by path.</summary>
+    private readonly HashSet<string> _observedTraces = new(StringComparer.OrdinalIgnoreCase);
+
     private volatile IReadOnlyList<ArtifactAttachment>? _attachmentsSnapshot;
 
     /// <summary>
@@ -340,6 +358,9 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _framePacing = new FramePacingMonitor(_settings.FramePacing, Environment?.DisplayRefreshRateHz);
             _displayCadence = new DisplayCadenceMonitor(Environment?.DisplayRefreshRateHz);
             _captureCost = new CaptureCostMonitor(Environment?.DisplayRefreshRateHz);
+            _captureLedger = new DeepCaptureLedger();
+            _neighbourCpu = new NeighbourCpuTrendMonitor();
+            _obsVram = new ObsVramFootprintMonitor();
             _vramAccounting = new VramAccountingMonitor();
             _vramBudget = new VramBudgetMonitor();
             _vramPressure = new VramPressureBandMonitor(Environment?.DisplayRefreshRateHz);
@@ -374,7 +395,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             // needs both.
             foreach (var vramAware in _artifactParsers.OfType<IVramAwareTraceAnalysis>())
             {
-                vramAware.AdapterVramPercent = RecentAdapterVramPercent;
+                vramAware.AdapterVramPercent = AdapterVramPercentAt;
             }
 
             // Lets each incident be judged against the window mode it happened in rather than the one
@@ -395,6 +416,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             lock (_sync)
             {
                 _pendingTraceEvidence.Clear();
+                _observedTraces.Clear();
             }
             _channel = Channel.CreateBounded<TelemetryEvent>(new BoundedChannelOptions(32768)
             {
@@ -814,9 +836,20 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             Report(StatusLevel.Info, "DeepCapture.Cost", report.Message);
         }
 
+        // Only at the end. A capture written a second ago has not been parsed yet and would count as
+        // orphaned in every quarter-hourly line until it was.
+        if (final && _captureLedger?.Summary() is { } ledger)
+        {
+            Report(
+                ledger.HasOrphans ? StatusLevel.Warning : StatusLevel.Info,
+                "DeepCapture.Ledger",
+                ledger.Message);
+        }
+
         if (final)
         {
             _captureCost = null;
+            _captureLedger = null;
         }
     }
 
@@ -919,6 +952,48 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         }
     }
 
+    /// <summary>
+    /// Writes the neighbouring process that stepped up mid-session and stayed there.
+    /// </summary>
+    /// <remarks>
+    /// Warning, and repeated as it grows: a load that changed halfway through is the one thing that makes
+    /// the two halves of a session incomparable, and it has to be read while there is still time to note
+    /// what happened on screen when it did.
+    /// </remarks>
+    private void FinalizeNeighbourCpu(bool final)
+    {
+        if (_neighbourCpu?.Summary() is { } report && ShouldWriteSummary("Process.CpuStep", report.Message))
+        {
+            Report(StatusLevel.Warning, "Process.CpuStep", report.Message);
+        }
+
+        if (final)
+        {
+            _neighbourCpu = null;
+        }
+    }
+
+    /// <summary>
+    /// Writes what the stream stack cost the card, when the session saw it come off.
+    /// </summary>
+    /// <remarks>
+    /// The line the OBS collector has been promising for two sessions and never delivering. Info: the
+    /// stack coming off is not a fault, and the figure is a reference for later rather than something to
+    /// act on tonight.
+    /// </remarks>
+    private void FinalizeObsVramFootprint(bool final)
+    {
+        if (_obsVram?.Summary() is { } report && ShouldWriteSummary("Obs.VramFootprint", report.Message))
+        {
+            Report(StatusLevel.Info, "Obs.VramFootprint", report.Message);
+        }
+
+        if (final)
+        {
+            _obsVram = null;
+        }
+    }
+
     /// <summary>Whether the anti-cheat line still has something to say.</summary>
     /// <remarks>
     /// A retired entry is written once. The line has ended in "Posten är därmed avförd" for six sessions
@@ -972,6 +1047,13 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 Report(StatusLevel.Info, "Analysis.Verdicts", gap);
             }
 
+            // Before the ranking, because it changes how the ranking is read: a verdict that names the
+            // same neighbour every time is one claim repeated, not a hundred.
+            if (report.UbiquitousSuspect is { } suspect && ShouldWriteSummary("Analysis.Verdicts.Suspect", suspect.Message))
+            {
+                Report(StatusLevel.Warning, "Analysis.Verdicts", suspect.Message);
+            }
+
             if (ShouldWriteSummary("Analysis.Verdicts", report.Message))
             {
                 Report(StatusLevel.Info, "Analysis.Verdicts", report.Message);
@@ -1000,6 +1082,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         FinalizeSlowFrameWaits(final);
         FinalizeGameFocus(final);
         FinalizeAntiCheatCost(final);
+        FinalizeNeighbourCpu(final);
+        FinalizeObsVramFootprint(final);
         FinalizeSystemMemory(final);
         FinalizeVerdicts(final);
     }
@@ -1575,7 +1659,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         // Counted like every other incident. A demo scenario added during a live session ends up in the
         // session's own history, so leaving it out of the tally made the end-of-session ranking
         // disagree with the incident list it is supposed to summarise.
-        _verdicts?.Record(analyzed.Marker.Id, analyzed.Analysis?.Hypotheses.FirstOrDefault()?.Category, analyzed.Analysis?.EvidenceGap);
+        _verdicts?.Record(
+            analyzed.Marker.Id,
+            analyzed.Analysis?.Hypotheses.FirstOrDefault()?.Category,
+            analyzed.Analysis?.EvidenceGap,
+            SuspectNames(analyzed));
 
         IncidentCompleted?.Invoke(this, analyzed);
 
@@ -1772,23 +1860,32 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     }
 
     /// <summary>
-    /// How full the card has been over the last few minutes, or null when nothing was measured.
+    /// How full the card was in one particular second, or over the last few minutes when no second is
+    /// named. Null when nothing was measured.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The median rather than the latest reading, and a window rather than an instant, because of when
-    /// this is asked. A deep capture runs its tail, writes several hundred megabytes and is then parsed,
-    /// so the question "how full was the card during that trace" arrives a minute or two after the
-    /// trace ended. A single reading taken at parse time can easily belong to a different part of the
-    /// evening; the median of the window the capture sits inside cannot.
+    /// The peak within <see cref="AdapterVramPeakTolerance"/> of the moment asked about, because the
+    /// moment asked about is the second the driver was evacuating in and eviction is over in one or two
+    /// readings. The highest reading in that neighbourhood is the fill the driver acted on; a mean or a
+    /// median there would average it against the state it left behind, which is lower by definition —
+    /// making room is what it just did.
     /// </para>
     /// <para>
-    /// The median also refuses to be moved by the capture's own cost. Writing the file evicts nothing,
-    /// but the game keeps allocating while it is written, and the last sample before the parse is the
-    /// one most likely to have drifted.
+    /// Without a moment the answer is the median of the retained window, which is the older behaviour
+    /// and right for what it answers: a trace with too few whole seconds to name a busiest one, or a file
+    /// imported by hand. It is deliberately not used when a second is known — a thirty-second window
+    /// around a one-second eviction reads several points low, and on 9 September that turned the worst
+    /// frame of the evening into a sentence denying memory pressure underneath a verdict of it.
+    /// </para>
+    /// <para>
+    /// A named second the history does not reach is answered with null rather than with that median. The
+    /// callers print the figure as the occupancy <em>in that second</em>, down to the clock time, and a
+    /// median of some other stretch of the evening under that sentence is a measurement of one period
+    /// attributed to another. Null is a case every caller already handles.
     /// </para>
     /// </remarks>
-    private double? RecentAdapterVramPercent()
+    private double? AdapterVramPercentAt(DateTimeOffset? at)
     {
         double[] readings;
         lock (_adapterVramSync)
@@ -1796,6 +1893,19 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             if (_adapterVram.Count == 0)
             {
                 return null;
+            }
+
+            if (at is { } moment)
+            {
+                var near = _adapterVram
+                    .Where(entry => (entry.At - moment).Duration() <= AdapterVramPeakTolerance)
+                    .Select(entry => entry.Percent)
+                    .ToArray();
+
+                // Nothing near it means the second has aged out of the history, which the trace parse
+                // can outlast on a long capture. That is an unanswered question, not an answer from
+                // elsewhere in the session.
+                return near.Length > 0 ? near.Max() : null;
             }
 
             readings = _adapterVram.Select(entry => entry.Percent).ToArray();
@@ -1922,6 +2032,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                     _vramAccounting?.Observe(gpuSample);
                     _vramBudget?.Observe(gpuSample);
                     _vramPressure?.Observe(gpuSample);
+                    _obsVram?.Observe(gpuSample);
                     GpuTelemetryUpdated?.Invoke(this, gpuSample);
                 }
                 else if (telemetryEvent is GpuProcessMemorySample gpuProcessSample)
@@ -1945,6 +2056,10 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 else if (telemetryEvent is FrameTelemetrySample frameSample)
                 {
                     ObserveFrame(frameSample);
+                }
+                else if (telemetryEvent is ObsTelemetrySample obsSample)
+                {
+                    _obsVram?.Observe(obsSample);
                 }
 
                 if (_incidentMaterializer is not null && Environment is not null)
@@ -2313,7 +2428,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
         // Counted by marker rather than by publication, so a re-analysis replaces the verdict instead of
         // adding a second one for the same incident.
-        _verdicts?.Record(analyzed.Marker.Id, analyzed.Analysis?.Hypotheses.FirstOrDefault()?.Category, analyzed.Analysis?.EvidenceGap);
+        _verdicts?.Record(
+            analyzed.Marker.Id,
+            analyzed.Analysis?.Hypotheses.FirstOrDefault()?.Category,
+            analyzed.Analysis?.EvidenceGap,
+            SuspectNames(analyzed));
 
         // Written before the history is touched by anything else: an incident evicted by the retention
         // cap, or dropped when the app closes, still leaves its summary on disk.
@@ -2362,8 +2481,20 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// The attachment is added only when it is new, so importing the same file twice does not grow the
     /// export bundle by a duplicate of itself.
     /// </remarks>
-    private static IncidentRecord WithEvidence(IncidentRecord incident, ArtifactEvidence evidence, ArtifactAttachment attachment)
+    /// <summary>The neighbours one incident named, for the session-level frequency.</summary>
+    private static IReadOnlyList<string> SuspectNames(IncidentRecord incident) =>
+        incident.Analysis?.SuspectedProcesses.Select(item => item.ProcessName).ToArray() ?? [];
+
+    private IncidentRecord WithEvidence(IncidentRecord incident, ArtifactEvidence evidence, ArtifactAttachment attachment)
     {
+        // The one place every trace that reaches an incident passes through, whether it was attached
+        // directly or held until the incident was published. The other half of the reconciliation is the
+        // capture write itself; the difference between the two is what nothing reported.
+        if (evidence.Kind == ArtifactKind.EtlTrace)
+        {
+            _captureLedger?.RecordReachedAnIncident(attachment.FilePath);
+        }
+
         return incident with
         {
             Events = incident.Events.Concat([evidence]).OrderBy(item => item.Timestamp).ToArray(),
@@ -2396,6 +2527,15 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         _attachmentsSnapshot = null;
     }
 
+    /// <summary>True the first time a trace file is handed to the session-level monitors.</summary>
+    private bool NoteTraceObserved(string path)
+    {
+        lock (_sync)
+        {
+            return _observedTraces.Add(path);
+        }
+    }
+
     /// <summary>
     /// Adds imported evidence to the most recent completed incident and re-runs the analysis, so the
     /// ranking reflects the new input rather than the state at materialization time.
@@ -2419,9 +2559,14 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         // Every trace, whichever incident it ends up on and whether it ends up on one at all. The
         // anti-cheat's cost is a property of the evening rather than of any incident, and answering it
         // once at session level is what stops it being rediscovered as a finding a fourth time.
-        if (evidence.Kind == ArtifactKind.EtlTrace)
+        //
+        // Once per file, though. The incident below drops a re-import as a duplicate and these do not
+        // see that decision; a file imported twice used to enter both series twice, and a level counted
+        // twice on one side of a comparison is a step that never happened.
+        if (evidence.Kind == ArtifactKind.EtlTrace && NoteTraceObserved(attachment.FilePath))
         {
             _antiCheatCost?.Observe(evidence.Metrics);
+            _neighbourCpu?.Observe(evidence.Timestamp, evidence.Metrics);
         }
 
         lock (_sync)
@@ -2465,7 +2610,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _incidents[index] = updated;
         }
 
-        _verdicts?.Record(updated.Marker.Id, updated.Analysis?.Hypotheses.FirstOrDefault()?.Category, updated.Analysis?.EvidenceGap);
+        _verdicts?.Record(
+            updated.Marker.Id,
+            updated.Analysis?.Hypotheses.FirstOrDefault()?.Category,
+            updated.Analysis?.EvidenceGap,
+            SuspectNames(updated));
 
         // The journal line written when the incident completed describes the analysis as it stood before
         // this import, so the conclusion the import produced — usually the one that actually explains
@@ -2491,6 +2640,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 // Timed here rather than when the capture was requested: what disturbs the game is the
                 // flush of the ring buffer to disk, which is what has just finished.
                 _captureCost?.RecordCaptureWritten(DateTimeOffset.UtcNow);
+                _captureLedger?.RecordWritten(result.CapturePath!);
 
                 // And the budget, which otherwise has to assume this capture is still recording and
                 // holds the next extreme frame off for the longest tail the options allow. With the file
@@ -2576,7 +2726,12 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             TryAttachEvidenceToIncident(marker.Id, stamped, result.Attachment);
         }
 
-        Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), $"Deep capture analyserad: {result.Evidence[0].Summary}");
+        // Named, so this line and the one that says the file was deleted for a worse hitch can be
+        // connected. They stand forty minutes apart in an evening's log and had nothing in common.
+        Report(
+            StatusLevel.Info,
+            nameof(DiagnosticsSessionManager),
+            $"Deep capture analyserad ({Path.GetFileName(capturePath)}): {result.Evidence[0].Summary}");
     }
 
     /// <summary>

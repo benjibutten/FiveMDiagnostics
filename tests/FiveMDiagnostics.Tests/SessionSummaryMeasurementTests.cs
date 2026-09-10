@@ -147,6 +147,50 @@ public sealed class SessionSummaryMeasurementTests
     }
 
     /// <summary>
+    /// The same thin material with the ratio pointing the other way. The floor was written to cut both
+    /// ways and only the exoneration was getting it: a session with a minute in the band wrote its ratio
+    /// out as a finding while the identical measurement acquitting the band was held back.
+    /// </summary>
+    [Fact]
+    public void AHigherRateInTheBandOnThinMaterialIsNotAFindingEither()
+    {
+        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+
+        Play(monitor, Start, minutes: 2, vramPercent: 92, hitchesPerMinute: 10);
+        Play(monitor, Start.AddMinutes(2), minutes: 2, vramPercent: 70, hitchesPerMinute: 1);
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report);
+        Assert.NotNull(report!.HitchRatio);
+        Assert.True(report.HitchRatio!.Value > 1);
+        Assert.Contains("ingen slutsats åt något håll", report.Message, StringComparison.Ordinal);
+
+        // The card was in the deep band for two of those minutes, which is a measurement rather than a
+        // comparison, and it stays a warning.
+        Assert.True(report.IsPressured);
+    }
+
+    /// <summary>
+    /// The exoneration on thin material may say so in the prose and may not quietly downgrade the line
+    /// as well: the card sat in the deep band, and that much is measured rather than inferred.
+    /// </summary>
+    [Fact]
+    public void AThinExonerationDoesNotDowngradeTheLine()
+    {
+        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+
+        Play(monitor, Start, minutes: 2, vramPercent: 92, hitchesPerMinute: 1);
+        Play(monitor, Start.AddMinutes(2), minutes: 2, vramPercent: 70, hitchesPerMinute: 5);
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report);
+        Assert.True(report!.BandCostNothing);
+        Assert.True(report.IsPressured);
+    }
+
+    /// <summary>
     /// An evening that never reaches the band says so, and says nothing about a gradient it has no
     /// minutes to measure.
     /// </summary>

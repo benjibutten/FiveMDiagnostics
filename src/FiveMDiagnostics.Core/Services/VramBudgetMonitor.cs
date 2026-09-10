@@ -117,6 +117,39 @@ public sealed class VramBudgetMonitor
     private bool _streamStackPresent;
 
     /// <summary>
+    /// How long the residual has to hold still before a drifting game row is treated as an offset.
+    /// </summary>
+    /// <remarks>
+    /// The same quarter of an hour the drift itself is measured over, so neither reading gets to declare
+    /// itself on less material than the other.
+    /// </remarks>
+    private static readonly TimeSpan StableResidualWindow = TimeSpan.FromMinutes(15);
+
+    /// <summary>
+    /// How far the residual may move across that window and still be one number.
+    /// </summary>
+    /// <remarks>
+    /// The reconciliation of 9 September ran twenty times over five and a half hours and reported the
+    /// same difference every time: 0.94 to 1.30 GB, a spread of 0.36. That is the desktop and the stream
+    /// stack, which do not change while nobody touches them. Half a gigabyte admits it and is well under
+    /// the several-gigabyte runaway the drift check exists to catch.
+    /// </remarks>
+    private const ulong StableResidualSpreadBytes = 512UL * 1024 * 1024;
+
+    /// <summary>
+    /// The residual — the card's own figure minus the game's row — over the recent window.
+    /// </summary>
+    /// <remarks>
+    /// A drifting row and a wrong row are not the same thing, and the split was being refused for both.
+    /// A game row that climbs while the card holds still is what happens when the game takes memory the
+    /// desktop gives back, and its absolute value can still agree with the card perfectly — which is
+    /// checkable, because everything else on the card is the difference between the two. On 9 September
+    /// the refusal at 22:23 was the evening's last budget line: five and a half hours, twenty
+    /// reconciliations, a difference stable to within 0.36 GB, and no split.
+    /// </remarks>
+    private readonly List<(DateTimeOffset At, ulong Bytes)> _residuals = [];
+
+    /// <summary>
     /// The largest amount the game has been seen holding beyond its streaming budget this session.
     /// </summary>
     /// <remarks>
@@ -366,12 +399,18 @@ public sealed class VramBudgetMonitor
         // slider another step was computed against that empty card. Refusing is worth more than a split
         // known to be wrong.
         var gameRowDrifting = believable.Where(IsGame).Any(sample.IsDrifting);
-        var tableUnusable = gameBytes > usedBytes || gameRowDrifting;
 
         // Everything the game does not hold, taken from the card's own figure so the table's double
         // counting cannot reach it. Floored because the two collectors sample at different instants and a
         // game that grew between them would otherwise produce a negative desktop.
         var otherBytes = usedBytes > gameBytes ? usedBytes - gameBytes : 0;
+
+        // A row larger than the card is wrong and nothing rescues it. A drifting row is only unusable
+        // while what it leaves over keeps moving: once the residual holds still for a quarter of an hour
+        // it is the desktop and the stream stack, measured as the card's own figure minus the row, and the
+        // split can be made against it.
+        var residualStable = gameBytes <= usedBytes && NoteResidual(sample.Timestamp, otherBytes);
+        var tableUnusable = gameBytes > usedBytes || (gameRowDrifting && !residualStable);
 
         var streamMeasuredBytes = believable.Where(IsStreamStack).Aggregate(0UL, (total, process) => total + process.DedicatedBytes);
 
@@ -465,6 +504,15 @@ public sealed class VramBudgetMonitor
         var resumed = _reportedUnusableTable;
         _reportedUnusableTable = false;
 
+        // The split is being made over a row the drift check still objects to, so the line has to say
+        // which reading it rests on. It rests on the card.
+        var offsetNote = gameRowDrifting
+            ? " Spelets rad räknas som driftande, men det den lämnar över — skrivbordet och streamstacken "
+                + $"— har legat still inom {StableResidualSpreadBytes / 1024d / 1024 / 1024:F1} GB i "
+                + $"{StableResidualWindow.TotalMinutes:F0} minuter. En stabil differens är en känd offset "
+                + "och inte en drift, så uppdelningen görs mot kortets egen siffra."
+            : string.Empty;
+
         // The refusal above used to be the last budget line of the evening: nothing forced a new one once
         // the table started agreeing with the card again, so a session that refused once at 22:32 could
         // go five hours without another split even after the row it refused over had long since recovered
@@ -522,6 +570,8 @@ public sealed class VramBudgetMonitor
                 message += $" {verdict}";
             }
         }
+
+        message += offsetNote;
 
         if (streamUnmeasurable)
         {
@@ -611,6 +661,40 @@ public sealed class VramBudgetMonitor
     /// exclude only the absolutely impossible rows, so the difference is the rows below the cut and
     /// nothing else — in particular a row proved to double count is inside both and cancels.
     /// </remarks>
+    /// <summary>
+    /// Folds one residual in and answers whether it has held still long enough to be an offset.
+    /// </summary>
+    /// <remarks>
+    /// Trimmed to the window on every sample, so this is a few hundred entries at the process cadence
+    /// and never grows. False until the window is actually full: a spread measured over two minutes says
+    /// nothing about a row that has been climbing for fifteen.
+    /// </remarks>
+    private bool NoteResidual(DateTimeOffset at, ulong bytes)
+    {
+        _residuals.Add((at, bytes));
+
+        var cutoff = at - StableResidualWindow;
+        var stale = 0;
+        while (stale < _residuals.Count && _residuals[stale].At < cutoff)
+        {
+            stale++;
+        }
+
+        if (stale > 0)
+        {
+            _residuals.RemoveRange(0, stale);
+        }
+
+        if (_residuals.Count < 2 || at - _residuals[0].At < StableResidualWindow)
+        {
+            return false;
+        }
+
+        var lowest = _residuals.Min(entry => entry.Bytes);
+        var highest = _residuals.Max(entry => entry.Bytes);
+        return highest - lowest <= StableResidualSpreadBytes;
+    }
+
     private static ulong HiddenBytes(GpuProcessMemorySample sample)
     {
         var listed = sample.Processes

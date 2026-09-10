@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Globalization;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
@@ -19,6 +19,10 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
     private DateTimeOffset? _disconnectedSince;
     private bool _reportedConnectionWarning;
     private bool _reportedRenderSkipOnset;
+    private long? _firstRenderSkipped;
+    private long? _lastRenderSkipped;
+    private long? _firstOutputSkipped;
+    private long? _lastOutputSkipped;
 
     public string Name => "OBS";
 
@@ -33,6 +37,10 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
         _disconnectedSince = null;
         _reportedConnectionWarning = false;
         _reportedRenderSkipOnset = false;
+        _firstRenderSkipped = null;
+        _lastRenderSkipped = null;
+        _firstOutputSkipped = null;
+        _lastOutputSkipped = null;
 
         try
         {
@@ -45,6 +53,7 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
                     ReportProcessTransition(context, sample);
                     ReportConnectionHealth(context, sample);
                     ReportRenderSkipOnset(context, sample);
+                    NoteSkippedFrames(sample);
                     await context.Writer.WriteAsync(sample, cancellationToken).ConfigureAwait(false);
                 }
 
@@ -60,6 +69,10 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
             if (!everConnected)
             {
                 ReportLogFallback(context, sessionStart);
+            }
+            else
+            {
+                ReportSkippedFrameTotals(context);
             }
 
             await ResetSocketAsync().ConfigureAwait(false);
@@ -194,6 +207,65 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
             $"OBS render skipped frames är inte längre noll ({sample.RenderSkippedFrames}). Output skipped "
             + "avgör om tittarna märker något — det är en annan räknare — men det här är första gången i "
             + "sessionen som renderkällan själv har missat en bildruta.");
+    }
+
+    /// <summary>Keeps the ends of the two skipped-frame counters.</summary>
+    internal void NoteSkippedFrames(ObsTelemetrySample sample)
+    {
+        if (sample.RenderSkippedFrames is { } render)
+        {
+            _firstRenderSkipped ??= render;
+            _lastRenderSkipped = render;
+        }
+
+        // The ends, not the peak. OBS counts these from the moment its output started, which is usually
+        // before the app did: a stream that dropped forty frames an hour before the session opened made
+        // every session after it warn about those forty frames again.
+        if (sample.OutputSkippedFrames is { } output)
+        {
+            _firstOutputSkipped ??= output;
+            _lastOutputSkipped = output;
+        }
+    }
+
+    /// <summary>
+    /// Says where the two counters ended up, once, at the end of the session.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="ReportRenderSkipOnset"/> covers the first frame the render source missed and nothing
+    /// covers the rest. On 9 September that counter went from 15 to 96 over five hours with one line
+    /// written about it, at the beginning — the same shape as the counter reading zero for seven sessions
+    /// and nobody noticing the eighth. A start value, an end value and the statement that
+    /// <c>output skipped</c> stayed at zero is what closes the question for the evening, and it is the
+    /// treatment the throttling and cooling figures already get.
+    /// </remarks>
+    internal void ReportSkippedFrameTotals(CollectorContext context)
+    {
+        if (_firstRenderSkipped is not { } first || _lastRenderSkipped is not { } last)
+        {
+            return;
+        }
+
+        // Against the session's own first reading, the way the render counter is. OBS's counter runs from
+        // the start of its output and the question the line answers is what happened this evening.
+        var skippedHere = _lastOutputSkipped is { } lastOutput && _firstOutputSkipped is { } firstOutput
+            ? lastOutput - firstOutput
+            : 0;
+
+        var viewers = skippedHere == 0
+            ? $"Output skipped rörde sig inte under sessionen (står på {_lastOutputSkipped ?? 0}): ingen "
+                + "bildruta uteblev för tittarna."
+            : $"Output skipped steg med {skippedHere} under sessionen (till {_lastOutputSkipped}) — de "
+                + "bildrutorna nådde aldrig tittarna.";
+
+        var render = last == first
+            ? $"OBS render skipped stod stilla på {first} hela sessionen."
+            : $"OBS render skipped gick från {first} till {last} under sessionen ({last - first} till).";
+
+        context.StatusSink.Report(
+            skippedHere == 0 ? StatusLevel.Info : StatusLevel.Warning,
+            Name,
+            $"{render} {viewers}");
     }
 
     /// <summary>

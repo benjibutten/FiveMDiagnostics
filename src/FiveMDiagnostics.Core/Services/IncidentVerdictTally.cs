@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Core;
+﻿namespace FiveMDiagnostics.Core;
 
 /// <summary>
 /// Counts what the correlation engine actually concluded across a session, so its ranking is readable
@@ -24,13 +24,23 @@ public sealed class IncidentVerdictTally
     private readonly object _sync = new();
     private readonly Dictionary<Guid, RootCauseCategory> _verdicts = [];
     private readonly Dictionary<Guid, InsufficientEvidenceReason> _evidenceGaps = [];
+    private readonly Dictionary<Guid, IReadOnlyList<string>> _suspects = [];
 
     /// <summary>Records, or replaces, the top-ranked category for one incident.</summary>
     /// <param name="evidenceGap">
     /// Why the category is <see cref="RootCauseCategory.InsufficientEvidence"/>, when it is. Ignored
     /// otherwise, and cleared on a re-analysis that no longer classifies the incident that way.
     /// </param>
-    public void Record(Guid markerId, RootCauseCategory? category, InsufficientEvidenceReason? evidenceGap = null)
+    /// <param name="suspects">
+    /// The processes this incident named as suspected neighbours. Kept so the session can say when one
+    /// name is on nearly every incident, which is either the session's finding or a broken rule and is
+    /// invisible either way from inside a single incident.
+    /// </param>
+    public void Record(
+        Guid markerId,
+        RootCauseCategory? category,
+        InsufficientEvidenceReason? evidenceGap = null,
+        IReadOnlyList<string>? suspects = null)
     {
         if (category is not { } verdict)
         {
@@ -40,6 +50,7 @@ public sealed class IncidentVerdictTally
         lock (_sync)
         {
             _verdicts[markerId] = verdict;
+            _suspects[markerId] = suspects ?? [];
 
             if (verdict == RootCauseCategory.InsufficientEvidence && evidenceGap is { } gap)
             {
@@ -73,7 +84,17 @@ public sealed class IncidentVerdictTally
                 .Select(group => new EvidenceGapCount(group.Key, group.Count()))
                 .ToArray();
 
-            return new IncidentVerdictReport(_verdicts.Count, byCategory, byGap);
+            // Counted over the incidents that named anything at all, so a session where most incidents
+            // have no neighbour to name cannot make a rare one look universal.
+            var withSuspects = _suspects.Values.Where(names => names.Count > 0).ToArray();
+            var ubiquitous = withSuspects
+                .SelectMany(names => names.Distinct(StringComparer.OrdinalIgnoreCase))
+                .GroupBy(name => name, StringComparer.OrdinalIgnoreCase)
+                .Select(group => new SuspectFrequency(group.Key, group.Count(), withSuspects.Length))
+                .OrderByDescending(item => item.Incidents)
+                .FirstOrDefault(item => item.IsUbiquitous);
+
+            return new IncidentVerdictReport(_verdicts.Count, byCategory, byGap, ubiquitous);
         }
     }
 }
@@ -85,10 +106,46 @@ public sealed record IncidentVerdictCount(RootCauseCategory Category, int Count)
 public sealed record EvidenceGapCount(InsufficientEvidenceReason Reason, int Count);
 
 /// <summary>What the engine concluded across a whole session.</summary>
+/// <summary>
+/// One process named as a suspect on nearly every incident that named anything.
+/// </summary>
+/// <remarks>
+/// On 9 September <c>FiveM_ChromeBrowser</c> was a suspected neighbour in 129 of 149 incidents, and in
+/// all 98 after midnight. Both readings were in the log, one incident at a time, where a name in a list
+/// of suspects looks like ordinary background noise. A name on every single incident is not noise: it is
+/// either the evening's finding or a rule that names whoever happens to be busiest, and both are worth
+/// the reader's attention before any individual verdict is.
+/// </remarks>
+public sealed record SuspectFrequency(string ProcessName, int Incidents, int IncidentsWithSuspects)
+{
+    /// <summary>
+    /// Share of incidents a name has to reach before it is reported as universal rather than frequent.
+    /// </summary>
+    /// <remarks>
+    /// Nine tenths, and it has been passed once: the sessions before this ran at 46% and 51% for the
+    /// same process, which is a busy neighbour and reads as one.
+    /// </remarks>
+    private const double UbiquitousShare = 0.9;
+
+    /// <summary>Incidents below which a share says nothing. A name on two of two is not a pattern.</summary>
+    private const int MinimumIncidents = 20;
+
+    public double Share => IncidentsWithSuspects == 0 ? 0 : (double)Incidents / IncidentsWithSuspects;
+
+    public bool IsUbiquitous => IncidentsWithSuspects >= MinimumIncidents && Share >= UbiquitousShare;
+
+    public string Message =>
+        $"{ProcessName} pekas ut som misstänkt sidoprocess i {Incidents} av {IncidentsWithSuspects} "
+        + $"incidenter ({Share:P0}). En process som namnges i nästan varenda incident är antingen "
+        + "sessionens fynd eller en regel som namnger den som råkar vara mest upptagen — läs väntkedjorna "
+        + "i spåren innan den tas för en orsak, för de säger vem som faktiskt höll tråden.";
+}
+
 public sealed record IncidentVerdictReport(
     int Incidents,
     IReadOnlyList<IncidentVerdictCount> ByCategory,
-    IReadOnlyList<EvidenceGapCount> ByEvidenceGap)
+    IReadOnlyList<EvidenceGapCount> ByEvidenceGap,
+    SuspectFrequency? UbiquitousSuspect = null)
 {
     /// <summary>Incidents where the card's memory was the top-ranked explanation.</summary>
     /// <remarks>

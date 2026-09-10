@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Tests;
+﻿namespace FiveMDiagnostics.Tests;
 
 using FiveMDiagnostics.Integrations.Etw;
 
@@ -31,7 +31,8 @@ public sealed class VideoMemoryManagerPressureTests
             PeakCores: 0.91,
             SubjectProcess: "FiveM_b3407_GTAProcess.exe",
             SubjectCoresAtPeak: 3.22,
-            SubjectBaselineCores: 3.93);
+            SubjectBaselineCores: 3.93,
+            PeakAt: null);
 
         Assert.True(pressure.IsPressured);
         Assert.True(pressure.SubjectWentQuiet);
@@ -58,7 +59,7 @@ public sealed class VideoMemoryManagerPressureTests
     [Fact]
     public void TheSameRateOnAHalfEmptyCardIsNotCalledMemoryPressure()
     {
-        var pressure = new VideoMemoryPressure(0.03, 0.42, "FiveM_b3407_GTAProcess.exe", 6.12, 2.75);
+        var pressure = new VideoMemoryPressure(0.03, 0.42, "FiveM_b3407_GTAProcess.exe", 6.12, 2.75, null);
 
         var described = pressure.Describe(adapterVramPercent: 54);
 
@@ -78,7 +79,7 @@ public sealed class VideoMemoryManagerPressureTests
     [Fact]
     public void WithoutTheCardsOwnReadingTheConclusionIsDeferred()
     {
-        var described = new VideoMemoryPressure(0.18, 0.91, "FiveM_b3407_GTAProcess.exe", null, null)
+        var described = new VideoMemoryPressure(0.18, 0.91, "FiveM_b3407_GTAProcess.exe", null, null, null)
             .Describe();
 
         Assert.Contains("0,91 kärnor", described, StringComparison.Ordinal);
@@ -95,7 +96,7 @@ public sealed class VideoMemoryManagerPressureTests
     [InlineData(0.22)]
     public void TheQuietTracesOfTheSameEveningAreNotPressure(double peakCores)
     {
-        var pressure = new VideoMemoryPressure(0.05, peakCores, "FiveM_b3407_GTAProcess.exe", 3.9, 3.9);
+        var pressure = new VideoMemoryPressure(0.05, peakCores, "FiveM_b3407_GTAProcess.exe", 3.9, 3.9, null);
 
         Assert.False(pressure.IsPressured);
         Assert.Contains("ingen mätbar flyttning", pressure.Describe(), StringComparison.Ordinal);
@@ -108,18 +109,42 @@ public sealed class VideoMemoryManagerPressureTests
     [Fact]
     public void AGameThatKeptWorkingIsNotDescribedAsWaiting()
     {
-        var pressure = new VideoMemoryPressure(0.20, 0.85, "FiveM_b3407_GTAProcess.exe", 3.90, 3.93);
+        var pressure = new VideoMemoryPressure(0.20, 0.85, "FiveM_b3407_GTAProcess.exe", 3.90, 3.93, null);
 
         Assert.True(pressure.IsPressured);
         Assert.False(pressure.SubjectWentQuiet);
         Assert.DoesNotContain("vänta, inte till att räkna", pressure.Describe(), StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// The busiest second is named in the sentence, so the reading can be told from the window median it
+    /// used to be.
+    /// </summary>
+    [Fact]
+    public void TheSecondTheReadingBelongsToIsNamed()
+    {
+        var pressure = new VideoMemoryPressure(
+            BaselineCores: 0.22,
+            PeakCores: 0.97,
+            SubjectProcess: "FiveM_b3407_GTAProcess.exe",
+            SubjectCoresAtPeak: 2.45,
+            SubjectBaselineCores: 4.13,
+            PeakAt: new DateTime(2026, 9, 10, 1, 57, 43, DateTimeKind.Local));
+
+        var described = pressure.Describe(adapterVramPercent: 92.6);
+
+        Assert.Contains("kl. 01:57:43", described, StringComparison.Ordinal);
+        Assert.Contains("flyttningen är eviction", described, StringComparison.Ordinal);
+
+        // The sentence that stood underneath a correct verdict of GPU VRAM pressure on that frame.
+        Assert.DoesNotContain("inte minnestryck", described, StringComparison.Ordinal);
+    }
+
     /// <summary>Without the per-process series there is a rate and nothing to pair it with.</summary>
     [Fact]
     public void AnUnpairedRateStillReportsTheDriver()
     {
-        var pressure = new VideoMemoryPressure(0.18, 0.91, "FiveM_b3407_GTAProcess.exe", null, null);
+        var pressure = new VideoMemoryPressure(0.18, 0.91, "FiveM_b3407_GTAProcess.exe", null, null, null);
 
         Assert.True(pressure.IsPressured);
         Assert.False(pressure.SubjectWentQuiet);

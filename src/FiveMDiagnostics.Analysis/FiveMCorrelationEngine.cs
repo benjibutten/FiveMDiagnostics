@@ -391,6 +391,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         AddThreadWaitHypothesis(hypotheses, correlatedThreadWait, metrics);
         AddVramHypothesis(hypotheses, metrics, gpu, correlatedThreadWait, gpuProcessMemory, videoMemory);
         AddGpuResidencyStallHypothesis(hypotheses, gpuSamples, frameSamples, gpu, artifacts);
+        AddInProcessRenderStallHypothesis(hypotheses, artifacts, gpu, incident.WindowStart, incident.WindowEnd);
         AddObsHypothesis(hypotheses, metrics, obsSamples, gpu);
         AddGpuHypothesis(hypotheses, metrics, obsSamples, systemSamples, gpu, correlatedThreadWait);
         AddResourceHypothesis(hypotheses, metrics, processSamples, artifacts, obsSamples, systemSamples, cores, correlatedThreadWait);
@@ -1071,6 +1072,119 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             + "tillsammans inte plats.");
 
         hypotheses.Add(new HypothesisScore(RootCauseCategory.GpuResidencyStall, Math.Min(confidence, 0.95), evidence));
+    }
+
+    /// <summary>
+    /// The game standing still behind its own render thread, with the card calm and nothing outside the
+    /// process in the chain.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Written for the mechanism that was left after the texture budget cut video memory pressure back.
+    /// The traces of 8 and 9 September carry seven of these: waits of 150–722 ms on the main thread, every
+    /// one released by the game's own render thread, which was on the processor throughout and inside
+    /// <c>d3d11.dll</c> and the driver's user-mode half. <c>dxgmms2.sys</c> held 0.04–0.07 cores in five
+    /// of the six traces, and the card sat at 81–86%.
+    /// </para>
+    /// <para>
+    /// Its evidence is the trace's own chain rather than a frame correlation, deliberately. The
+    /// correlation exists and is stricter — it has to line a wait up against the frames it lost — and the
+    /// 465 ms frame of 9 September failed it on window boundaries while its chain was unambiguous. A
+    /// verdict that says "the game waited on itself" needs only the chain; how much it cost is what the
+    /// frame correlation adds when it fires.
+    /// </para>
+    /// </remarks>
+    private static void AddInProcessRenderStallHypothesis(
+        List<HypothesisScore> hypotheses,
+        IReadOnlyList<ArtifactEvidence> artifacts,
+        GpuMetrics gpu,
+        DateTimeOffset windowStart,
+        DateTimeOffset windowEnd)
+    {
+        var trace = artifacts
+            .Where(item => item.Kind == ArtifactKind.EtlTrace
+                && item.Metrics.GetValueOrDefault("gameThreadBlockerIsGame") >= 0.5
+                && item.Metrics.GetValueOrDefault("gameThreadMaxWaitMs") >= SlowFrameFloorMs
+                && OverlapsWindow(item, windowStart, windowEnd))
+            .OrderByDescending(item => item.Metrics.GetValueOrDefault("gameThreadMaxWaitMs"))
+            .FirstOrDefault();
+
+        if (trace is null)
+        {
+            return;
+        }
+
+        // The driver's own threshold, as the parser decided it. Anything at or above it is the driver
+        // evacuating the card, which is a different verdict with its own hypothesis. A trace that never
+        // measured the module is not a trace that measured calm, so its absence has to end the verdict
+        // rather than clear the gate: read as a default, an unmeasured dxgmms2.sys came out below every
+        // threshold here and then printed the 0.00 as evidence that the driver moved nothing.
+        if (!trace.Metrics.TryGetValue("videoMemoryManagerPeakCores", out var videoMemoryCores)
+            || trace.Metrics.GetValueOrDefault("videoMemoryManagerPressured") >= 0.5)
+        {
+            return;
+        }
+
+        // The card has to have been out of the band as well. The wait chain looks the same during an
+        // eviction — the render thread is what blocks then too — and the occupancy is what tells them
+        // apart. The trace's own reading is preferred: it belongs to the second the driver was busiest,
+        // where the window's peak is whatever the whole incident touched. With neither, the verdict is
+        // simply unavailable — the same default that read as calm above read as an empty card here.
+        var occupancy = trace.Metrics.TryGetValue("videoMemoryAdapterPercentAtPeak", out var atPeak)
+            ? atPeak
+            : gpu.HasData ? gpu.PeakVramPercent : (double?)null;
+        if (occupancy is not { } percent || percent >= VramPressureBandMonitor.BandPercent)
+        {
+            return;
+        }
+
+        var waitMs = trace.Metrics.GetValueOrDefault("gameThreadMaxWaitMs");
+        var blockerThreadId = (int)trace.Metrics.GetValueOrDefault("gameThreadBlockedByThreadId");
+        var driverCores = trace.Metrics
+            .Where(entry => entry.Value > 0 && entry.Key.StartsWith(BlockerModuleCoresPrefix, StringComparison.Ordinal))
+            .Where(entry => GraphicsDriverModules.Contains(entry.Key[BlockerModuleCoresPrefix.Length..], StringComparer.OrdinalIgnoreCase))
+            .ToArray();
+
+        var confidence = 0.55;
+        var evidence = new List<string>
+        {
+            $"Spelets huvudtråd stod stilla {waitMs:F0} ms och släpptes av tid {blockerThreadId} i spelets "
+                + "egen process, som låg på processorn hela tiden. Kedjan lämnar aldrig FiveM: ingen extern "
+                + "process, ingen drivrutinsavbrott och ingen disk finns i den.",
+            $"Kortet låg på {percent:F0} %, under {VramPressureBandMonitor.BandPercent:F0} % där eviction "
+                + $"börjar, och dxgmms2.sys (DirectX minneshanterare) höll {videoMemoryCores:F2} kärnor som "
+                + "mest — drivrutinen flyttade inget videominne medan spelet väntade.",
+        };
+
+        // Which of the game's own threads it was, when the trace can say. Same process is not the same
+        // thread: a blocker inside FiveM is as easily audio or resource streaming, and the driver's
+        // user-mode modules on the blocking thread are the only thing here that names the render thread.
+        // Without them the chain is still the verdict — nothing outside the process held it — and the
+        // sentence about what to change has to stop short of naming a thread it did not identify.
+        if (driverCores.Length > 0)
+        {
+            confidence += 0.2;
+            var modules = string.Join(
+                " och ",
+                driverCores.Select(entry => $"{entry.Key[BlockerModuleCoresPrefix.Length..]} ({entry.Value:F2} kärnor)"));
+            evidence.Add(
+                $"Den blockerande tråden låg i {modules} — spelets rendertråd inne i Direct3D. Väntan är "
+                + "serialisering mellan spelets egna trådar, inte konkurrens om maskinen.");
+            evidence.Add(
+                "Åtgärden ligger i vad rendertråden har att göra: färre NUI-lager, mindre renderarbete per "
+                + "frame eller en annan klientbuild. Att stänga bakgrundsprogram flyttar den inte, för de är "
+                + "inte i kedjan.");
+        }
+        else
+        {
+            evidence.Add(
+                "Vilken av spelets trådar som höll huvudtråden går inte att säga av spåret — ingen "
+                + "grafikmodul syns på den blockerande tråden, så det är lika gärna ljud eller "
+                + "resursströmning. Åtgärden ligger ändå inne i klienten: att stänga bakgrundsprogram "
+                + "flyttar den inte, för de är inte i kedjan.");
+        }
+
+        hypotheses.Add(new HypothesisScore(RootCauseCategory.InProcessRenderStall, confidence, evidence));
     }
 
     private static void AddObsHypothesis(List<HypothesisScore> hypotheses, FrameMetrics metrics, IReadOnlyList<ObsTelemetrySample> obsSamples, GpuMetrics gpu)
@@ -1988,6 +2102,19 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         {
             confidence += 0.1;
             evidence.Add($"Disktrafiken från bakgrunden toppade på {suspectPeakIo:F0} MB/s.");
+        }
+
+        // A neighbour that is not in the wait chain did not block the thread that was blocked. The trace
+        // says who released it; when that was the game's own render thread, the busiest process on the
+        // machine is a bystander however much it was doing. On 9 September this verdict named
+        // FiveM_ChromeBrowser on 99 of 149 incidents, including a 465 ms frame whose chain never left
+        // FiveM at all.
+        if (hypotheses.Any(item => item.Category == RootCauseCategory.InProcessRenderStall))
+        {
+            confidence = Math.Min(confidence, UncorroboratedAttributionCeiling);
+            evidence.Add(
+                "Men spårets väntkedja slutar inne i spelets egen process, så ingen av dem höll den tråd "
+                + "som stod stilla. De var på maskinen samtidigt; de var inte i vägen.");
         }
 
         hypotheses.Add(new HypothesisScore(
@@ -3157,6 +3284,10 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             RootCauseCategory.GameNotInFocus => "Game not in focus",
             RootCauseCategory.MemoryPagingStall => "Sidfel mot växlingsfilen (slut på RAM)",
             RootCauseCategory.GpuResidencyStall => "GPU-residens: drivrutinen gjorde plats i VRAM",
+            // Not "sin egen rendertråd": the chain proves the process, and only the graphics modules on
+            // the blocking thread prove the thread. The evidence names the render thread when they are
+            // there, and the heading has to hold for the trace where they are not.
+            RootCauseCategory.InProcessRenderStall => "Spelet väntade på en av sina egna trådar",
             _ => "Insufficient evidence",
         };
     }

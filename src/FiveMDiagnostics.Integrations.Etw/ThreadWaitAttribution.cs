@@ -225,6 +225,18 @@ internal sealed class ThreadWaitAttribution
             .Select(group => $"{group.Key} ×{group.Count()}")
             .ToArray();
 
+        var chain = WalkChain(selectedWaits.FirstOrDefault(), processId => cpu.Name(cpu.ProcessIdForThread(processId)));
+
+        // What the thread at the end of the chain was executing. Without it the sentence names a thread
+        // id and a duration, and the reader has to run etlanalyzer by hand to learn that the id belongs
+        // to the render thread and that it was sitting in Direct3D — which is the whole finding.
+        var blocker = chain.LastOrDefault(link => link is { EndsChain: true, FromDpc: false });
+        var blockerModules = blocker is null
+            ? []
+            : cpu.ModulesForThread(blocker.ThreadId, take: 4)
+                .Select(module => $"{module.Share:P0} {ModuleGlossary.Annotate(module.Module)}")
+                .ToArray();
+
         return new ThreadWaitSummary(
             candidates.ThreadId,
             selectedWaits
@@ -237,7 +249,8 @@ internal sealed class ThreadWaitAttribution
             userRequestCount,
             candidates.Samples,
             reasons,
-            WalkChain(selectedWaits.FirstOrDefault(), processId => cpu.Name(cpu.ProcessIdForThread(processId))));
+            chain,
+            blockerModules);
     }
 
     /// <summary>
@@ -368,13 +381,18 @@ internal sealed record ThreadWaitChainLink(
 /// The threads behind the longest wait, nearest first. Empty when nothing readied the thread — a timer
 /// expiry — or when the trace could not attribute the wake to anything.
 /// </param>
+/// <param name="BlockerModules">
+/// What the thread at the end of the chain was executing, already formatted as share and module. Empty
+/// when the chain names no such thread.
+/// </param>
 internal sealed record ThreadWaitSummary(
     int ThreadId,
     IReadOnlyList<ThreadWaitInterval> Intervals,
     int UserRequestWaitCount,
     int CpuSampleCount,
     IReadOnlyList<string> Reasons,
-    IReadOnlyList<ThreadWaitChainLink> ReleaseChain)
+    IReadOnlyList<ThreadWaitChainLink> ReleaseChain,
+    IReadOnlyList<string> BlockerModules)
 {
     public int LongWaitCount => Intervals.Count;
     public double MaxWaitMs => Intervals.Select(wait => wait.DurationMs).DefaultIfEmpty().Max();
@@ -419,7 +437,9 @@ internal sealed record ThreadWaitSummary(
             ? " En DPC namnger ingen tråd, så kedjan slutar där."
             : Blocker is null
                 ? " Kedjan kunde inte följas hela vägen."
-                : string.Empty;
+                : BlockerModules.Count > 0
+                    ? $" Tråd {Blocker.ThreadId} körde {string.Join(", ", BlockerModules)}."
+                    : string.Empty;
 
         return $" Kedjan bakom den längsta väntan: tid {ThreadId} → {steps}."
             + " Vem som släppte tråden är härlett ur vilken tråd som låg på samma processor när "

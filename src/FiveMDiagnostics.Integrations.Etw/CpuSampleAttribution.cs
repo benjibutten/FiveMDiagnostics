@@ -403,7 +403,8 @@ internal sealed class CpuSampleAttribution
                 samplesByProcessBucket.GetValueOrDefault(subject.Key),
                 Name(subject.Key),
                 seconds,
-                samplesPerCoreSecond));
+                samplesPerCoreSecond,
+                _firstSample));
     }
 
     /// <summary>
@@ -430,7 +431,8 @@ internal sealed class CpuSampleAttribution
         long[]? subjectByBucket,
         string subjectProcess,
         double seconds,
-        double samplesPerCoreSecond)
+        double samplesPerCoreSecond,
+        DateTime? firstSample)
     {
         var total = videoMemoryByBucket.Sum();
         var overallCores = total / seconds / samplesPerCoreSecond;
@@ -441,7 +443,7 @@ internal sealed class CpuSampleAttribution
         var completeBuckets = (int)Math.Floor(seconds / VideoMemoryBucketSeconds);
         if (completeBuckets < MinimumVideoMemoryBuckets)
         {
-            return new VideoMemoryPressure(overallCores, overallCores, subjectProcess, null, null);
+            return new VideoMemoryPressure(overallCores, overallCores, subjectProcess, null, null, null);
         }
 
         double Cores(long samples) => samples / VideoMemoryBucketSeconds / samplesPerCoreSecond;
@@ -477,7 +479,12 @@ internal sealed class CpuSampleAttribution
             subjectBaseline = Median(subjectPerBucket);
         }
 
-        return new VideoMemoryPressure(baseline, perBucket[peakBucket], subjectProcess, subjectAtPeak, subjectBaseline);
+        // The middle of the busiest bucket, not its edge: the reading it is matched against is sampled
+        // twice a second, and half a bucket either way is the difference between the second the driver
+        // evacuated and the one before it.
+        var peakAt = firstSample?.AddSeconds((peakBucket + 0.5) * VideoMemoryBucketSeconds);
+
+        return new VideoMemoryPressure(baseline, perBucket[peakBucket], subjectProcess, subjectAtPeak, subjectBaseline, peakAt);
     }
 
     private static double Median(double[] values)
@@ -576,12 +583,17 @@ internal sealed record ModuleShare(string Module, double Share, double Cores);
 /// <param name="SubjectProcess">Process the two subject figures describe.</param>
 /// <param name="SubjectCoresAtPeak">What that process held during the busiest video-memory second.</param>
 /// <param name="SubjectBaselineCores">What it held in the median second.</param>
+/// <param name="PeakAt">
+/// Wall clock of the busiest second, so the card's occupancy can be read for that second rather than
+/// for the trace. Null when the trace held too few whole seconds to name one.
+/// </param>
 internal sealed record VideoMemoryPressure(
     double BaselineCores,
     double PeakCores,
     string SubjectProcess,
     double? SubjectCoresAtPeak,
-    double? SubjectBaselineCores)
+    double? SubjectBaselineCores,
+    DateTime? PeakAt)
 {
     /// <summary>
     /// Peak rate at which the driver is unmistakably evacuating the card rather than doing housekeeping.
@@ -618,8 +630,10 @@ internal sealed record VideoMemoryPressure(
     private const double CorroboratingVramPercent = 88;
 
     /// <param name="adapterVramPercent">
-    /// How full the card was, when the session knows. The trace does not contain it, and the conclusion
-    /// depends on it: 0.42 cores at 92% occupancy is eviction, and the same 0.42 cores at 54% is not.
+    /// How full the card was in <see cref="PeakAt"/>'s own second, when the session knows. The trace does
+    /// not contain it, and the conclusion depends on it: 0.42 cores at 92% occupancy is eviction, and the
+    /// same 0.42 cores at 54% is not. It must not be a median over the trace — a thirty-second window
+    /// around a one-second eviction reads several points below the second that matters.
     /// </param>
     public string Describe(double? adapterVramPercent = null)
     {
@@ -637,16 +651,20 @@ internal sealed record VideoMemoryPressure(
         var measurement = $"Videominne: {ModuleGlossary.Annotate("dxgmms2.sys")} höll {PeakCores:F2} kärnor som mest "
             + $"under en sekund, mot {BaselineCores:F2} i spårets lugna sekunder.";
 
+        // "In that second", spelled out. The reader has to be able to tell this figure from the window
+        // median it used to be, because the two disagree on exactly the traces that matter.
+        var second = PeakAt is { } peak ? $" kl. {peak:HH:mm:ss}" : string.Empty;
+
         var meaning = adapterVramPercent switch
         {
             { } percent when percent >= CorroboratingVramPercent =>
-                $" Kortet låg samtidigt på {percent:F0} %, så flyttningen är eviction: drivrutinen "
-                + "gjorde plats genom att skyffla ytor över PCIe.",
+                $" Kortet låg i den sekunden{second} på {percent:F0} %, så flyttningen är eviction: "
+                + "drivrutinen gjorde plats genom att skyffla ytor över PCIe.",
 
             { } percent =>
-                $" Men kortet låg bara på {percent:F0} %, alltså under {CorroboratingVramPercent:F0} % "
-                + "där eviction börjar. Drivrutinen flyttade minne av något annat skäl — en inladdning "
-                + "eller ett lägesbyte — och det här var inte minnestryck.",
+                $" Men kortet låg i den sekunden{second} bara på {percent:F0} %, alltså under "
+                + $"{CorroboratingVramPercent:F0} % där eviction börjar. Drivrutinen flyttade minne av "
+                + "något annat skäl — en inladdning eller ett lägesbyte — och det här var inte minnestryck.",
 
             _ => " Så mycket flyttning brukar betyda att kortet är fullt och att drivrutinen evakuerar "
                 + "ytor över PCIe, men spåret innehåller ingen avläsning av kortets fyllnadsgrad — "

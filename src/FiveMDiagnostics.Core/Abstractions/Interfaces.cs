@@ -101,9 +101,18 @@ public interface IStallAwareDeepCapture
 public interface IVramAwareTraceAnalysis
 {
     /// <summary>
-    /// The card's occupancy in percent around the time of the capture, or null when it is not known.
+    /// The card's occupancy in percent at a given moment, or over the recent window when the moment is
+    /// null. Null when nothing was measured.
     /// </summary>
-    Func<double?>? AdapterVramPercent { get; set; }
+    /// <remarks>
+    /// A function of a moment rather than of nothing, because eviction is a second and a trace is thirty.
+    /// On 9 September the driver held 0.97 cores while the card stood at 92.6%, and the same trace's
+    /// window median was 86% — so the analyser wrote "the card was only at 86%, below the 88% where
+    /// eviction begins, this was not memory pressure" underneath a verdict of GPU VRAM pressure at 95%,
+    /// about the worst frame of the evening. The moment asked about is the busiest second in
+    /// <c>dxgmms2.sys</c>, which is the only second the question is about.
+    /// </remarks>
+    Func<DateTimeOffset?, double?>? AdapterVramPercent { get; set; }
 }
 
 /// <summary>

@@ -72,6 +72,28 @@ public enum RootCauseCategory
     /// </para>
     /// </remarks>
     GpuResidencyStall,
+
+    /// <summary>
+    /// The game's main thread stood still behind its own render thread, with the card calm.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The mechanism that was left once video memory pressure was cut back. Across the traces of 8 and
+    /// 9 September the same chain appears every time: the main thread waits 150–722 ms in
+    /// <c>Wait/UserRequest</c>, the thread that releases it is the game's own render thread, and that
+    /// thread was on the processor for all of it — inside <c>d3d11.dll</c> and the driver's user-mode
+    /// half. In the same seconds <c>dxgmms2.sys</c> holds 0.04–0.07 cores, the card sits well under the
+    /// eviction band, the disk is quiet and nothing outside the process is in the chain.
+    /// </para>
+    /// <para>
+    /// Its own category because the alternatives are both wrong and were both used. 27 of the 37 frames
+    /// over 100 ms on 9 September look like this, and they came out as
+    /// <see cref="ExternalProcessInterference"/> — naming whichever neighbour happened to be busiest,
+    /// on a 465 ms frame whose wait chain never left the game — or as insufficient evidence. Neither
+    /// sends the reader anywhere useful, and the first sends them somewhere actively wrong.
+    /// </para>
+    /// </remarks>
+    InProcessRenderStall,
 }
 
 public enum ArtifactKind

@@ -311,6 +311,65 @@ public sealed class VramBudgetMonitorTests
             AdapterCount: adapterCount);
     }
 
+    /// <summary>
+    /// A drifting game row whose residual holds still is an offset, and the split is made against the
+    /// card.
+    /// </summary>
+    /// <remarks>
+    /// 9 September: the refusal at 22:23 was the evening's last budget line. Five and a half hours, twenty
+    /// reconciliations, and a difference that stayed between 0.94 and 1.30 GB the whole time — which is
+    /// the desktop and the stream stack sitting exactly where nobody touched them.
+    /// </remarks>
+    [Fact]
+    public void ADriftingRowWithASteadyResidualIsAnOffsetRatherThanARefusal()
+    {
+        var monitor = new VramBudgetMonitor();
+
+        // Sixteen minutes at the five second process cadence. The game's row climbs and the card climbs
+        // with it, so what the two leave over never moves.
+        VramBudgetReport? last = null;
+        for (var step = 0; step <= 16 * 12; step++)
+        {
+            var at = Start.AddSeconds(step * 5);
+            var game = 6.30 + (step * 0.0015);
+
+            monitor.Observe(Adapter(at, usedGigabytes: game + 2.05));
+            last = monitor.Observe(Drifting(Sample(at, gameGigabytes: game, obsGigabytes: 1.02))) ?? last;
+        }
+
+        Assert.NotNull(last);
+        Assert.DoesNotContain("kan inte delas upp", last!.Message, StringComparison.Ordinal);
+        Assert.Contains("känd offset", last.Message, StringComparison.Ordinal);
+        Assert.Equal(1.02, last.StreamStackBytes / (double)Gigabyte, 2);
+    }
+
+    /// <summary>
+    /// The fault the refusal exists for is untouched: a row that runs away from the card leaves a
+    /// residual that moves with it, and no split may be built on it.
+    /// </summary>
+    [Fact]
+    public void ARowRunningAwayFromTheCardIsStillRefused()
+    {
+        var monitor = new VramBudgetMonitor();
+
+        VramBudgetReport? last = null;
+        for (var step = 0; step <= 16 * 12; step++)
+        {
+            var at = Start.AddSeconds(step * 5);
+
+            // 4.3 GB to 8.2 GB while the card moves a tenth: the evening this check was written for.
+            monitor.Observe(Adapter(at, usedGigabytes: 8.40 + (step * 0.0005)));
+            last = monitor.Observe(Drifting(Sample(at, gameGigabytes: 4.30 + (step * 0.02), obsGigabytes: 1.02))) ?? last;
+        }
+
+        Assert.NotNull(last);
+        Assert.Contains("kan inte delas upp", last!.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>The same sample, with the game's row marked as drifting by the accounting monitor.</summary>
+    private static GpuProcessMemorySample Drifting(GpuProcessMemorySample sample) =>
+        sample with { DriftingProcessIds = [18704] };
+
     private static GpuProcessMemorySample Sample(DateTimeOffset timestamp, double gameGigabytes, double obsGigabytes)
     {
         var processes = new List<GpuProcessMemoryUsage>();
