@@ -148,4 +148,23 @@ public static class Strings
     public static string LiveVramPanelEmpty => ResourceManager.GetString("LiveVramPanelEmpty", Culture) ?? "No process table yet. It appears once a session is running.";
     public static string SessionAlertsHeader => ResourceManager.GetString("SessionAlertsHeader", Culture) ?? "Needs attention";
     public static string LiveVramOwnersUnavailable => ResourceManager.GetString("LiveVramOwnersUnavailable", Culture) ?? "not measured";
+    public static string UpdateTitle => ResourceManager.GetString("UpdateTitle", Culture) ?? "FiveM Diagnostics update";
+    public static string UpdateOnlyInReleaseBuilds => ResourceManager.GetString("UpdateOnlyInReleaseBuilds", Culture) ?? "Updates can only be checked for in released builds.";
+    public static string UpdateUpToDate => ResourceManager.GetString("UpdateUpToDate", Culture) ?? "You already have the latest version.";
+    public static string UpdateAvailableFormat => ResourceManager.GetString("UpdateAvailableFormat", Culture) ?? "FiveM Diagnostics {0} is available. You have {1}.\n\nDownload and install it now? The app closes and restarts automatically, and a running session is stopped.\n\nWindows may ask for approval, or show a SmartScreen warning for a newly published or unsigned build.";
+    public static string UpdateCheckFailedFormat => ResourceManager.GetString("UpdateCheckFailedFormat", Culture) ?? "Could not check for or prepare the update.\n\n{0}";
+    public static string UpdateInstallFailedFormat => ResourceManager.GetString("UpdateInstallFailedFormat", Culture) ?? "The update could not be completed, so the installed version was kept.\n\n{0}";
+    public static string UpdateRollbackFormat => ResourceManager.GetString("UpdateRollbackFormat", Culture) ?? "The update failed, and {0} file(s) could not be put back:\n\n{1}\n\nThe installation may now be a mix of two versions, so FiveM Diagnostics was left closed rather than started again.\n\nYour previous files were kept here:\n  {2}\n\nCopy them back over\n  {3}\nor download the latest release from https://github.com/benjibutten/FiveMDiagnostics/releases and extract it there.";
+    public static string UpdateRollbackMoreFilesFormat => ResourceManager.GetString("UpdateRollbackMoreFilesFormat", Culture) ?? "…and {0} more";
+    public static string UpdateStatusPreparing => ResourceManager.GetString("UpdateStatusPreparing", Culture) ?? "Preparing the update…";
+    public static string UpdateStatusDownloading => ResourceManager.GetString("UpdateStatusDownloading", Culture) ?? "Downloading the update…";
+    public static string UpdateStatusVerifying => ResourceManager.GetString("UpdateStatusVerifying", Culture) ?? "Verifying the download…";
+    public static string UpdateStatusPreparingInstall => ResourceManager.GetString("UpdateStatusPreparingInstall", Culture) ?? "Preparing the installation…";
+    public static string UpdateStatusWaitingForApproval => ResourceManager.GetString("UpdateStatusWaitingForApproval", Culture) ?? "Waiting for approval from Windows…";
+    public static string UpdateStatusStartingInstall => ResourceManager.GetString("UpdateStatusStartingInstall", Culture) ?? "Starting the installation…";
+    public static string UpdateStatusWaitingForExit => ResourceManager.GetString("UpdateStatusWaitingForExit", Culture) ?? "Waiting for FiveM Diagnostics to close…";
+    public static string UpdateStatusUnpacking => ResourceManager.GetString("UpdateStatusUnpacking", Culture) ?? "Unpacking the update…";
+    public static string UpdateStatusInstalling => ResourceManager.GetString("UpdateStatusInstalling", Culture) ?? "Installing the update…";
+    public static string UpdateStatusRestarting => ResourceManager.GetString("UpdateStatusRestarting", Culture) ?? "Starting FiveM Diagnostics again…";
+    public static string TrayCheckForUpdates => ResourceManager.GetString("TrayCheckForUpdates", Culture) ?? "Check for updates…";
 }

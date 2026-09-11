@@ -6,6 +6,7 @@ namespace FiveMDiagnostics.App.Wpf;
 
 using FiveMDiagnostics.App.Wpf.Properties;
 using FiveMDiagnostics.App.Wpf.Services;
+using FiveMDiagnostics.App.Wpf.Updates;
 
 public partial class MainWindow : Window
 {
@@ -30,6 +31,7 @@ public partial class MainWindow : Window
         _trayIconService.MarkStutterRequested += (_, _) => ExecuteTrayCommand(_viewModel.MarkStutterCommand, Strings.TrayMarkStutterMessage);
         _trayIconService.MarkSevereRequested += (_, _) => ExecuteTrayCommand(_viewModel.MarkSevereStutterCommand, Strings.TrayMarkSevereMessage);
         _trayIconService.ExportLatestRequested += (_, _) => ExecuteTrayCommand(_viewModel.ExportSelectedIncidentCommand, Strings.TrayExportStartingMessage);
+        _trayIconService.CheckForUpdatesRequested += async (_, _) => await UpdateCoordinator.CheckAsync(this, manual: true);
         _trayIconService.ExitRequested += (_, _) => ExitApplication();
 
         _viewModel.StartSessionCommand.CanExecuteChanged += OnCommandAvailabilityChanged;
@@ -112,6 +114,13 @@ public partial class MainWindow : Window
         _allowClose = true;
         Close();
     }
+
+    /// <summary>
+    /// Closes for real rather than hiding to the tray. The updater is already waiting
+    /// for this process to exit before it can replace a single file, and a window that
+    /// only hid itself would leave it waiting forever.
+    /// </summary>
+    public void ExitForUpdate() => ExitApplication();
 
     private void OnCommandAvailabilityChanged(object? sender, EventArgs e)
     {

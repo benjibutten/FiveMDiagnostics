@@ -169,4 +169,42 @@
   <data name="LiveVramUntrustedNote" xml:space="preserve"><value>double counted — excluded from reports</value></data>
   <data name="LiveVramPanelEmpty" xml:space="preserve"><value>No process table yet. It appears once the session has found the FiveM/GTA process — VRAM is only measured while the game is running.</value></data>
   <data name="SessionAlertsHeader" xml:space="preserve"><value>Needs attention</value></data>
+  <data name="UpdateTitle" xml:space="preserve"><value>FiveM Diagnostics update</value></data>
+  <data name="UpdateOnlyInReleaseBuilds" xml:space="preserve"><value>Updates can only be checked for in released builds.</value></data>
+  <data name="UpdateUpToDate" xml:space="preserve"><value>You already have the latest version.</value></data>
+  <data name="UpdateAvailableFormat" xml:space="preserve"><value>FiveM Diagnostics {0} is available. You have {1}.
+
+Download and install it now? The app closes and restarts automatically, and a running session is stopped.
+
+Windows may ask for approval, or show a SmartScreen warning for a newly published or unsigned build.</value></data>
+  <data name="UpdateCheckFailedFormat" xml:space="preserve"><value>Could not check for or prepare the update.
+
+{0}</value></data>
+  <data name="UpdateInstallFailedFormat" xml:space="preserve"><value>The update could not be completed, so the installed version was kept.
+
+{0}</value></data>
+  <data name="UpdateRollbackFormat" xml:space="preserve"><value>The update failed, and {0} file(s) could not be put back:
+
+{1}
+
+The installation may now be a mix of two versions, so FiveM Diagnostics was left closed rather than started again.
+
+Your previous files were kept here:
+  {2}
+
+Copy them back over
+  {3}
+or download the latest release from https://github.com/benjibutten/FiveMDiagnostics/releases and extract it there.</value></data>
+  <data name="UpdateRollbackMoreFilesFormat" xml:space="preserve"><value>…and {0} more</value></data>
+  <data name="UpdateStatusPreparing" xml:space="preserve"><value>Preparing the update…</value></data>
+  <data name="UpdateStatusDownloading" xml:space="preserve"><value>Downloading the update…</value></data>
+  <data name="UpdateStatusVerifying" xml:space="preserve"><value>Verifying the download…</value></data>
+  <data name="UpdateStatusPreparingInstall" xml:space="preserve"><value>Preparing the installation…</value></data>
+  <data name="UpdateStatusWaitingForApproval" xml:space="preserve"><value>Waiting for approval from Windows…</value></data>
+  <data name="UpdateStatusStartingInstall" xml:space="preserve"><value>Starting the installation…</value></data>
+  <data name="UpdateStatusWaitingForExit" xml:space="preserve"><value>Waiting for FiveM Diagnostics to close…</value></data>
+  <data name="UpdateStatusUnpacking" xml:space="preserve"><value>Unpacking the update…</value></data>
+  <data name="UpdateStatusInstalling" xml:space="preserve"><value>Installing the update…</value></data>
+  <data name="UpdateStatusRestarting" xml:space="preserve"><value>Starting FiveM Diagnostics again…</value></data>
+  <data name="TrayCheckForUpdates" xml:space="preserve"><value>Check for updates…</value></data>
 </root>

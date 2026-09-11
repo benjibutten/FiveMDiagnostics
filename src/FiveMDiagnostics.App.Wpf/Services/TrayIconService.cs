@@ -16,6 +16,7 @@ public sealed class TrayIconService : IDisposable
     private readonly Forms.ToolStripMenuItem _markStutterMenuItem;
     private readonly Forms.ToolStripMenuItem _markSevereMenuItem;
     private readonly Forms.ToolStripMenuItem _exportLatestMenuItem;
+    private readonly Forms.ToolStripMenuItem _checkForUpdatesMenuItem;
     private readonly Forms.ToolStripMenuItem _exitMenuItem;
 
     public TrayIconService()
@@ -27,6 +28,7 @@ public sealed class TrayIconService : IDisposable
         _markStutterMenuItem = CreateMenuItem(Strings.MarkStutter, (_, _) => MarkStutterRequested?.Invoke(this, EventArgs.Empty));
         _markSevereMenuItem = CreateMenuItem(Strings.MarkSevere, (_, _) => MarkSevereRequested?.Invoke(this, EventArgs.Empty));
         _exportLatestMenuItem = CreateMenuItem(Strings.ExportLatest, (_, _) => ExportLatestRequested?.Invoke(this, EventArgs.Empty));
+        _checkForUpdatesMenuItem = CreateMenuItem(Strings.TrayCheckForUpdates, (_, _) => CheckForUpdatesRequested?.Invoke(this, EventArgs.Empty));
         _exitMenuItem = CreateMenuItem(Strings.TrayExit, (_, _) => ExitRequested?.Invoke(this, EventArgs.Empty));
 
         _menu.Items.AddRange(
@@ -39,6 +41,7 @@ public sealed class TrayIconService : IDisposable
             _markSevereMenuItem,
             _exportLatestMenuItem,
             new Forms.ToolStripSeparator(),
+            _checkForUpdatesMenuItem,
             _exitMenuItem,
         ]);
 
@@ -66,6 +69,8 @@ public sealed class TrayIconService : IDisposable
     public event EventHandler? MarkSevereRequested;
 
     public event EventHandler? ExportLatestRequested;
+
+    public event EventHandler? CheckForUpdatesRequested;
 
     public event EventHandler? ExitRequested;
 

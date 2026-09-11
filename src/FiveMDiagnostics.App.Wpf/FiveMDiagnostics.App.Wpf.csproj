@@ -6,7 +6,20 @@
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
     <ApplicationIcon>AppIcon.ico</ApplicationIcon>
+    <!-- The released asset has always been FiveMDiagnostics.exe, and the updater matches
+         the archive against the name of the running executable. -->
+    <AssemblyName>FiveMDiagnostics</AssemblyName>
+    <!-- A build made here carries the -local marker, which is how the updater tells a
+         working copy of the source tree from something it may overwrite. -->
+    <Version Condition="'$(Version)' == ''">1.0.0-local</Version>
+    <AssemblyVersion Condition="'$(AssemblyVersion)' == ''">1.0.0.0</AssemblyVersion>
+    <FileVersion Condition="'$(FileVersion)' == ''">1.0.0.0</FileVersion>
+    <InformationalVersion Condition="'$(InformationalVersion)' == ''">1.0.0-local</InformationalVersion>
   </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="FiveMDiagnostics.Tests" />
+  </ItemGroup>
 
   <ItemGroup>
     <Resource Include="AppIcon.ico" />

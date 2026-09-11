@@ -1,6 +1,7 @@
 ﻿using System.Globalization;
 using FiveMDiagnostics.Analysis;
 using FiveMDiagnostics.App.Wpf.Properties;
+using FiveMDiagnostics.App.Wpf.Updates;
 using FiveMDiagnostics.Collectors;
 using FiveMDiagnostics.Core;
 using FiveMDiagnostics.Export;
@@ -20,11 +21,32 @@ public partial class App : System.Windows.Application
 	{
 		base.OnStartup(e);
 
-		_singleInstanceManager = new SingleInstanceManager();
-
 		var settingsStore = new SettingsStore();
 		var settings = await settingsStore.LoadAsync().ConfigureAwait(true);
 		ApplyCulture(settings.Language);
+
+		// Both update modes run in a copy of the exe in a temp folder, and both must
+		// return before the single-instance mutex below is touched: the app they are
+		// waiting for still owns it.
+		if (UpdateInstaller.IsCleanupMode(e.Args))
+		{
+			await UpdateInstaller.RunCleanupAsync(e.Args).ConfigureAwait(true);
+			Shutdown();
+			return;
+		}
+
+		if (UpdateInstaller.IsUpdateMode(e.Args))
+		{
+			await UpdateInstaller.RunAsync(e.Args).ConfigureAwait(true);
+			Shutdown();
+			return;
+		}
+
+		// Set when this process is the freshly installed build: the updater's temp
+		// folder is still on disk and nothing else will remove it.
+		UpdateInstaller.ScheduleCleanup(e.Args);
+
+		_singleInstanceManager = new SingleInstanceManager();
 
 		if (!_singleInstanceManager.IsPrimaryInstance)
 		{
@@ -81,6 +103,10 @@ public partial class App : System.Windows.Application
 		});
 		_singleInstanceManager.StartListening();
 		mainWindow.Show();
+
+		// Silent unless there is something to install, and at most one request per
+		// 12 hours no matter how often the app is started.
+		await UpdateCoordinator.CheckAsync(mainWindow, manual: false).ConfigureAwait(true);
 	}
 
 	protected override void OnExit(System.Windows.ExitEventArgs e)

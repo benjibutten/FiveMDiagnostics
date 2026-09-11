@@ -43,7 +43,7 @@ jobs:
           $tagName = "v$version"
           $assemblyVersion = "1.0.${{ github.run_number }}.0"
           $releaseName = "FiveMDiagnostics $version"
-          $assetName = "FiveMDiagnostics.exe"
+          $assetName = "FiveMDiagnostics-$version-win-x64.zip"
 
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag_name=$tagName" >> $env:GITHUB_OUTPUT
@@ -82,21 +82,12 @@ jobs:
             -p:InformationalVersion="${{ steps.meta.outputs.version }}+${{ github.sha }}" `
             -o $publishDir
 
-          $publishedExeName = "$(Split-Path $env:PROJECT_PATH -LeafBase).exe"
-          $publishedExePath = Join-Path $publishDir $publishedExeName
-          $releaseExePath = Join-Path $publishDir "${{ steps.meta.outputs.asset_name }}"
-
-          if (!(Test-Path $publishedExePath))
+          # The updater matches the archive against the name of the running executable,
+          # so a release that does not carry FiveMDiagnostics.exe cannot be installed.
+          if (!(Test-Path (Join-Path $publishDir "FiveMDiagnostics.exe")))
           {
-            throw "Expected published executable not found at $publishedExePath"
+            throw "Expected published executable not found in $publishDir"
           }
-
-          if (Test-Path $releaseExePath)
-          {
-            Remove-Item $releaseExePath -Force
-          }
-
-          Move-Item $publishedExePath $releaseExePath
 
       - name: Code sign executable (optional)
         if: ${{ env.WINDOWS_CODESIGN_CERT_PFX_BASE64 != '' && env.WINDOWS_CODESIGN_CERT_PASSWORD != '' }}
@@ -105,7 +96,7 @@ jobs:
           $certPath = Join-Path $env:RUNNER_TEMP "fivemdiagnostics-codesign.pfx"
           [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_CERT_PFX_BASE64))
 
-          $exePath = Join-Path $PWD "artifacts/publish/$env:RUNTIME_ID/${{ steps.meta.outputs.asset_name }}"
+          $exePath = Join-Path $PWD "artifacts/publish/$env:RUNTIME_ID/FiveMDiagnostics.exe"
           signtool sign `
             /fd SHA256 `
             /f $certPath `
@@ -114,11 +105,33 @@ jobs:
             /td SHA256 `
             $exePath
 
+      - name: Create release zip
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zipPath = Join-Path $PWD "artifacts/${{ steps.meta.outputs.asset_name }}"
+
+          if (Test-Path $zipPath)
+          {
+            Remove-Item $zipPath -Force
+          }
+
+          Compress-Archive -Path "artifacts/publish/$env:RUNTIME_ID/*" -DestinationPath $zipPath
+
+          # The in-app updater downloads this file alongside the zip and refuses to
+          # install an archive whose hash does not match it.
+          $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  ${{ steps.meta.outputs.asset_name }}" | Set-Content -Path "$zipPath.sha256" -NoNewline
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: fivemdiagnostics-${{ steps.meta.outputs.version }}-win-x64
-          path: artifacts/publish/${{ env.RUNTIME_ID }}/${{ steps.meta.outputs.asset_name }}
+          path: |
+            artifacts/${{ steps.meta.outputs.asset_name }}
+            artifacts/${{ steps.meta.outputs.asset_name }}.sha256
 
       - name: Write release notes
         shell: pwsh
@@ -130,8 +143,14 @@ jobs:
           Build: ${{ steps.meta.outputs.version }}
           Commit: ${{ github.sha }}
           Runtime: ${{ env.RUNTIME_ID }}
+          SHA-256: ${{ steps.package.outputs.sha256 }}
 
-          Download FiveMDiagnostics.exe from the release assets and run it directly.
+          Download the asset below, extract it, and run FiveMDiagnostics.exe. Keep the
+          same install path across updates: the app updates itself in place from there.
+
+          Windows Defender SmartScreen may warn about a newly published or unsigned build.
+          Verify that the archive came from this GitHub release and compare its SHA-256
+          hash with the attached .sha256 file before choosing More info > Run anyway.
           "@ | Set-Content -Path artifacts/release-notes.md
 
       - name: Create GitHub release
@@ -141,7 +160,7 @@ jobs:
           commit: ${{ github.sha }}
           name: ${{ steps.meta.outputs.release_name }}
           bodyFile: artifacts/release-notes.md
-          artifacts: artifacts/publish/${{ env.RUNTIME_ID }}/${{ steps.meta.outputs.asset_name }}
+          artifacts: artifacts/${{ steps.meta.outputs.asset_name }},artifacts/${{ steps.meta.outputs.asset_name }}.sha256
           allowUpdates: true
           artifactErrorsFailBuild: true
           replacesArtifacts: true

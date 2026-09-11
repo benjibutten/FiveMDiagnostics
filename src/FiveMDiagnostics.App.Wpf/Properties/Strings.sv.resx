@@ -169,4 +169,42 @@
   <data name="LiveVramUntrustedNote" xml:space="preserve"><value>dubbelräknar — utesluten ur rapporter</value></data>
   <data name="LiveVramPanelEmpty" xml:space="preserve"><value>Ingen processtabell ännu. Den dyker upp när sessionen hittat FiveM/GTA-processen — VRAM mäts bara medan spelet kör.</value></data>
   <data name="SessionAlertsHeader" xml:space="preserve"><value>Behöver åtgärdas</value></data>
+  <data name="UpdateTitle" xml:space="preserve"><value>Uppdatering av FiveM Diagnostics</value></data>
+  <data name="UpdateOnlyInReleaseBuilds" xml:space="preserve"><value>Uppdateringar kan bara sökas i publicerade byggen.</value></data>
+  <data name="UpdateUpToDate" xml:space="preserve"><value>Du har redan den senaste versionen.</value></data>
+  <data name="UpdateAvailableFormat" xml:space="preserve"><value>FiveM Diagnostics {0} finns att hämta. Du har {1}.
+
+Vill du hämta och installera den nu? Appen stängs och startas om automatiskt, och en pågående session avbryts.
+
+Windows kan fråga om godkännande, eller visa en SmartScreen-varning för ett nyss publicerat eller osignerat bygge.</value></data>
+  <data name="UpdateCheckFailedFormat" xml:space="preserve"><value>Kunde inte söka efter eller förbereda uppdateringen.
+
+{0}</value></data>
+  <data name="UpdateInstallFailedFormat" xml:space="preserve"><value>Uppdateringen kunde inte slutföras, så den installerade versionen behölls.
+
+{0}</value></data>
+  <data name="UpdateRollbackFormat" xml:space="preserve"><value>Uppdateringen misslyckades, och {0} fil(er) kunde inte återställas:
+
+{1}
+
+Installationen kan nu vara en blandning av två versioner, så FiveM Diagnostics lämnades stängd i stället för att startas om.
+
+Dina tidigare filer ligger kvar här:
+  {2}
+
+Kopiera tillbaka dem över
+  {3}
+eller hämta senaste utgåvan från https://github.com/benjibutten/FiveMDiagnostics/releases och packa upp den där.</value></data>
+  <data name="UpdateRollbackMoreFilesFormat" xml:space="preserve"><value>…och {0} till</value></data>
+  <data name="UpdateStatusPreparing" xml:space="preserve"><value>Förbereder uppdateringen…</value></data>
+  <data name="UpdateStatusDownloading" xml:space="preserve"><value>Hämtar uppdateringen…</value></data>
+  <data name="UpdateStatusVerifying" xml:space="preserve"><value>Kontrollerar hämtningen…</value></data>
+  <data name="UpdateStatusPreparingInstall" xml:space="preserve"><value>Förbereder installationen…</value></data>
+  <data name="UpdateStatusWaitingForApproval" xml:space="preserve"><value>Väntar på godkännande från Windows…</value></data>
+  <data name="UpdateStatusStartingInstall" xml:space="preserve"><value>Startar installationen…</value></data>
+  <data name="UpdateStatusWaitingForExit" xml:space="preserve"><value>Väntar på att FiveM Diagnostics ska stängas…</value></data>
+  <data name="UpdateStatusUnpacking" xml:space="preserve"><value>Packar upp uppdateringen…</value></data>
+  <data name="UpdateStatusInstalling" xml:space="preserve"><value>Installerar uppdateringen…</value></data>
+  <data name="UpdateStatusRestarting" xml:space="preserve"><value>Startar FiveM Diagnostics igen…</value></data>
+  <data name="TrayCheckForUpdates" xml:space="preserve"><value>Sök efter uppdateringar…</value></data>
 </root>
