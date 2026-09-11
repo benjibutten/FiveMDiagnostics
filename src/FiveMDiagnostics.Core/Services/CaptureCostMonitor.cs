@@ -52,12 +52,14 @@ public sealed class CaptureCostMonitor
     private readonly object _sync = new();
 
     private readonly List<DateTimeOffset> _captures = [];
+    private readonly List<DateTimeOffset> _gameStarts = [];
     private readonly List<(DateTimeOffset At, double FrameTimeMs)> _warmup = new(CadenceWarmupFrames);
     private readonly double _refreshIntervalMs;
 
     private double _hitchThresholdMs;
     private int _hitches;
     private int _hitchesNearCapture;
+    private int _hitchesWhileLoading;
     private DateTimeOffset? _firstFrameAt;
     private DateTimeOffset? _lastFrameAt;
 
@@ -76,6 +78,31 @@ public sealed class CaptureCostMonitor
         lock (_sync)
         {
             _captures.Add(at);
+        }
+    }
+
+    /// <summary>
+    /// Notes that the game started, so the minutes it spends loading are left out of the comparison.
+    /// </summary>
+    /// <remarks>
+    /// Loading hitches at several times the rate of play and has nothing to do with what a capture costs.
+    /// On 10 September the game crashed and relaunched mid-session, two of the evening's four captures
+    /// were taken in the minutes around the relaunch, and the line reported "75/h there against 39/h in
+    /// the rest of the session" — an overstatement of the instrument's cost built almost entirely out of
+    /// a reload. The same <see cref="VramPressureBandMonitor.LoadingWindow"/> is used, so the two
+    /// summaries of one session agree on which minutes were loading.
+    /// </remarks>
+    public void NoteGameStart(DateTimeOffset at)
+    {
+        lock (_sync)
+        {
+            // A resolver that re-reports the same start within the minute must not stack two windows.
+            if (_gameStarts.Count > 0 && (at - _gameStarts[^1]).Duration() < TimeSpan.FromMinutes(1))
+            {
+                return;
+            }
+
+            _gameStarts.Add(at);
         }
     }
 
@@ -122,11 +149,21 @@ public sealed class CaptureCostMonitor
                 return null;
             }
 
-            var sessionHours = (last - first).TotalHours;
-            var nearHours = _captures.Count * Window.TotalHours;
-            if (sessionHours <= nearHours)
+            // Every span is intersected with the measured window and merged, so two captures a
+            // half-minute apart are not charged two full minutes and a capture taken during a reload is
+            // not charged at all — its frames were not counted either.
+            var loading = Merge(_gameStarts.Select(start => (start, start + VramPressureBandMonitor.LoadingWindow)), first, last);
+            var captureWindows = Merge(_captures.Select(capture => (capture, capture + Window)), first, last);
+
+            var loadingHours = loading.Sum(span => (span.To - span.From).TotalHours);
+            var nearHours = captureWindows.Sum(span => (span.To - span.From).TotalHours)
+                - Overlap(captureWindows, loading).TotalHours;
+            var elsewhereHours = (last - first).TotalHours - loadingHours - nearHours;
+
+            if (nearHours <= 0 || elsewhereHours <= 0)
             {
-                // Every frame is inside a capture window, so there is nothing to compare it against.
+                // Either no capture landed outside a reload, or everything left is inside one of their
+                // windows; there is nothing to compare against in both cases.
                 return null;
             }
 
@@ -135,10 +172,78 @@ public sealed class CaptureCostMonitor
                 _hitches,
                 _hitchesNearCapture,
                 _hitchesNearCapture / nearHours,
-                (_hitches - _hitchesNearCapture) / (sessionHours - nearHours),
-                _hitchThresholdMs);
+                (_hitches - _hitchesNearCapture) / elsewhereHours,
+                _hitchThresholdMs,
+                _hitchesWhileLoading,
+                TimeSpan.FromHours(loadingHours));
         }
     }
+
+    /// <summary>Whether a frame fell inside the loading window after a game start. Called under the lock.</summary>
+    private bool IsLoading(DateTimeOffset at)
+    {
+        foreach (var start in _gameStarts)
+        {
+            if (at >= start && at - start < VramPressureBandMonitor.LoadingWindow)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>The spans clipped to the measured window and merged where they overlap.</summary>
+    private static List<(DateTimeOffset From, DateTimeOffset To)> Merge(
+        IEnumerable<(DateTimeOffset From, DateTimeOffset To)> spans,
+        DateTimeOffset first,
+        DateTimeOffset last)
+    {
+        var merged = new List<(DateTimeOffset From, DateTimeOffset To)>();
+
+        foreach (var (from, to) in spans
+            .Select(span => (From: Max(span.From, first), To: Min(span.To, last)))
+            .Where(span => span.To > span.From)
+            .OrderBy(span => span.From))
+        {
+            if (merged.Count > 0 && from <= merged[^1].To)
+            {
+                merged[^1] = (merged[^1].From, Max(merged[^1].To, to));
+                continue;
+            }
+
+            merged.Add((from, to));
+        }
+
+        return merged;
+    }
+
+    /// <summary>How much of two merged span lists falls in both.</summary>
+    private static TimeSpan Overlap(
+        List<(DateTimeOffset From, DateTimeOffset To)> left,
+        List<(DateTimeOffset From, DateTimeOffset To)> right)
+    {
+        var total = TimeSpan.Zero;
+
+        foreach (var a in left)
+        {
+            foreach (var b in right)
+            {
+                var from = Max(a.From, b.From);
+                var to = Min(a.To, b.To);
+                if (to > from)
+                {
+                    total += to - from;
+                }
+            }
+        }
+
+        return total;
+    }
+
+    private static DateTimeOffset Max(DateTimeOffset a, DateTimeOffset b) => a > b ? a : b;
+
+    private static DateTimeOffset Min(DateTimeOffset a, DateTimeOffset b) => a < b ? a : b;
 
     /// <summary>
     /// Fixes what counts as a hitch at twice the interval the session is actually running at, never
@@ -179,6 +284,14 @@ public sealed class CaptureCostMonitor
             return;
         }
 
+        // Loading is its own regime and belongs in neither side of the comparison. Counted separately
+        // rather than dropped, so the line can say how much of the evening it set aside.
+        if (IsLoading(at))
+        {
+            _hitchesWhileLoading++;
+            return;
+        }
+
         _hitches++;
 
         // Linear over the session's captures, which is single digits by design, and reached only by a
@@ -196,13 +309,17 @@ public sealed class CaptureCostMonitor
 }
 
 /// <summary>What the session's own captures coincided with.</summary>
+/// <param name="HitchesWhileLoading">Hitches set aside because the game was still loading.</param>
+/// <param name="LoadingTime">How much of the measured window those minutes came to.</param>
 public sealed record CaptureCostReport(
     int CaptureCount,
     int Hitches,
     int HitchesNearCapture,
     double NearCaptureHitchesPerHour,
     double ElsewhereHitchesPerHour,
-    double HitchThresholdMs)
+    double HitchThresholdMs,
+    int HitchesWhileLoading = 0,
+    TimeSpan LoadingTime = default)
 {
     /// <summary>
     /// Captures beyond which an evening is paying for traces the review will not open.
@@ -239,11 +356,19 @@ public sealed record CaptureCostReport(
                     + "tas i följd."
                 : string.Empty;
 
+            // Loading is excluded from both sides, and said so. Without the sentence the counts do not
+            // add up against the session's other lines, and a reader checking them assumes a bug.
+            var loading = HitchesWhileLoading > 0
+                ? $" {HitchesWhileLoading} hitches i {LoadingTime.TotalMinutes:F0} minuters inladdning är "
+                    + "borträknade ur båda sidorna — en omstartad spelprocess hackar av egna skäl, och "
+                    + "en capture som tas i de minuterna får inte betala för det."
+                : string.Empty;
+
             return $"Deep captures: {CaptureCount} st. Av sessionens {Hitches} hitches ≥{HitchThresholdMs:F0} ms inträffade "
                 + $"{HitchesNearCapture} inom en minut efter att en capture skrivits till disk — "
                 + $"{NearCaptureHitchesPerHour:F0}/h där, mot {ElsewhereHitchesPerHour:F0}/h i resten av sessionen. "
                 + "Delvis är det efterdyningar av hitchen som utlöste capturen, delvis kostnaden för att skriva "
-                + $"~900 MB medan spelet kör. Räkna med det innan två kvällar med olika antal captures jämförs.{advice}";
+                + $"~900 MB medan spelet kör. Räkna med det innan två kvällar med olika antal captures jämförs.{loading}{advice}";
         }
     }
 }

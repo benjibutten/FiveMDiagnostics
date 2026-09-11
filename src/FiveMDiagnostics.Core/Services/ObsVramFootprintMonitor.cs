@@ -236,12 +236,26 @@ public sealed record ObsVramFootprintReport(
                 ? $" Streamstacken höll alltså ungefär {TotalMegabytesFreed:F0} MB av kortet."
                 : $" Det steget är ungefär {TotalMegabytesFreed:F0} MB av kortet.";
 
+            // Which half is missing, and why. On 10 September only the stream was stopped — OBS itself
+            // kept running — and the line stated the encoder's 235 MB and stopped. Read cold a fortnight
+            // later that is indistinguishable from a measurement that failed, when in fact it is a
+            // measurement that was only given half its evidence.
+            var missing = (Encoder, RestOfStack) switch
+            {
+                (not null, null) => " OBS-processen avslutades aldrig under sessionen, så resten av "
+                    + "stacken — kanvas, game capture och webbkällor — är omätt i kväll. Den delen "
+                    + "kräver att processen stängs medan mätningen fortfarande rullar.",
+                (null, not null) => " Strömmen stoppades aldrig separat, så encoderns egen andel är omätt "
+                    + "i kväll; siffran ovan är hela stacken i ett steg.",
+                _ => string.Empty,
+            };
+
             var caveat = TailIsUsable
                 ? string.Empty
                 : $" Perioden efter är {TailWithoutObs.TotalMinutes:F0} minuter, vilket är för kort för att "
                     + "jämföra frametider över — VRAM-stegen är sekundupplösta och står ändå.";
 
-            return $"OBS-avstängningen mätt: {string.Join("; ", steps)}.{total}{caveat} "
+            return $"OBS-avstängningen mätt: {string.Join("; ", steps)}.{total}{missing}{caveat} "
                 + "Stegen är lästa sekunderna runt varje övergång, inte som medianer över perioderna: spelet "
                 + "fyller på i det lediga inom en halvminut.";
         }

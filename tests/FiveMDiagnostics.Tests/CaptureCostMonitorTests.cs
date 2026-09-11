@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Tests;
+﻿namespace FiveMDiagnostics.Tests;
 
 using FiveMDiagnostics.Core;
 
@@ -154,6 +154,91 @@ public sealed class CaptureCostMonitorTests
         }
 
         Assert.Null(monitor.Summary());
+    }
+
+
+    /// <summary>
+    /// The evening of 10 September, where the game crashed and relaunched mid-session and two of the
+    /// four captures were taken in the minutes around the reload.
+    /// </summary>
+    /// <remarks>
+    /// The line reported 75 hitches an hour near a capture against 39 in the rest of the session — an
+    /// overstatement of what the instrument costs, built almost entirely out of a game loading. Loading
+    /// hitches for reasons of its own and belongs in neither side of the comparison.
+    /// </remarks>
+    [Fact]
+    public void HitchesWhileTheGameIsLoadingCountAgainstNeitherSide()
+    {
+        var withLoadingKnown = Evening(noteGameStart: true);
+        var asItWasReported = Evening(noteGameStart: false);
+
+        Assert.NotNull(withLoadingKnown);
+        Assert.NotNull(asItWasReported);
+
+        // The reload's hitches are set aside, and the line says so rather than dropping them silently.
+        Assert.Equal(240, withLoadingKnown.HitchesWhileLoading);
+        Assert.Equal(40, withLoadingKnown.LoadingTime.TotalMinutes, 0);
+        Assert.Contains("borträknade ur båda sidorna", withLoadingKnown.Message, StringComparison.Ordinal);
+
+        // Both sides were carrying the reload before. The capture taken two minutes into it was charged
+        // for the loading hitches around it, and the rest of the session's rate was raised by the other
+        // thirty-eight minutes of them — which is how an evening reports a hitch rate no part of it had.
+        Assert.True(
+            asItWasReported.HitchesNearCapture > withLoadingKnown.HitchesNearCapture,
+            "the capture taken during the reload should no longer be charged for it");
+
+        // Both hours of play held sixty hitches an hour; the reload held three hundred and sixty. The
+        // old reading reported a session rate no part of the evening ever had.
+        Assert.InRange(withLoadingKnown.ElsewhereHitchesPerHour, 50, 70);
+        Assert.True(
+            asItWasReported.ElsewhereHitchesPerHour > 120,
+            $"the reload inflated the session rate to {asItWasReported.ElsewhereHitchesPerHour:F0}/h "
+            + $"against {withLoadingKnown.ElsewhereHitchesPerHour:F0}/h once it is set aside");
+    }
+
+    /// <summary>
+    /// An hour of play, a forty-minute reload with a capture two minutes into it, and an hour of play
+    /// with a capture in the middle.
+    /// </summary>
+    private static CaptureCostReport? Evening(bool noteGameStart)
+    {
+        var monitor = new CaptureCostMonitor(60);
+
+        if (noteGameStart)
+        {
+            monitor.NoteGameStart(Start.AddMinutes(60));
+        }
+
+        monitor.RecordCaptureWritten(Start.AddMinutes(62));
+        monitor.RecordCaptureWritten(Start.AddMinutes(130));
+
+        Play(monitor, fromMinute: 0, minutes: 60, hitchesPerMinute: 1);
+        Play(monitor, fromMinute: 60, minutes: 40, hitchesPerMinute: 6);
+        Play(monitor, fromMinute: 100, minutes: 60, hitchesPerMinute: 1);
+
+        return monitor.Summary();
+    }
+
+
+    /// <summary>Frames at the cadence the session actually holds, with hitches sprinkled through them.</summary>
+    private static void Play(CaptureCostMonitor monitor, int fromMinute, int minutes, int hitchesPerMinute)
+    {
+        for (var minute = 0; minute < minutes; minute++)
+        {
+            var at = Start.AddMinutes(fromMinute + minute);
+
+            // Thirty presents a minute is enough to fix the median at the cadence without making the
+            // test a benchmark.
+            for (var frame = 0; frame < 30; frame++)
+            {
+                monitor.Observe(Frame(at.AddSeconds(frame * 2), 16.7));
+            }
+
+            for (var hitch = 0; hitch < hitchesPerMinute; hitch++)
+            {
+                monitor.Observe(Frame(at.AddSeconds(1 + hitch * 8), 40));
+            }
+        }
     }
 
     private static FrameTelemetrySample Frame(DateTimeOffset at, double frameTimeMs)

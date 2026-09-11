@@ -87,6 +87,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// <summary>Whether this session has already retired the anti-cheat question. See ShouldWriteAntiCheatCost.</summary>
     private bool _antiCheatCostWritten;
     private SystemMemoryMonitor? _systemMemory;
+    private DiskLatencyMonitor? _diskLatency;
     private IncidentVerdictTally? _verdicts;
     private GameGraphicsSettingsMonitor? _gameSettings;
 
@@ -156,6 +157,16 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// </remarks>
     private int? _targetProcessId;
 
+    /// <summary>
+    /// The last game process the session saw, kept across its exit so a relaunch can be told from a
+    /// first sighting.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="_targetProcessId"/> is cleared the moment the game goes away, which is what the rest
+    /// of the session needs and what makes the two cases identical to it afterwards.
+    /// </remarks>
+    private int? _lastTargetProcessId;
+
     /// <summary>How often the graphics settings file is compared against what the session started with.</summary>
     private static readonly TimeSpan GameSettingsCheckInterval = TimeSpan.FromMinutes(5);
 
@@ -171,6 +182,16 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// few lines an hour and the last one written is the one that counts.
     /// </remarks>
     private static readonly TimeSpan InterimSummaryInterval = TimeSpan.FromMinutes(15);
+
+    /// <summary>
+    /// How long a written capture is left alone before an interim reconciliation counts it as missing.
+    /// </summary>
+    /// <remarks>
+    /// Parsing a 900 MB trace took five to seven seconds across the sessions of 8–10 September. Two
+    /// minutes is that with room to spare, and it costs nothing: a capture excluded from one quarter-hour
+    /// line is reconciled in the next.
+    /// </remarks>
+    private static readonly TimeSpan LedgerSettlingPeriod = TimeSpan.FromMinutes(2);
 
     /// <summary>
     /// Quiet period after a large frame before the stall is considered over.
@@ -369,6 +390,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _antiCheatCost = new AntiCheatCostMonitor();
             _antiCheatCostWritten = false;
             _systemMemory = new SystemMemoryMonitor();
+            _diskLatency = new DiskLatencyMonitor();
             _verdicts = new IncidentVerdictTally();
             _liveVram = new LiveVramTracker();
 
@@ -377,6 +399,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _targetProcessSeen = false;
             _reportedTargetProcessExit = false;
             _targetProcessId = null;
+            _lastTargetProcessId = null;
 
             // Half the capture threshold: a frame that large is unambiguously part of a stall, while an
             // ordinary two-refresh hitch is not, and holding a trace open for those would keep every
@@ -468,6 +491,18 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         }
 
         Report(StatusLevel.Info, nameof(DiagnosticsSessionManager), $"Session started for profile '{_settings.ServerProfile.Name}'.");
+
+        // The two ages the evening of 10 September was interpreted without. Its result — the best hitch
+        // rate of the investigation on settings identical to a far worse evening — turned on whether a
+        // freshly restarted machine hitches less, and nothing in the session said how long the machine
+        // had been up.
+        if (SessionStartAge.Describe(
+                Environment?.MachineUptime,
+                _processResolver.TryGetTargetProcess()?.StartedAt,
+                Environment?.SessionStartedAt ?? DateTimeOffset.UtcNow) is { } ages)
+        {
+            Report(StatusLevel.Info, "SessionStart.Age", ages);
+        }
 
         // At the start rather than in the summary, because it is the one finding of this investigation
         // that is fixed before playing rather than analysed afterwards.
@@ -836,9 +871,16 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             Report(StatusLevel.Info, "DeepCapture.Cost", report.Message);
         }
 
-        // Only at the end. A capture written a second ago has not been parsed yet and would count as
-        // orphaned in every quarter-hourly line until it was.
-        if (final && _captureLedger?.Summary() is { } ledger)
+        // Written on the quarter-hour as well as at the end, because the sessions worth reconciling are
+        // the ones that never reach their end: on 10 September the machine went down mid-write and this
+        // line — which only ran on an orderly stop — was never produced at all. A capture written a
+        // second ago has not been parsed yet, so the interim form leaves the freshest ones out rather
+        // than calling them orphans.
+        var ledger = final
+            ? _captureLedger?.Summary()
+            : _captureLedger?.Summary(DateTimeOffset.UtcNow, LedgerSettlingPeriod);
+
+        if (ledger is not null && ShouldWriteSummary("DeepCapture.Ledger", ledger.Message))
         {
             Report(
                 ledger.HasOrphans ? StatusLevel.Warning : StatusLevel.Info,
@@ -1085,6 +1127,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         FinalizeNeighbourCpu(final);
         FinalizeObsVramFootprint(final);
         FinalizeSystemMemory(final);
+        FinalizeDiskLatency(final);
         FinalizeVerdicts(final);
     }
 
@@ -1095,6 +1138,29 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// The only writer of that line. Each one describes the session so far, and the interesting one is
     /// whichever came after the worst minute, so it is repeated at session end as well.
     /// </remarks>
+    /// <summary>
+    /// Writes how each volume behaved, so a disk that answered once and badly is not one line among
+    /// fifty identical ones.
+    /// </summary>
+    /// <remarks>
+    /// A Warning only when a volume stands outside its own behaviour. Three evenings running, the
+    /// session wrote a sub-second reading on a volume nothing reads from and three reviews walked past
+    /// it, because in an incident it looks exactly like the fifty lines around it saying a disk answered
+    /// in 13 ms.
+    /// </remarks>
+    private void FinalizeDiskLatency(bool final)
+    {
+        if (_diskLatency?.Summary() is { } report && ShouldWriteSummary("Disk.Latency", report.Message))
+        {
+            Report(report.HasOutlier ? StatusLevel.Warning : StatusLevel.Info, "Disk.Latency", report.Message);
+        }
+
+        if (final)
+        {
+            _diskLatency = null;
+        }
+    }
+
     private void FinalizeSystemMemory(bool final)
     {
         if (_systemMemory?.Summary() is { } report && ShouldWriteSummary("SystemMemory", report.Message))
@@ -2024,6 +2090,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                     // this path had a cadence of its own that started in the same second and wrote the
                     // same sentence a second later, all evening.
                     _systemMemory?.Observe(systemSample);
+                    _diskLatency?.Observe(systemSample.WorstDiskInstance, systemSample.DiskAverageLatencyMs);
                     SystemTelemetryUpdated?.Invoke(this, systemSample);
                 }
                 else if (telemetryEvent is GpuTelemetrySample gpuSample)
@@ -2186,7 +2253,30 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 // otherwise. The difference matters here: the session may be started with the game
                 // already running for an hour, and calling that a fresh load would file an hour of
                 // ordinary play as the loading window.
-                _vramPressure?.NoteGameStart(target.StartedAt ?? DateTimeOffset.UtcNow);
+                var startedAt = target.StartedAt ?? DateTimeOffset.UtcNow;
+                _vramPressure?.NoteGameStart(startedAt);
+
+                // The same minutes the band monitor sets aside. A capture taken during a reload was
+                // being charged for the reload's own hitches.
+                _captureCost?.NoteGameStart(startedAt);
+
+                // A relaunch rather than the first sighting. Everything measured per process is two
+                // series across this line — the NUI process's CPU among them, which is why the step
+                // monitor was reading one instance's level as another's — and on 10 September four
+                // separate analyses had to recover the fact from process ids in a CSV, because the
+                // session handled the restart correctly and never said it had happened.
+                if (_lastTargetProcessId is { } previous && previous != target.ProcessId)
+                {
+                    Report(
+                        StatusLevel.Warning,
+                        "Spelprocess",
+                        $"Spelet startades om: PID {previous} → {target.ProcessId}. Allt som mäts per process "
+                        + "— inklusive FiveM:s NUI-process, som startar om med spelet — är två olika serier "
+                        + "före och efter den här punkten och ska inte jämföras rakt av. Minuterna närmast "
+                        + "efter är dessutom inladdning, inte spelande.");
+                }
+
+                _lastTargetProcessId = target.ProcessId;
             }
 
             _targetProcessSeen = true;
@@ -2640,7 +2730,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 // Timed here rather than when the capture was requested: what disturbs the game is the
                 // flush of the ring buffer to disk, which is what has just finished.
                 _captureCost?.RecordCaptureWritten(DateTimeOffset.UtcNow);
-                _captureLedger?.RecordWritten(result.CapturePath!);
+                _captureLedger?.RecordWritten(result.CapturePath!, DateTimeOffset.UtcNow);
 
                 // And the budget, which otherwise has to assume this capture is still recording and
                 // holds the next extreme frame off for the longest tail the options allow. With the file

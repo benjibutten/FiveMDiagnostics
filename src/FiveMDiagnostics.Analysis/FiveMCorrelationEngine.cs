@@ -258,6 +258,29 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
     private const double ClassificationFloor = 0.35;
 
     /// <summary>
+    /// The most a residency stall may score when the card was below the pressure band.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately under <see cref="ClassificationFloor"/>. A card that stopped is worth recording
+    /// whatever the occupancy was, but "the driver made room in VRAM" is a claim about a full card, and
+    /// on 10 September it was the verdict on an incident whose own trace text said the card was at 86%
+    /// and that this was not memory pressure. Held here, the observation survives and the verdict goes
+    /// to whichever hypothesis can actually account for the stall.
+    /// </remarks>
+    private const double BelowBandResidencyCeiling = 0.3;
+
+    /// <summary>
+    /// Skipped renders inside one incident window before OBS is said to have stalled with the game.
+    /// </summary>
+    /// <remarks>
+    /// Thirty is half a second of frozen canvas at sixty frames a second. The counter moved 40 steps
+    /// across the whole quiet part of 10 September and 301 inside the one window that mattered, so the
+    /// gap between ordinary drift and the thing this looks for is an order of magnitude wide and the
+    /// threshold does not have to be delicate.
+    /// </remarks>
+    private const long ObsRenderSkipBurstFrames = 30;
+
+    /// <summary>
     /// Severe spikes a window needs before a verdict that falls short of <see cref="ClassificationFloor"/>
     /// is called inconclusive rather than simply thin. Below this, the window itself did not offer enough
     /// material to classify — a quiet ninety seconds with a trace attached is not a failure of the engine,
@@ -1055,6 +1078,23 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
                 + $"{VramPressureBandMonitor.BandPercent:F0} % är det inte längre kortet som fylls, det är "
                 + "drivrutinen som måste göra plats innan nästa yta får plats i minnet.");
         }
+        else
+        {
+            // The card was not full, so whatever the driver was doing it was not making room. On
+            // 10 September this verdict took an incident at 75% while its own trace text, reading the
+            // same second, said "the card was only at 86%, below the 88% where eviction begins — the
+            // driver moved memory for some other reason, and this was not memory pressure". Both
+            // sentences stood in the same incident. The observation is kept because a stopped card is
+            // worth seeing, but it is held under the classification floor so it cannot be the verdict:
+            // a stall with the card below the band is some other mechanism, and one of the other
+            // hypotheses should be allowed to name it. The cap is applied after every other signal has
+            // been added, below, so no later bonus can lift it back over the floor.
+            evidence.Add(
+                $"Men kortet låg bara på {peakVram:F1} % strax före framen, alltså under "
+                + $"{VramPressureBandMonitor.BandPercent:F0} % där eviction börjar. Drivrutinen flyttade "
+                + "minne av något annat skäl — en inladdning eller ett lägesbyte — och det här var inte "
+                + "minnestryck. Posten står kvar som observation men får inte bli dom.");
+        }
 
         if (driverModules.Length > 0)
         {
@@ -1071,7 +1111,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             + "att leta efter en process som växer. Ingen enskild process gjorde något fel; de fick "
             + "tillsammans inte plats.");
 
-        hypotheses.Add(new HypothesisScore(RootCauseCategory.GpuResidencyStall, Math.Min(confidence, 0.95), evidence));
+        var ceiling = vramInBand ? 0.95 : BelowBandResidencyCeiling;
+        hypotheses.Add(new HypothesisScore(RootCauseCategory.GpuResidencyStall, Math.Min(confidence, ceiling), evidence));
     }
 
     /// <summary>
@@ -2363,6 +2404,11 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
                         ? "process körs, WebSocket frånkopplad"
                         : "process körs inte";
             highlights.Add(new(obs.Timestamp, "OBS", $"OBS-status: {state}. Render time {obs.AverageFrameRenderTimeMs:F1} ms, render skipped {obs.RenderSkippedFrames}, output skipped {obs.OutputSkippedFrames}."));
+
+            if (DescribeObsRenderSkipBurst(obsSamples) is { } burst)
+            {
+                highlights.Add(new(obs.Timestamp, "OBS", burst));
+            }
         }
 
         // Said apart, exactly as BuildProbeHint says them apart. The worst RTT of the window is often
@@ -2383,6 +2429,53 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         highlights.AddRange(artifacts.Take(3).Select(item => new TimelineHighlight(item.Timestamp, item.Kind.ToString(), item.Summary)));
         highlights.Add(new(incident.Marker.MarkedAt, "Classification", $"Högst rankad hypotes: {ToLabel(top.Category)} ({top.Confidence:P0})."));
         return highlights.OrderBy(item => item.Timestamp).ToArray();
+    }
+
+    /// <summary>
+    /// A burst of skipped renders inside this window, which says the stall reached past the game.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// OBS renders from its own canvas on its own clock. It does not care that the game has stopped
+    /// producing frames — a frozen game gives it a stale texture to composite, not a reason to skip a
+    /// render. So a burst of skipped renders is not the game's stutter seen from outside; it is OBS
+    /// being stopped too, by something underneath both processes.
+    /// </para>
+    /// <para>
+    /// Written after 10 September, whose only real freeze — 1 002 ms and then 2 973 ms, four seconds
+    /// apart — took OBS with it: the counter went 78 to 379 across that one incident and moved 40 steps
+    /// in the whole rest of the evening. Every long frame of the six evenings before it had been the game
+    /// waiting inside its own process with everything around it quiet. That one was not, and the only
+    /// way to see it was to read the absolute counter across twelve consecutive incidents by hand.
+    /// </para>
+    /// <para>
+    /// Deliberately not a verdict. The engine has no category for a stall beneath both processes, and
+    /// inventing one from a single evening would be worse than printing the observation and letting the
+    /// next evening say whether it recurs.
+    /// </para>
+    /// </remarks>
+    private static string? DescribeObsRenderSkipBurst(IReadOnlyList<ObsTelemetrySample> obsSamples)
+    {
+        var connected = obsSamples.Where(item => item.IsConnected).ToArray();
+        if (connected.Length < 2)
+        {
+            return null;
+        }
+
+        var skipped = Delta(connected.Select(item => item.RenderSkippedFrames));
+        if (skipped < ObsRenderSkipBurstFrames)
+        {
+            return null;
+        }
+
+        var outputSkipped = Delta(connected.Select(item => item.OutputSkippedFrames));
+        var viewers = outputSkipped == 0
+            ? "Output skipped rörde sig inte, så tittarna tappade ingenting"
+            : $"Output skipped steg med {outputSkipped} i samma fönster — de bildrutorna nådde aldrig tittarna";
+
+        return $"OBS hoppade över {skipped} renderingar i det här fönstret. OBS renderar från sin egen duk "
+            + "och påverkas inte av att spelet står stilla, så ett hopp av den storleken betyder att "
+            + $"stoppet låg under båda processerna och inte inne i spelet. {viewers}.";
     }
 
     /// <summary>
@@ -2788,6 +2881,18 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         return $" {failed} av {probes.Count} {label} misslyckades; de som svarade toppade på {succeededRtt:F0} ms.";
     }
 
+    /// <summary>
+    /// The neighbouring programs worth naming, one row per program rather than one per process.
+    /// </summary>
+    /// <remarks>
+    /// Peaks are taken per process id first, because a program's cost is the sum of its processes and not
+    /// the cost of whichever one happened to be sampled highest — and then folded by name, because the
+    /// reader acts on a program. Chromium-based programs make the difference visible: FiveM's NUI layer
+    /// runs several processes all called <c>FiveM_ChromeBrowser</c>, and on 10 September four incidents
+    /// named it twice with two different figures and, in one case, the same sentence printed twice. A
+    /// list that contradicts itself in two adjacent rows is not one anybody can rank by hand, and the
+    /// tally that watches for a process named in nearly every incident counts these rows.
+    /// </remarks>
     private static IReadOnlyList<SuspectedProcessImpact> AnalyzeSuspiciousProcesses(IReadOnlyList<SystemTelemetrySample> systemSamples)
     {
         var cpuFloor = SuspectCpuFloorPercent(systemSamples);
@@ -2796,23 +2901,41 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             .SelectMany(item => item.TopCpuProcesses.Concat(item.TopDiskProcesses))
             .Where(item => IsRelevantExternalProcess(item.ProcessName))
             .GroupBy(item => (item.ProcessName, item.ProcessId))
-            .Select(group =>
+            .Select(group => new
             {
-                var peakCpu = group.Max(entry => entry.CpuPercent);
-                var peakIoMegabytes = group.Max(entry => ToMegabytes(entry.IoBytesPerSecond));
-                var isService = group.Any(entry => entry.IsSystemService);
+                group.Key.ProcessName,
+                group.Key.ProcessId,
+                PeakCpu = group.Max(entry => entry.CpuPercent),
+                PeakIo = group.Max(entry => ToMegabytes(entry.IoBytesPerSecond)),
+                Samples = group.Count(),
+                IsService = group.Any(entry => entry.IsSystemService),
+            })
+            .GroupBy(instance => instance.ProcessName, StringComparer.OrdinalIgnoreCase)
+            .Select(byName =>
+            {
+                // Summed across instances: two renderer processes holding a tenth of the machine each
+                // cost the machine a fifth, and that is the figure the reader is deciding on.
+                var peakCpu = Math.Round(byName.Sum(instance => instance.PeakCpu), 1);
+                var peakIoMegabytes = Math.Round(byName.Sum(instance => instance.PeakIo), 1);
+                var busiest = byName.OrderByDescending(instance => instance.PeakCpu).First();
+                var instances = byName.Count();
+
+                var reason = DescribeProcessReason(byName.Key, peakCpu, peakIoMegabytes)
+                    + (instances > 1 ? $" ({instances} processer med samma namn, summerade)" : string.Empty);
 
                 return new
                 {
                     Impact = new SuspectedProcessImpact(
-                        group.Key.ProcessName,
-                        group.Key.ProcessId,
-                        Math.Round(peakCpu, 1),
-                        Math.Round(peakIoMegabytes, 1),
-                        group.Count(),
-                        DescribeProcessReason(group.Key.ProcessName, peakCpu, peakIoMegabytes),
-                        isService),
-                    Score = SuspectScore(group.Key.ProcessName, Math.Round(peakCpu, 1), Math.Round(peakIoMegabytes, 1)),
+                        byName.Key,
+
+                        // The busiest instance's id, so the field still names a process that existed.
+                        busiest.ProcessId,
+                        peakCpu,
+                        peakIoMegabytes,
+                        byName.Max(instance => instance.Samples),
+                        reason,
+                        byName.Any(instance => instance.IsService)),
+                    Score = SuspectScore(byName.Key, peakCpu, peakIoMegabytes),
                 };
             })
             .Where(item => item.Impact.PeakCpuPercent >= cpuFloor || item.Impact.PeakIoMegabytesPerSecond >= 12)

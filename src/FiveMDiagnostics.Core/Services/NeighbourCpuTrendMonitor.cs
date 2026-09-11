@@ -31,6 +31,14 @@ public sealed class NeighbourCpuTrendMonitor
     /// <summary>How a trace reports what each neighbouring process held.</summary>
     private const string ProcessCoresPrefix = "cpuProcessCores_";
 
+    /// <summary>Which instance of that process the cores belonged to.</summary>
+    /// <remarks>
+    /// Absent from traces written before 11 September and from hand-imported ETLs, which is why a
+    /// missing pid continues the run it arrives in rather than starting a new one: an old trace must not
+    /// split a series it knows nothing about.
+    /// </remarks>
+    private const string ProcessPidPrefix = "cpuProcessPid_";
+
     /// <summary>
     /// Traces a process needs before its levels are compared at all.
     /// </summary>
@@ -55,7 +63,9 @@ public sealed class NeighbourCpuTrendMonitor
     private const double StepCores = 0.5;
 
     private readonly object _sync = new();
-    private readonly Dictionary<string, List<(DateTimeOffset At, double Cores)>> _byProcess = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, List<Sample>> _byProcess = new(StringComparer.OrdinalIgnoreCase);
+
+    private readonly record struct Sample(DateTimeOffset At, double Cores, int? ProcessId);
 
     /// <summary>The window a trace describes, which is not when the app finished reading it.</summary>
     private const string CoveredStartKey = "traceCoveredStartUnixMs";
@@ -91,7 +101,11 @@ public sealed class NeighbourCpuTrendMonitor
                     _byProcess[name] = series;
                 }
 
-                series.Add((at, cores));
+                var processId = metrics.TryGetValue(ProcessPidPrefix + name, out var pid) && pid > 0
+                    ? (int)pid
+                    : (int?)null;
+
+                series.Add(new Sample(at, cores, processId));
             }
         }
     }
@@ -104,11 +118,53 @@ public sealed class NeighbourCpuTrendMonitor
         lock (_sync)
         {
             return _byProcess
-                .Where(entry => entry.Value.Count >= MinimumTraces)
-                .Select(entry => FindStep(entry.Key, entry.Value))
-                .OfType<NeighbourCpuTrendReport>()
+                .SelectMany(entry => StepsWithinInstances(entry.Key, entry.Value))
                 .OrderByDescending(report => report.After - report.Before)
                 .FirstOrDefault();
+        }
+    }
+
+    /// <summary>
+    /// Steps found inside one process instance, never across two.
+    /// </summary>
+    /// <remarks>
+    /// A restart resets everything the comparison assumes. On 10 September the game crashed at 00:09 and
+    /// relaunched, taking <c>FiveM_ChromeBrowser</c> with it; the monitor saw 0.34 cores in the first
+    /// trace and 0.88–1.37 in the three after, called it a step that "never came down again", and added
+    /// that the machine was not the one the earlier half had run on. Two of those three traces were a
+    /// different process, and one of them was the new instance loading the game. Splitting on the pid
+    /// leaves two runs of two traces, neither long enough to claim anything — which is the honest answer
+    /// for that evening.
+    /// <para>
+    /// Every run is offered rather than only the last: a step inside an earlier instance is as real as
+    /// one inside the current instance, and <see cref="Summary"/> picks the largest.
+    /// </para>
+    /// </remarks>
+    private static IEnumerable<NeighbourCpuTrendReport> StepsWithinInstances(string process, List<Sample> series)
+    {
+        var restarts = 0;
+        var run = new List<Sample>();
+
+        foreach (var sample in series.OrderBy(item => item.At))
+        {
+            var known = run.LastOrDefault(item => item.ProcessId is not null).ProcessId;
+            if (sample.ProcessId is { } pid && known is { } previous && pid != previous)
+            {
+                restarts++;
+                if (run.Count >= MinimumTraces && FindStep(process, run, restarts - 1) is { } step)
+                {
+                    yield return step;
+                }
+
+                run = [];
+            }
+
+            run.Add(sample);
+        }
+
+        if (run.Count >= MinimumTraces && FindStep(process, run, restarts) is { } tail)
+        {
+            yield return tail;
         }
     }
 
@@ -121,7 +177,7 @@ public sealed class NeighbourCpuTrendMonitor
     /// that went up and came back down again is not what this is for — the question it answers is whether
     /// the machine the second half of the session ran on was the same one the first half did.
     /// </remarks>
-    private static NeighbourCpuTrendReport? FindStep(string process, List<(DateTimeOffset At, double Cores)> series)
+    private static NeighbourCpuTrendReport? FindStep(string process, List<Sample> series, int restartsSeen)
     {
         var ordered = series.OrderBy(item => item.At).ToArray();
 
@@ -146,7 +202,8 @@ public sealed class NeighbourCpuTrendMonitor
                     AfterPeak: after.Max(item => item.Cores),
                     TracesBefore: before.Length,
                     TracesAfter: after.Length,
-                    SteppedBetween: (before[^1].At, after[0].At));
+                    SteppedBetween: (before[^1].At, after[0].At),
+                    RestartsSeen: restartsSeen);
             }
         }
 
@@ -157,6 +214,11 @@ public sealed class NeighbourCpuTrendMonitor
 /// <param name="Before">The highest the process reached in any trace before the step.</param>
 /// <param name="After">The lowest it held in any trace after it.</param>
 /// <param name="SteppedBetween">The two captures the step happened between; it cannot be placed closer.</param>
+/// <param name="RestartsSeen">
+/// How many times the process restarted during the session. The step is always read inside one instance;
+/// this only warns the reader that the series had breaks in it, so the trace counts are not the whole
+/// evening.
+/// </param>
 public sealed record NeighbourCpuTrendReport(
     string ProcessName,
     double Before,
@@ -164,13 +226,27 @@ public sealed record NeighbourCpuTrendReport(
     double AfterPeak,
     int TracesBefore,
     int TracesAfter,
-    (DateTimeOffset From, DateTimeOffset To) SteppedBetween)
+    (DateTimeOffset From, DateTimeOffset To) SteppedBetween,
+    int RestartsSeen = 0)
 {
     public string Message =>
-        $"{ProcessName} steg från högst {Before:F2} kärnor i sessionens första {TracesBefore} traces till "
+        $"{ProcessName} steg från högst {Before:F2} kärnor i {FirstTraces} {TracesBefore} traces till "
         + $"{After:F2}–{AfterPeak:F2} i de {TracesAfter} följande, och gick aldrig ner igen. Steget ligger "
         + $"mellan {SteppedBetween.From.ToLocalTime():HH:mm:ss} och {SteppedBetween.To.ToLocalTime():HH:mm:ss}. "
+        + Restarts
         + "Det säger inte att processen orsakade något — läs väntkedjorna för det — men maskinen den senare "
         + "delen av sessionen kördes på är inte den som den tidigare delen kördes på, och kvällarna är inte "
         + "jämförbara över den gränsen.";
+
+    private string FirstTraces => RestartsSeen == 0 ? "sessionens första" : "instansens första";
+
+    /// <summary>Names the breaks in the series, so the trace counts are not read as the whole evening.</summary>
+    private string Restarts => RestartsSeen switch
+    {
+        0 => string.Empty,
+        1 => "Processen startades om en gång under sessionen; steget är läst inom en och samma instans, "
+            + "inte över omstarten. ",
+        _ => $"Processen startades om {RestartsSeen} gånger under sessionen; steget är läst inom en och "
+            + "samma instans, inte över någon omstart. ",
+    };
 }

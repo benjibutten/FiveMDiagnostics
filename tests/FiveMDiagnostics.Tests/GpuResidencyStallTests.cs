@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Tests;
+﻿namespace FiveMDiagnostics.Tests;
 
 using FiveMDiagnostics.Analysis;
 using FiveMDiagnostics.Core;
@@ -140,10 +140,41 @@ public sealed class GpuResidencyStallTests
         Assert.DoesNotContain(analysis.Hypotheses, item => item.Category == RootCauseCategory.GpuVramPressure);
     }
 
+
+    /// <summary>
+    /// The 2 973 ms freeze of 10 September, where this verdict and its own trace text contradicted each
+    /// other inside one incident.
+    /// </summary>
+    /// <remarks>
+    /// The card stopped — utilization 3–6 %, memory bandwidth 0–1 %, for three seconds — and
+    /// <c>dxgmms2.sys</c> went to 1.01 cores. But the card sat at 86.0 % in the second it happened, and
+    /// the trace text said so in the same incident: "below the 88 % where eviction begins … the driver
+    /// moved memory for some other reason, and this was not memory pressure". The verdict was
+    /// nevertheless GPU residency at 75 %. Making room in VRAM is a claim about a full card, so below
+    /// the band the observation is kept and the verdict is not.
+    /// </remarks>
+    [Fact]
+    public void BelowTheBandTheStallIsObservedButNotTheVerdict()
+    {
+        var analysis = new FiveMCorrelationEngine().Analyze(Incident(vramShiftPercentPoints: 4));
+
+        var residency = analysis.Hypotheses.Single(item => item.Category == RootCauseCategory.GpuResidencyStall);
+
+        Assert.True(residency.Confidence < 0.35, $"expected it under the classification floor, got {residency.Confidence:F2}");
+        Assert.NotEqual(RootCauseCategory.GpuResidencyStall, analysis.Hypotheses[0].Category);
+
+        // The evidence still describes the stopped card, and now says why it is not memory pressure —
+        // in the same words the trace text uses, so the incident cannot contradict itself again.
+        Assert.Contains(residency.Evidence, item => item.Contains("minnesbandbredd 0 %", StringComparison.Ordinal));
+        Assert.Contains(residency.Evidence, item => item.Contains("inte minnestryck", StringComparison.Ordinal));
+        Assert.Contains(residency.Evidence, item => item.Contains("får inte bli dom", StringComparison.Ordinal));
+    }
+
     private static IncidentRecord Incident(
         double? stalledBandwidthPercent = 0,
         double busyUtilizationPercent = 44,
-        bool withTrace = true)
+        bool withTrace = true,
+        double vramShiftPercentPoints = 0)
     {
         var events = new List<TelemetryEvent>();
 
@@ -176,7 +207,7 @@ public sealed class GpuResidencyStallTests
                 at,
                 utilizationPercent: stopped ? 2 : busyUtilizationPercent,
                 bandwidthPercent: stopped ? stalledBandwidthPercent : 14,
-                vramPercent: vramPercent));
+                vramPercent: vramPercent - vramShiftPercentPoints));
         }
 
         if (withTrace)

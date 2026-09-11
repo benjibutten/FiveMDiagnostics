@@ -23,6 +23,19 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
     private long? _lastRenderSkipped;
     private long? _firstOutputSkipped;
     private long? _lastOutputSkipped;
+    private string? _lastSkippedFrameTotals;
+    private DateTimeOffset _nextSkippedFrameTotals = DateTimeOffset.MinValue;
+
+    /// <summary>
+    /// How often the skipped-frame totals are written while the session runs.
+    /// </summary>
+    /// <remarks>
+    /// Matches the session's own interim summary cadence. The line used to be written once, on the way
+    /// out of the loop, which meant it was never written at all on 10 September: the machine went down
+    /// while OBS had skipped 380 renders, 301 of them inside a single four-second freeze, and the only
+    /// record left was the counter embedded in twelve consecutive incidents.
+    /// </remarks>
+    private static readonly TimeSpan SkippedFrameTotalsInterval = TimeSpan.FromMinutes(15);
 
     public string Name => "OBS";
 
@@ -41,6 +54,8 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
         _lastRenderSkipped = null;
         _firstOutputSkipped = null;
         _lastOutputSkipped = null;
+        _lastSkippedFrameTotals = null;
+        _nextSkippedFrameTotals = sessionStart + SkippedFrameTotalsInterval;
 
         try
         {
@@ -55,6 +70,14 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
                     ReportRenderSkipOnset(context, sample);
                     NoteSkippedFrames(sample);
                     await context.Writer.WriteAsync(sample, cancellationToken).ConfigureAwait(false);
+
+                    // On the quarter-hour as well as on the way out, so a session that ends with the
+                    // machine rather than with a stop still leaves the totals behind.
+                    if (context.UtcNow() >= _nextSkippedFrameTotals)
+                    {
+                        _nextSkippedFrameTotals = context.UtcNow() + SkippedFrameTotalsInterval;
+                        ReportSkippedFrameTotals(context);
+                    }
                 }
 
                 await Task.Delay(context.Settings.Obs.PollingInterval, cancellationToken).ConfigureAwait(false);
@@ -262,10 +285,21 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
             ? $"OBS render skipped stod stilla på {first} hela sessionen."
             : $"OBS render skipped gick från {first} till {last} under sessionen ({last - first} till).";
 
+        var line = $"{render} {viewers}";
+
+        // Repeated on a cadence, so an unchanged evening would otherwise write the same sentence every
+        // quarter of an hour. The counters only ever rise, so a repeat means nothing moved.
+        if (string.Equals(line, _lastSkippedFrameTotals, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        _lastSkippedFrameTotals = line;
+
         context.StatusSink.Report(
             skippedHere == 0 ? StatusLevel.Info : StatusLevel.Warning,
             Name,
-            $"{render} {viewers}");
+            line);
     }
 
     /// <summary>

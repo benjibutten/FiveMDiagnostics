@@ -68,6 +68,34 @@ public sealed class ObsVramFootprintTests
         Assert.Contains("för kort för att", report.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// 10 September, where only the stream was stopped and OBS itself kept running to the end.
+    /// </summary>
+    /// <remarks>
+    /// The line stated the encoder's 2.3 pp and stopped there. Read cold a fortnight later that is
+    /// indistinguishable from a measurement that failed, when what actually happened is that the
+    /// measurement was given half its evidence — the instruction was to close OBS in two steps and only
+    /// the first was done.
+    /// </remarks>
+    [Fact]
+    public void AMissingSecondStepIsSaidRatherThanLeftOut()
+    {
+        var monitor = new ObsVramFootprintMonitor();
+
+        Play(monitor, from: 0, seconds: 18, vramPercent: 80.5, streaming: true, running: true);
+
+        // The stream stops; OBS stays up for the rest of the evening.
+        Play(monitor, from: 18, seconds: 1200, vramPercent: 78.2, streaming: false, running: true);
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report);
+        Assert.NotNull(report.Encoder);
+        Assert.Null(report.RestOfStack);
+        Assert.Contains("OBS-processen avslutades aldrig", report.Message, StringComparison.Ordinal);
+        Assert.Contains("omätt i kväll", report.Message, StringComparison.Ordinal);
+    }
+
     /// <summary>An evening where OBS ran to the end has no step to read and says nothing.</summary>
     [Fact]
     public void AStackThatNeverCameOffIsSilent()

@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Tests;
+﻿namespace FiveMDiagnostics.Tests;
 
 using FiveMDiagnostics.Core;
 
@@ -13,13 +13,16 @@ using FiveMDiagnostics.Core;
 /// </remarks>
 public sealed class DeepCaptureLedgerTests
 {
+    /// <summary>When the captures landed; the end-of-session summary reconciles regardless of when.</summary>
+    private static readonly DateTimeOffset Written = new(2026, 9, 8, 23, 16, 16, TimeSpan.Zero);
+
     [Fact]
     public void ACaptureThatReachedNoIncidentIsNamed()
     {
         var ledger = new DeepCaptureLedger();
 
-        ledger.RecordWritten(@"D:\Traces\deep_20260908_211525_644caf7c.etl");
-        ledger.RecordWritten(@"D:\Traces\deep_20260908_214538_e6672ada.etl");
+        ledger.RecordWritten(@"D:\Traces\deep_20260908_211525_644caf7c.etl", Written);
+        ledger.RecordWritten(@"D:\Traces\deep_20260908_214538_e6672ada.etl", Written);
         ledger.RecordReachedAnIncident(@"D:\Traces\deep_20260908_214538_e6672ada.etl");
 
         var report = ledger.Summary();
@@ -42,7 +45,7 @@ public sealed class DeepCaptureLedgerTests
 
         foreach (var path in new[] { @"C:\t\a.etl", @"C:\t\b.etl", @"C:\t\c.etl" })
         {
-            ledger.RecordWritten(path);
+            ledger.RecordWritten(path, Written);
             ledger.RecordReachedAnIncident(path);
         }
 
@@ -62,8 +65,8 @@ public sealed class DeepCaptureLedgerTests
     {
         var ledger = new DeepCaptureLedger();
 
-        ledger.RecordWritten(@"C:\t\a.etl");
-        ledger.RecordWritten(@"C:\t\a.etl");
+        ledger.RecordWritten(@"C:\t\a.etl", Written);
+        ledger.RecordWritten(@"C:\t\a.etl", Written);
         ledger.RecordReachedAnIncident(@"C:\t\a.etl");
         ledger.RecordReachedAnIncident(@"C:\t\a.etl");
         ledger.RecordReachedAnIncident(@"C:\downloads\someone-elses.etl");
@@ -80,5 +83,61 @@ public sealed class DeepCaptureLedgerTests
     public void ASessionWithoutCapturesIsSilent()
     {
         Assert.Null(new DeepCaptureLedger().Summary());
+    }
+
+    /// <summary>
+    /// The evening of 10 September, which never reached its end: the machine went down mid-write, the
+    /// session was never stopped, and a reconciliation that only ran on an orderly shutdown was never
+    /// written at all. The interim form has to work, and it has to not call a capture written seconds
+    /// ago an orphan.
+    /// </summary>
+    [Fact]
+    public void AnInterimReconciliationLeavesTheFreshestCaptureOut()
+    {
+        var ledger = new DeepCaptureLedger();
+        var now = Written.AddMinutes(30);
+
+        ledger.RecordWritten(@"C:	\settled.etl", now.AddMinutes(-20));
+        ledger.RecordReachedAnIncident(@"C:	\settled.etl");
+        ledger.RecordWritten(@"C:	\just-now.etl", now.AddSeconds(-5));
+
+        var report = ledger.Summary(now, TimeSpan.FromMinutes(2));
+
+        Assert.NotNull(report);
+        Assert.False(report.HasOrphans);
+        Assert.Equal(1, report.CapturesWritten);
+        Assert.Equal(1, report.CapturesPending);
+        Assert.Contains("skrevs nyss", report.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A capture that has had its chance and still reached nothing is an orphan on the quarter-hour too;
+    /// waiting for a session end that may never come is how the gap went unreported.
+    /// </summary>
+    [Fact]
+    public void AnInterimReconciliationStillNamesASettledOrphan()
+    {
+        var ledger = new DeepCaptureLedger();
+        var now = Written.AddMinutes(30);
+
+        ledger.RecordWritten(@"C:	\orphan.etl", now.AddMinutes(-20));
+
+        var report = ledger.Summary(now, TimeSpan.FromMinutes(2));
+
+        Assert.NotNull(report);
+        Assert.True(report.HasOrphans);
+        Assert.Equal(["orphan.etl"], report.OrphanedCaptures);
+    }
+
+    /// <summary>Nothing has settled yet, so there is nothing to reconcile and no line worth writing.</summary>
+    [Fact]
+    public void AnInterimReconciliationWithNothingSettledIsSilent()
+    {
+        var ledger = new DeepCaptureLedger();
+        var now = Written.AddMinutes(30);
+
+        ledger.RecordWritten(@"C:	\just-now.etl", now.AddSeconds(-5));
+
+        Assert.Null(ledger.Summary(now, TimeSpan.FromMinutes(2)));
     }
 }

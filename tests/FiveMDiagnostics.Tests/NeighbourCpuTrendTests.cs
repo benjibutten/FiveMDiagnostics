@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Tests;
+﻿namespace FiveMDiagnostics.Tests;
 
 using FiveMDiagnostics.Core;
 
@@ -143,11 +143,85 @@ public sealed class NeighbourCpuTrendTests
         Assert.Equal(Start.AddMinutes(60), report.SteppedBetween.To);
     }
 
+
+    /// <summary>
+    /// The evening of 10 September, where the step the monitor reported was two different processes.
+    /// </summary>
+    /// <remarks>
+    /// The game crashed at 00:09 and relaunched, taking <c>FiveM_ChromeBrowser</c> with it. The monitor
+    /// saw 0.34 cores in the evening's first trace and 0.88–1.37 in the three that followed, and wrote
+    /// that the process "never came down again" and that the machine the later half ran on was not the
+    /// one the earlier half had. Two of those three traces were a new instance, and one of them was that
+    /// instance loading the game. Split on the pid, neither run is long enough to claim anything — which
+    /// is the honest answer for that evening.
+    /// </remarks>
+    [Fact]
+    public void AStepThatSpansARestartIsNotAStep()
+    {
+        var monitor = new NeighbourCpuTrendMonitor();
+
+        Observe(monitor, 0, browserCores: 0.34, browserPid: 18944);
+        Observe(monitor, 57, browserCores: 1.37, browserPid: 18944);
+        Observe(monitor, 72, browserCores: 0.88, browserPid: 27868);
+        Observe(monitor, 170, browserCores: 1.36, browserPid: 27868);
+
+        Assert.Null(monitor.Summary());
+    }
+
+    /// <summary>
+    /// The same shape inside one instance is still the finding it always was, and the line says the
+    /// series had a break in it so the trace counts are not read as the whole evening.
+    /// </summary>
+    [Fact]
+    public void AStepInsideOneInstanceSurvivesARestartElsewhereInTheSession()
+    {
+        var monitor = new NeighbourCpuTrendMonitor();
+
+        Observe(monitor, 0, browserCores: 0.30, browserPid: 18944);
+        Observe(monitor, 20, browserCores: 0.41, browserPid: 27868);
+        Observe(monitor, 40, browserCores: 0.38, browserPid: 27868);
+        Observe(monitor, 60, browserCores: 1.50, browserPid: 27868);
+        Observe(monitor, 80, browserCores: 1.34, browserPid: 27868);
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report);
+        Assert.Equal(0.41, report.Before, 2);
+        Assert.Equal(1.34, report.After, 2);
+        Assert.Equal(2, report.TracesBefore);
+        Assert.Equal(2, report.TracesAfter);
+        Assert.Equal(1, report.RestartsSeen);
+        Assert.Contains("startades om en gång", report.Message, StringComparison.Ordinal);
+        Assert.Contains("inom en och samma instans", report.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Traces written before 11 September carry no pid, and an evening of them must behave exactly as it
+    /// did — a missing pid continues the run rather than splitting it.
+    /// </summary>
+    [Fact]
+    public void TracesWithoutAPidAreOneSeriesAsBefore()
+    {
+        var monitor = new NeighbourCpuTrendMonitor();
+
+        foreach (var (minutes, cores) in new[] { (0, 0.27), (84, 0.41), (112, 1.50), (156, 1.34), (177, 1.18) })
+        {
+            Observe(monitor, minutes, browserCores: cores);
+        }
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report);
+        Assert.Equal(0, report.RestartsSeen);
+        Assert.Contains("sessionens första", report.Message, StringComparison.Ordinal);
+    }
+
     private static void Observe(
         NeighbourCpuTrendMonitor monitor,
         int minutes,
         double browserCores,
-        int? coveredMinutes = null)
+        int? coveredMinutes = null,
+        int? browserPid = null)
     {
         var metrics = new Dictionary<string, double>
         {
@@ -158,6 +232,11 @@ public sealed class NeighbourCpuTrendTests
             ["cpuProcessCores_dwm.exe"] = 0.30,
             ["cpuSubjectProcessCores"] = 3.6,
         };
+
+        if (browserPid is { } pid)
+        {
+            metrics["cpuProcessPid_FiveM_ChromeBrowser"] = pid;
+        }
 
         if (coveredMinutes is { } covered)
         {

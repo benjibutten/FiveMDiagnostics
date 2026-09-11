@@ -42,7 +42,11 @@ public sealed class EnvironmentMetadataProvider : IEnvironmentMetadataProvider
                 settings.ServerProfile.Name,
                 DateTimeOffset.UtcNow,
                 SessionEndedAt: null,
-                TryGetAttachedDisplays());
+                TryGetAttachedDisplays(),
+
+                // TickCount64 rather than WMI's LastBootUpTime: it cannot fail, it needs no query, and
+                // both carry the same Fast Startup caveat anyway. The line that prints it says so.
+                TimeSpan.FromMilliseconds(System.Environment.TickCount64));
         }, cancellationToken);
     }
 

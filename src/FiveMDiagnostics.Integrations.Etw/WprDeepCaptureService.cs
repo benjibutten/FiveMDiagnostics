@@ -816,7 +816,21 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
                     // answers is what a program of that name held while the frames were lost, and an
                     // assignment would have made that the arbitrary one.
                     var key = $"cpuProcessCores_{process.ProcessName}";
-                    metrics[key] = Math.Round(Math.Max(metrics.GetValueOrDefault(key), process.Cores), 4);
+                    var cores = Math.Round(process.Cores, 4);
+                    if (metrics.TryGetValue(key, out var recorded) && recorded >= cores)
+                    {
+                        continue;
+                    }
+
+                    metrics[key] = cores;
+
+                    // Which instance those cores belong to. NeighbourCpuTrendMonitor compares a
+                    // neighbour's level across a session's traces, and a process that restarted is not
+                    // the same process: on 10 September the game and its NUI process died and relaunched
+                    // mid-session, and the step the monitor reported — "never came down again" — put one
+                    // instance's level beside another's. The pid travels with the cores so the comparison
+                    // can stop at the boundary.
+                    metrics[$"cpuProcessPid_{process.ProcessName}"] = process.ProcessId;
                 }
 
                 if (attribution.VideoMemory is { } videoMemory)

@@ -1131,7 +1131,8 @@ public sealed record EnvironmentMetadata(
     string ServerProfileName,
     DateTimeOffset SessionStartedAt,
     DateTimeOffset? SessionEndedAt,
-    IReadOnlyList<AttachedDisplay>? Displays = null);
+    IReadOnlyList<AttachedDisplay>? Displays = null,
+    TimeSpan? MachineUptime = null);
 
 /// <summary>One display attached when the session started.</summary>
 /// <remarks>
