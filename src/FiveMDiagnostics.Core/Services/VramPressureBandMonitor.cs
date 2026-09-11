@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Core;
+﻿namespace FiveMDiagnostics.Core;
 
 /// <summary>
 /// Measures how much of a session the card spent inside the VRAM band, and what that band cost.
@@ -125,6 +125,9 @@ public sealed class VramPressureBandMonitor
     private readonly List<(DateTimeOffset At, double FrameTimeMs)> _warmup = new(CadenceWarmupFrames);
     private readonly double _refreshIntervalMs;
 
+    /// <summary>When the game was last seen to go away, while it is still away.</summary>
+    private DateTimeOffset? _gameExitedAt;
+
     private double _hitchThresholdMs;
     private double _peakPercent;
     private int _unpairedFrames;
@@ -150,12 +153,37 @@ public sealed class VramPressureBandMonitor
     {
         lock (_sync)
         {
+            // Cleared before the repeat guard: a restart inside the tail is the same start told again
+            // for this list, but it is still the moment the card goes back to being measured.
+            _gameExitedAt = null;
+
             if (_gameStarts.Count > 0 && (at - _gameStarts[^1]).Duration() < TimeSpan.FromMinutes(1))
             {
                 return;
             }
 
             _gameStarts.Add(at);
+        }
+    }
+
+    /// <summary>
+    /// Notes that the game has gone, so the minutes measured after it stay out of the session's figures.
+    /// </summary>
+    /// <remarks>
+    /// The adapter is deliberately sampled for ten minutes after the game exits — that tail is the one
+    /// measurement saying whose memory the card was full of — but those readings are not the evening.
+    /// Counted here they grow the denominator under every share below, and in the case the tail exists
+    /// for, a card still held at 89 % after the exit, they grow the numerator too: ten minutes in which
+    /// nobody played, reported as band pressure on the evening conclusions are drawn from. They would
+    /// also land in "drift" rather than in loading, which is the figure whose own sentence says it can be
+    /// compared with another evening's — and since an evening that ends with the machine switched off
+    /// produces no tail at all, that comparison would turn on how each evening happened to end.
+    /// </remarks>
+    public void NoteGameExit(DateTimeOffset at)
+    {
+        lock (_sync)
+        {
+            _gameExitedAt = at;
         }
     }
 
@@ -169,6 +197,14 @@ public sealed class VramPressureBandMonitor
 
         lock (_sync)
         {
+            // The reading's own timestamp rather than a flag, because the exit is noticed on the UI timer
+            // while the readings arrive on the pump: a reading taken before the game went away still
+            // belongs to the evening even when it is handed over after.
+            if (_gameExitedAt is { } exited && sample.Timestamp > exited)
+            {
+                return;
+            }
+
             _readings.Add(new Reading(sample.Timestamp, percent));
             _peakPercent = Math.Max(_peakPercent, percent);
             DrainPending(final: false);

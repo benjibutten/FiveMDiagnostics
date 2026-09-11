@@ -14,7 +14,7 @@ using FiveMDiagnostics.Core;
 /// noticed until four evenings were compared by hand.
 /// </para>
 /// <para>
-/// <c>F:</c>, where the game actually lives, is the control: 377 windows across four evenings, median
+/// <c>F:</c>, where the game actually lives, is the control: 377 readings across four evenings, median
 /// 13.2–13.8 ms, worst ever 17.1. Slow and utterly steady. Any rule that calls that a fault is useless.
 /// </para>
 /// </remarks>
@@ -25,10 +25,10 @@ public sealed class DiskLatencyMonitorTests
     {
         var monitor = new DiskLatencyMonitor();
 
-        // The evening as measured: F: slowest in forty-seven windows, never above 15.8 ms.
-        for (var window = 0; window < 47; window++)
+        // The evening as measured: F: slowest in forty-seven polling samples, never above 15.8 ms.
+        for (var reading = 0; reading < 47; reading++)
         {
-            monitor.Observe("2 F:", 12.4 + (window % 7) * 0.5);
+            monitor.Observe("2 F:", 12.4 + (reading % 7) * 0.5);
         }
 
         monitor.Observe("0 D:", 815.9);
@@ -39,7 +39,7 @@ public sealed class DiskLatencyMonitorTests
         Assert.True(report.HasOutlier);
         Assert.Equal("0 D:", Assert.Single(report.Outliers).Volume);
         Assert.Contains("815,9 ms", report.Message, StringComparison.Ordinal);
-        Assert.Contains("47 fönster", report.Message, StringComparison.Ordinal);
+        Assert.Contains("47 mätpunkter", report.Message, StringComparison.Ordinal);
 
         // Spin-up is the likelier reading and is offered as such; the event log is what settles it.
         Assert.Contains("varvar upp", report.Message, StringComparison.Ordinal);
@@ -47,8 +47,8 @@ public sealed class DiskLatencyMonitorTests
     }
 
     /// <summary>
-    /// The mechanical disk the game streams from. Slow every single window, and there is nothing wrong
-    /// with it.
+    /// The mechanical disk the game streams from. Slow in every single reading, and there is nothing
+    /// wrong with it.
     /// </summary>
     [Fact]
     public void ASlowButSteadyVolumeIsNotAnOutlier()

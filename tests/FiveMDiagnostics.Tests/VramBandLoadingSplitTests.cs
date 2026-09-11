@@ -1,4 +1,4 @@
-namespace FiveMDiagnostics.Tests;
+﻿namespace FiveMDiagnostics.Tests;
 
 using FiveMDiagnostics.Core;
 
@@ -155,6 +155,78 @@ public sealed class VramBandLoadingSplitTests
         Assert.NotNull(report);
         Assert.Contains("Bandet kostade ingenting", report.Message, StringComparison.Ordinal);
         Assert.Contains("Det är ett motbevis", report.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The ten minutes the card is measured after the game closes are not minutes of the evening.
+    /// </summary>
+    /// <remarks>
+    /// The tail exists to show what the card gives back, and the case it was built for — memory still
+    /// held at 89 % after the exit — is the one where counting it does the most damage: ten minutes
+    /// nobody played, added to the numerator and the denominator of the share the evening is judged on,
+    /// and filed as drift rather than loading. An evening that ends with the machine switched off
+    /// produces no tail at all, so the figure would also depend on how the evening happened to end.
+    /// </remarks>
+    [Fact]
+    public void TheMinutesAfterTheGameClosesAreNotCounted()
+    {
+        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        monitor.NoteGameStart(Start);
+        Play(monitor, Start, minutes: 30, vramPercent: 70);
+
+        var exited = Start.AddMinutes(30);
+        monitor.NoteGameExit(exited);
+
+        // The card still full, and nothing rendering on it. From the poll after the exit: a reading taken
+        // in the same instant the game went away is still the evening's.
+        Readings(monitor, exited.AddSeconds(5), minutes: 10, vramPercent: 92);
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report);
+        Assert.Equal(30, report.MeasuredMinutes, 1);
+        Assert.Equal(0, report.MinutesInBand, 1);
+        Assert.Equal(70, report.PeakPercent, 1);
+    }
+
+    /// <summary>
+    /// A restart inside the tail is the same evening, and its minutes count again from the moment the
+    /// game is back.
+    /// </summary>
+    [Fact]
+    public void AGameThatComesBackIsMeasuredAgain()
+    {
+        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        monitor.NoteGameStart(Start);
+        Play(monitor, Start, minutes: 30, vramPercent: 70);
+
+        var exited = Start.AddMinutes(30);
+        monitor.NoteGameExit(exited);
+        Readings(monitor, exited.AddSeconds(5), minutes: 5, vramPercent: 92);
+
+        var restarted = exited.AddMinutes(5);
+        monitor.NoteGameStart(restarted);
+        Play(monitor, restarted, minutes: 20, vramPercent: 92);
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report);
+        Assert.Equal(50, report.MeasuredMinutes, 1);
+        Assert.Equal(20, report.MinutesInBand, 1);
+    }
+
+    /// <summary>Adapter readings with no game rendering behind them, which is what the tail is.</summary>
+    private static void Readings(VramPressureBandMonitor monitor, DateTimeOffset from, int minutes, double vramPercent)
+    {
+        for (var minute = 0; minute < minutes; minute++)
+        {
+            var minuteStart = from.AddMinutes(minute);
+
+            for (var reading = 0; reading < 12; reading++)
+            {
+                monitor.Observe(Adapter(minuteStart.AddSeconds(reading * 5), vramPercent));
+            }
+        }
     }
 
     /// <summary>

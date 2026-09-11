@@ -1105,6 +1105,13 @@ public sealed record DiagnosticsSettings
     public AutoDetectOptions AutoDetect { get; set; } = new();
     public FramePacingOptions FramePacing { get; set; } = new();
     public PrivacyOptions Privacy { get; set; } = new();
+
+    /// <summary>
+    /// Whether the session follows the game: started when FiveM appears, ended once it has stayed gone
+    /// for <see cref="PostGameWindow.Duration"/>. Off leaves both ends to the buttons.
+    /// </summary>
+    public bool AutoSession { get; set; } = true;
+
     public string Language { get; set; } = "en";
 
     public static DiagnosticsSettings CreateDefault()
@@ -1176,6 +1183,12 @@ public sealed record ProcessActivity(
     long IoBytesPerSecond,
     bool IsSystemService = false);
 
+/// <param name="ObservedSamples">
+/// How many distinct samples the name appeared in at all, however many processes carried it in each.
+/// It is the tie-break under the ranking score, where it stands for "seen throughout" rather than "seen
+/// once": a name counted per row instead would rank a process that runs in four instances above one that
+/// was busy for four times as long.
+/// </param>
 /// <param name="IsSystemService">
 /// True when the row came from outside the interactive session. Carried through to the text because
 /// "close it" is not the advice for a service, and because a reader who cannot find the process in the

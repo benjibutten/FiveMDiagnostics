@@ -260,7 +260,8 @@
                                 </StackPanel>
                             </Expander>
 
-                            <CheckBox Content="{x:Static props:Strings.AutoDetectEnabled}" IsChecked="{Binding AutoDetectEnabled}" Margin="0,12,0,0" />
+                            <CheckBox Content="{x:Static props:Strings.AutoSessionEnabled}" IsChecked="{Binding AutoSessionEnabled}" Margin="0,12,0,0" />
+                            <CheckBox Content="{x:Static props:Strings.AutoDetectEnabled}" IsChecked="{Binding AutoDetectEnabled}" />
                             <CheckBox Content="{x:Static props:Strings.CaptureNormalManualIncidents}" IsChecked="{Binding CaptureNormalManualIncidents}" />
                             <CheckBox Content="{x:Static props:Strings.IncludeSensitiveFields}" IsChecked="{Binding IncludeSensitiveFields}" Margin="0,12,0,0" />
                             <CheckBox Content="{x:Static props:Strings.IncludeAttachedArtifacts}" IsChecked="{Binding IncludeAttachedArtifacts}" />

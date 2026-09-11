@@ -14,10 +14,17 @@ namespace FiveMDiagnostics.Core;
 /// on 9 September, each in its own incident, each unremarked.
 /// </para>
 /// <para>
-/// So the summary is per volume rather than per window. A volume that is slowest in every window at 13
-/// ms is a slow disk doing its job; a volume that is slowest in one window out of fifty-three, at fifty
-/// times any other volume's worst, is something else — and the difference is invisible until the two are
-/// written on the same line.
+/// So the summary is per volume rather than per reading. A volume that is slowest in every reading at
+/// 13 ms is a slow disk doing its job; a volume that is slowest in one reading out of fifty-three, at
+/// fifty times any other volume's worst, is something else — and the difference is invisible until the
+/// two are written on the same line.
+/// </para>
+/// <para>
+/// The tally counts polling samples, not incidents: <see cref="Observe"/> is called once per system
+/// poll, which is every 750 ms, so an evening produces thousands of readings and a volume's count says
+/// how much of the session it was the slowest disk — not how many times something happened to it. The
+/// count was called "windows" and read as one incident apiece, which made "slowest in 4 812 windows"
+/// look like an alarm when it is a quiet disk answering in 13 ms for an hour.
 /// </para>
 /// <para>
 /// The warning it raises is deliberately careful about what it claims. An idle mechanical disk parks its
@@ -50,13 +57,13 @@ public sealed class DiskLatencyMonitor
     /// </remarks>
     private const double OutlierFloorMs = 100;
 
-    /// <summary>Readings below this are not worth keeping as the window's worst.</summary>
+    /// <summary>Readings below this are not worth keeping as a sample's worst.</summary>
     private const double IgnoreBelowMs = 0.01;
 
     private readonly object _sync = new();
     private readonly Dictionary<string, List<double>> _byVolume = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>Folds in one window's slowest volume and what it answered in.</summary>
+    /// <summary>Folds in one polling sample's slowest volume and what it answered in.</summary>
     public void Observe(string? volume, double? latencyMs)
     {
         if (string.IsNullOrWhiteSpace(volume) || latencyMs is not { } latency || latency < IgnoreBelowMs)
@@ -107,16 +114,20 @@ public sealed class DiskLatencyMonitor
     /// Whether a volume answered far slower than it usually does, slowly enough to matter.
     /// </summary>
     /// <remarks>
-    /// A volume seen only once has no history to be measured against, so its worst is compared with the
+    /// A volume read only once has no history to be measured against, so its worst is compared with the
     /// floor alone — which is the case that matters, since a disk that woke up once is exactly that.
     /// </remarks>
     private static bool IsOutlier(DiskVolumeLatency volume) =>
         volume.WorstMs >= OutlierFloorMs
-        && (volume.Windows == 1 || volume.WorstMs >= volume.MedianMs * OutlierRatio);
+        && (volume.Readings == 1 || volume.WorstMs >= volume.MedianMs * OutlierRatio);
 }
 
-/// <param name="Windows">How many windows this volume was the slowest disk in.</param>
-public sealed record DiskVolumeLatency(string Volume, int Windows, double MedianMs, double WorstMs);
+/// <param name="Readings">
+/// How many polling samples this volume was the slowest disk in. Samples, not incidents: the system
+/// poll runs every 750 ms, so this is roughly how much of the session the volume spent as the slowest
+/// disk.
+/// </param>
+public sealed record DiskVolumeLatency(string Volume, int Readings, double MedianMs, double WorstMs);
 
 /// <param name="Outliers">Volumes whose worst reading stands far outside their own behaviour.</param>
 public sealed record DiskLatencyReport(
@@ -132,7 +143,7 @@ public sealed record DiskLatencyReport(
             var tally = string.Join(
                 "; ",
                 Volumes.Select(volume =>
-                    $"{volume.Volume} var långsammast i {volume.Windows} fönster "
+                    $"{volume.Volume} var långsammast i {volume.Readings} mätpunkter "
                     + $"(median {volume.MedianMs:F1} ms, värsta {volume.WorstMs:F1})"));
 
             var warning = HasOutlier

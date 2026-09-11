@@ -1,4 +1,4 @@
-# Roadmap
+﻿# Roadmap
 
 ## v1
 
@@ -7,6 +7,7 @@
 - system/process/network telemetry
 - OBS integration via websocket
 - WPF tray app with hotkeys
+- session started and ended by the game process, on by default
 - ring buffer and incident materialization
 - ZIP export with redaction defaults
 - fake scenarios and acceptance tests

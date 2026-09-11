@@ -16,6 +16,9 @@ public sealed class MainWindowViewModel : ObservableObject
     private const int MaxStatusEntries = 100;
     private const int MaxStatusEntriesPerFlush = 12;
 
+    /// <summary>Status source for everything the session automation says, so the journal groups it.</summary>
+    private const string AutoSessionSource = "Session.Auto";
+
     private readonly DiagnosticsSessionManager _sessionManager;
     private readonly SettingsStore _settingsStore;
     private readonly IUserDialogService _dialogService;
@@ -39,6 +42,22 @@ public sealed class MainWindowViewModel : ObservableObject
     private DateTimeOffset _alertsValidFrom = DateTimeOffset.MinValue;
     private bool _acceptSessionAlerts;
     private readonly HashSet<Guid> _pendingIncidentIds = [];
+
+    /// <summary>
+    /// Decides whether the game's presence should start or end the session.
+    /// </summary>
+    /// <remarks>
+    /// Here rather than in the session manager because it acts through
+    /// <see cref="StartSessionAsync"/> and <see cref="StopSessionAsync"/>, which do the alert-boundary
+    /// work around the manager's own start and stop. A manager that started itself would bypass that,
+    /// and the banner would carry the previous evening's warnings into the new session.
+    /// </remarks>
+    private readonly AutoSessionPolicy _autoSession = new();
+
+    /// <summary>Set while a start or stop this policy asked for is still running.</summary>
+    private bool _autoSessionBusy;
+    private DateTimeOffset _lastAutoSessionCheckUtc = DateTimeOffset.MinValue;
+    private bool _autoSessionEnabled;
 
     private IncidentRecord? _selectedIncident;
     private bool _isSessionActive;
@@ -96,11 +115,12 @@ public sealed class MainWindowViewModel : ObservableObject
         _includeSensitiveFields = settings.Privacy.IncludeSensitiveFieldsInExport;
         _includeAttachedArtifacts = settings.Privacy.IncludeAttachedArtifactsInExport;
         _autoDetectEnabled = settings.AutoDetect.Enabled;
+        _autoSessionEnabled = settings.AutoSession;
         _captureNormalManualIncidents = settings.DeepCapture.CaptureNormalManualIncidents;
         _selectedLanguage = settings.Language;
 
         StartSessionCommand = new AsyncRelayCommand(StartSessionAsync, () => !IsSessionActive);
-        StopSessionCommand = new AsyncRelayCommand(StopSessionAsync, () => IsSessionActive);
+        StopSessionCommand = new AsyncRelayCommand(StopSessionManuallyAsync, () => IsSessionActive);
         SaveSettingsCommand = new AsyncRelayCommand(SaveSettingsAsync);
         ImportArtifactsCommand = new AsyncRelayCommand(ImportArtifactsAsync);
         ExportSelectedIncidentCommand = new AsyncRelayCommand(ExportSelectedIncidentAsync, () => SelectedIncident is not null || _sessionManager.LatestIncident is not null);
@@ -139,6 +159,12 @@ public sealed class MainWindowViewModel : ObservableObject
         CaptureFeedbackText = Strings.CaptureFeedbackHint;
         RefreshState();
     }
+
+    /// <summary>
+    /// Something the tray should say out loud, because the window is usually not on screen when the
+    /// session automation acts.
+    /// </summary>
+    public event EventHandler<string>? TrayNoticeRequested;
 
     public DiagnosticsSettings Settings { get; }
 
@@ -183,8 +209,10 @@ public sealed class MainWindowViewModel : ObservableObject
     }
 
     public string SessionStateText => IsSessionActive
-        ? IsReadyForIncident ? Strings.SessionReady : Strings.SessionWarmingUp
-        : Strings.SessionIdle;
+        ? _autoSession.InPostGameTail
+            ? Strings.SessionPostGameTail
+            : IsReadyForIncident ? Strings.SessionReady : Strings.SessionWarmingUp
+        : AutoSessionEnabled ? Strings.SessionIdleAuto : Strings.SessionIdle;
 
     public bool IsReadyForIncident
     {
@@ -425,6 +453,24 @@ public sealed class MainWindowViewModel : ObservableObject
         }
     }
 
+    public bool AutoSessionEnabled
+    {
+        get => _autoSessionEnabled;
+        set
+        {
+            if (SetProperty(ref _autoSessionEnabled, value))
+            {
+                Settings.AutoSession = value;
+
+                // The policy only maintains its state while it is being asked for decisions, so anything
+                // it was holding when the toggle went off describes an evening nobody is following any
+                // more.
+                _autoSession.Reset();
+                OnPropertyChanged(nameof(SessionStateText));
+            }
+        }
+    }
+
     public bool CaptureNormalManualIncidents
     {
         get => _captureNormalManualIncidents;
@@ -504,6 +550,20 @@ public sealed class MainWindowViewModel : ObservableObject
 
         await _dispatcher.InvokeAsync(RefreshState, DispatcherPriority.Background);
         CaptureFeedbackText = Strings.CaptureFeedbackSessionStarted;
+    }
+
+    /// <summary>
+    /// Stops the session and keeps it stopped while this game keeps running.
+    /// </summary>
+    /// <remarks>
+    /// The only difference from <see cref="StopSessionAsync"/>, and the reason the button goes through
+    /// here: without the suppression the automation would start a new session a second later, and Stop
+    /// would be a button that flickers the session rather than one that ends it.
+    /// </remarks>
+    private async Task StopSessionManuallyAsync()
+    {
+        _autoSession.SuppressFor(_sessionManager.ActiveProcess);
+        await StopSessionAsync().ConfigureAwait(false);
     }
 
     private async Task StopSessionAsync()
@@ -804,6 +864,90 @@ public sealed class MainWindowViewModel : ObservableObject
         }));
     }
 
+    /// <summary>
+    /// Lets the game process start and end the session.
+    /// </summary>
+    /// <remarks>
+    /// On the UI timer rather than on a timer of its own: the process resolver caches its scan, so this
+    /// is a field comparison on most ticks, and once a second is fast enough for a decision whose
+    /// shortest interesting interval is ten minutes.
+    /// </remarks>
+    private void CheckAutoSession()
+    {
+        if (!AutoSessionEnabled || _autoSessionBusy)
+        {
+            return;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        if (now - _lastAutoSessionCheckUtc < TimeSpan.FromSeconds(1))
+        {
+            return;
+        }
+
+        _lastAutoSessionCheckUtc = now;
+        var game = _sessionManager.ActiveProcess;
+        var action = _autoSession.Evaluate(_sessionManager.IsSessionActive, game, now);
+        if (action == AutoSessionAction.None)
+        {
+            return;
+        }
+
+        _autoSessionBusy = true;
+        _ = RunAutoSessionAsync(action, game);
+    }
+
+    private async Task RunAutoSessionAsync(AutoSessionAction action, TargetProcessInfo? game)
+    {
+        try
+        {
+            if (action == AutoSessionAction.Start)
+            {
+                await StartSessionAsync().ConfigureAwait(true);
+
+                // After the start rather than before it. The journal opens with the session, and a line
+                // reported a moment earlier would be written into the evening that has already ended.
+                _sessionManager.Report(StatusLevel.Info, AutoSessionSource, Strings.AutoSessionStarted);
+            }
+            else
+            {
+                // Before the stop, so the reason this evening ended is in the journal about to close.
+                _sessionManager.Report(
+                    StatusLevel.Info,
+                    AutoSessionSource,
+                    string.Format(Strings.AutoSessionStoppedFormat, PostGameWindow.Duration.TotalMinutes));
+
+                await StopSessionAsync().ConfigureAwait(true);
+
+                // The one notice worth interrupting for, and the only one raised on the way out: it says
+                // the evening is complete on disk. The start has no notice — the window and the tray menu
+                // both show it, and it would arrive while the game is still loading, over the game.
+                TrayNoticeRequested?.Invoke(this, Strings.TrayAutoSessionStopped);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Suppressed rather than retried. A start that fails for this game will fail again a second
+            // later, and the evening would end with a status list of nothing else. Said out loud as well,
+            // because the window is usually in the tray and a silent failure costs the whole evening.
+            //
+            // A failed stop carries no game — the game is what went away — so this is the full reset: the
+            // session stays running and nothing tries to end it again until the game has been seen once
+            // more. That is the message the user is given, and the button is the way out of it.
+            _autoSession.SuppressFor(game);
+            var message = string.Format(
+                action == AutoSessionAction.Start ? Strings.AutoSessionStartFailedFormat : Strings.AutoSessionStopFailedFormat,
+                ex.Message);
+
+            _sessionManager.Report(StatusLevel.Error, AutoSessionSource, message);
+            TrayNoticeRequested?.Invoke(this, message);
+        }
+        finally
+        {
+            _autoSessionBusy = false;
+        }
+    }
+
     private void RefreshState()
     {
         var wasActive = IsSessionActive;
@@ -823,6 +967,15 @@ public sealed class MainWindowViewModel : ObservableObject
         ActiveProcessText = _sessionManager.ActiveProcess is { } process
             ? $"{process.ProcessName} (PID {process.ProcessId})"
             : Strings.WaitingForProcess;
+
+        // The per-process table is anchored on the game and stops with it, while the adapter figure
+        // beside it keeps reading through the tail. Left alone, the header would name a process that no
+        // longer exists as the card's largest holder, next to a live percentage falling away from it.
+        if (IsSessionActive && _autoSession.InPostGameTail)
+        {
+            LiveVramOwnersText = Strings.LiveStatsIdle;
+            LiveVramRows.Clear();
+        }
 
         if (!IsSessionActive)
         {
@@ -870,6 +1023,7 @@ public sealed class MainWindowViewModel : ObservableObject
     private void FlushUiUpdates()
     {
         FlushPendingStatusEntries();
+        CheckAutoSession();
 
         if (!_stateRefreshPending && (!_sessionManager.IsSessionActive || DateTimeOffset.UtcNow - _lastStateRefreshUtc < TimeSpan.FromSeconds(1)))
         {

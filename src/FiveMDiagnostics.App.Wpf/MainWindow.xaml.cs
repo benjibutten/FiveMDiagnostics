@@ -34,6 +34,8 @@ public partial class MainWindow : Window
         _trayIconService.CheckForUpdatesRequested += async (_, _) => await UpdateCoordinator.CheckAsync(this, manual: true);
         _trayIconService.ExitRequested += (_, _) => ExitApplication();
 
+        _viewModel.TrayNoticeRequested += OnTrayNoticeRequested;
+
         _viewModel.StartSessionCommand.CanExecuteChanged += OnCommandAvailabilityChanged;
         _viewModel.StopSessionCommand.CanExecuteChanged += OnCommandAvailabilityChanged;
         _viewModel.MarkStutterCommand.CanExecuteChanged += OnCommandAvailabilityChanged;
@@ -68,6 +70,7 @@ public partial class MainWindow : Window
 
     private void OnClosed(object? sender, EventArgs e)
     {
+        _viewModel.TrayNoticeRequested -= OnTrayNoticeRequested;
         _viewModel.StartSessionCommand.CanExecuteChanged -= OnCommandAvailabilityChanged;
         _viewModel.StopSessionCommand.CanExecuteChanged -= OnCommandAvailabilityChanged;
         _viewModel.MarkStutterCommand.CanExecuteChanged -= OnCommandAvailabilityChanged;
@@ -121,6 +124,11 @@ public partial class MainWindow : Window
     /// only hid itself would leave it waiting forever.
     /// </summary>
     public void ExitForUpdate() => ExitApplication();
+
+    private void OnTrayNoticeRequested(object? sender, string message)
+    {
+        _trayIconService.ShowBalloon(Strings.AppTitle, message);
+    }
 
     private void OnCommandAvailabilityChanged(object? sender, EventArgs e)
     {

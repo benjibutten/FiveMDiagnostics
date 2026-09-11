@@ -170,11 +170,38 @@ public sealed class GpuResidencyStallTests
         Assert.Contains(residency.Evidence, item => item.Contains("får inte bli dom", StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// A card nobody measured is not a card measured below the band.
+    /// </summary>
+    /// <remarks>
+    /// The run-up's peak was zero-filled when no VRAM reading fell inside it, so an incident with the
+    /// memory column missing — NVML not answering, a driver restart, the counter simply absent — read as
+    /// a card measured at 0.0 %. That is below the band, so the verdict wrote "kortet låg bara på 0,0 %
+    /// … det här var inte minnestryck" and held itself under the classification floor, dismissing memory
+    /// pressure on a number nobody took. Unmeasured has to say unmeasured.
+    /// </remarks>
+    [Fact]
+    public void AMissingVramColumnIsNotACardMeasuredBelowTheBand()
+    {
+        var analysis = new FiveMCorrelationEngine().Analyze(Incident(vramMeasured: false));
+
+        var residency = analysis.Hypotheses.Single(item => item.Category == RootCauseCategory.GpuResidencyStall);
+
+        // The stopped card and the driver module are still worth what they are worth; only the VRAM
+        // bonus is missing, and the below-the-band floor must not apply.
+        Assert.True(residency.Confidence >= 0.7, $"expected the stopped card to still count, got {residency.Confidence:F2}");
+
+        Assert.Contains(residency.Evidence, item => item.Contains("Ingen VRAM-mätning", StringComparison.Ordinal));
+        Assert.DoesNotContain(residency.Evidence, item => item.Contains("0,0 %", StringComparison.Ordinal));
+        Assert.DoesNotContain(residency.Evidence, item => item.Contains("inte minnestryck", StringComparison.Ordinal));
+    }
+
     private static IncidentRecord Incident(
         double? stalledBandwidthPercent = 0,
         double busyUtilizationPercent = 44,
         bool withTrace = true,
-        double vramShiftPercentPoints = 0)
+        double vramShiftPercentPoints = 0,
+        bool vramMeasured = true)
     {
         var events = new List<TelemetryEvent>();
 
@@ -207,7 +234,7 @@ public sealed class GpuResidencyStallTests
                 at,
                 utilizationPercent: stopped ? 2 : busyUtilizationPercent,
                 bandwidthPercent: stopped ? stalledBandwidthPercent : 14,
-                vramPercent: vramPercent - vramShiftPercentPoints));
+                vramPercent: vramMeasured ? vramPercent - vramShiftPercentPoints : null));
         }
 
         if (withTrace)
@@ -263,11 +290,12 @@ public sealed class GpuResidencyStallTests
             });
     }
 
+    /// <param name="vramPercent">Null for a reading the memory column is missing from.</param>
     private static GpuTelemetrySample Adapter(
         DateTimeOffset at,
         double utilizationPercent,
         double? bandwidthPercent,
-        double vramPercent)
+        double? vramPercent)
     {
         const ulong Total = 10UL * 1024 * 1024 * 1024;
 
@@ -277,7 +305,7 @@ public sealed class GpuResidencyStallTests
             "NVIDIA GeForce RTX 3080",
             utilizationPercent,
             bandwidthPercent,
-            (ulong)(Total * vramPercent / 100),
+            vramPercent is { } percent ? (ulong)(Total * percent / 100) : null,
             Total,
             EncoderUtilizationPercent: utilizationPercent < 5 ? 0 : 34,
             DecoderUtilizationPercent: 0,

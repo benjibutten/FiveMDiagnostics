@@ -1032,8 +1032,12 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
                 && at - sample.Timestamp <= ResidencyRunUp)
             .Select(sample => sample.VramUsagePercent!.Value)
             .ToArray();
-        var peakVram = runUp.DefaultIfEmpty(0).Max();
-        var risePercent = runUp.Length > 0 ? peakVram - runUp.Min() : 0;
+        // Nullable rather than zero-filled. DefaultIfEmpty(0) turned a run-up with no VRAM reading in
+        // it into a measured 0 %, and the verdict below then dismissed memory pressure — "kortet låg bara
+        // på 0,0 %" — on the strength of a number nobody took. Unmeasured and measured-below-the-band are
+        // different claims and have to be written, and weighted, differently.
+        double? peakVram = runUp.Length > 0 ? runUp.Max() : null;
+        var risePercent = peakVram is { } highest ? highest - runUp.Min() : 0;
 
         // "Sits at or above" the band, not "crossed into it during the run-up": the card can arrive at the
         // frame already having spent several seconds above the line, which is exactly what the 8 September
@@ -1066,7 +1070,16 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
                     + "still har ingen — det är den siffran som skiljer en överbelastad GPU från en stannad.",
         };
 
-        if (vramInBand)
+        if (peakVram is null)
+        {
+            // No bonus and no penalty: the run-up carries no VRAM reading, so this incident says nothing
+            // either way about memory pressure. The stopped card below still stands on its own figures.
+            evidence.Add(
+                $"Ingen VRAM-mätning finns i de {ResidencyRunUp.TotalSeconds:F0} sekunderna före framen, så "
+                + "hur fullt kortet var går inte att säga. Minnestryck är varken bekräftat eller avfärdat "
+                + "här — resten av posten vilar på att kortet slutade räkna.");
+        }
+        else if (vramInBand)
         {
             confidence += 0.2;
             var rise = risePercent >= 0.5
@@ -1106,12 +1119,23 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
                 + "ut från processorns håll.");
         }
 
-        evidence.Add(
-            "Åtgärden är att ta minne av kortet — texturbudgeten, webbkällor, ett fönster mindre — inte "
-            + "att leta efter en process som växer. Ingen enskild process gjorde något fel; de fick "
-            + "tillsammans inte plats.");
+        // The advice follows from the card having been full, which is precisely what the two branches
+        // above decline to say. Written unconditionally it stood in the same post as "det här var inte
+        // minnestryck" and "varken bekräftat eller avfärdat", telling the reader to act on a mechanism the
+        // post had just refused to name.
+        evidence.Add(vramInBand
+            ? "Åtgärden är att ta minne av kortet — texturbudgeten, webbkällor, ett fönster mindre — inte "
+                + "att leta efter en process som växer. Ingen enskild process gjorde något fel; de fick "
+                + "tillsammans inte plats."
+            : "Vad som ska göras åt det här följer inte av posten: kortet mättes inte över bandet, och att "
+                + "ta minne av det hjälper bara om det var fullt. Kvällens bandandel i "
+                + "sessionssammanfattningen är siffran att gå på — den här posten säger att kortet slutade "
+                + "räkna, inte varför.");
 
-        var ceiling = vramInBand ? 0.95 : BelowBandResidencyCeiling;
+        // The floor applies to a card measured below the band, not to one nobody measured: capping an
+        // unmeasured incident would dismiss memory pressure on absent data, which is the same mistake in
+        // the other direction.
+        var ceiling = vramInBand || peakVram is null ? 0.95 : BelowBandResidencyCeiling;
         hypotheses.Add(new HypothesisScore(RootCauseCategory.GpuResidencyStall, Math.Min(confidence, ceiling), evidence));
     }
 
@@ -2885,40 +2909,56 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
     /// The neighbouring programs worth naming, one row per program rather than one per process.
     /// </summary>
     /// <remarks>
-    /// Peaks are taken per process id first, because a program's cost is the sum of its processes and not
-    /// the cost of whichever one happened to be sampled highest — and then folded by name, because the
-    /// reader acts on a program. Chromium-based programs make the difference visible: FiveM's NUI layer
-    /// runs several processes all called <c>FiveM_ChromeBrowser</c>, and on 10 September four incidents
-    /// named it twice with two different figures and, in one case, the same sentence printed twice. A
-    /// list that contradicts itself in two adjacent rows is not one anybody can rank by hand, and the
-    /// tally that watches for a process named in nearly every incident counts these rows.
+    /// <para>
+    /// The instances of a program are summed inside one sample, where they really did run at the same
+    /// time, and the peak is then taken across samples — because a program's cost is the sum of its
+    /// processes and not the cost of whichever one happened to be sampled highest. Summing each
+    /// instance's own peak instead added up loads from different moments: a helper that spiked at
+    /// 23:47:09 and another that spiked at 23:47:21 were reported as one program holding both at once,
+    /// which is a figure the machine never saw and a ranking the reader cannot act on.
+    /// </para>
+    /// <para>
+    /// Folded by name at the end, because the reader acts on a program. Chromium-based programs make the
+    /// difference visible: FiveM's NUI layer runs several processes all called
+    /// <c>FiveM_ChromeBrowser</c>, and on 10 September four incidents named it twice with two different
+    /// figures and, in one case, the same sentence printed twice. A list that contradicts itself in two
+    /// adjacent rows is not one anybody can rank by hand, and the tally that watches for a process named
+    /// in nearly every incident counts these rows.
+    /// </para>
     /// </remarks>
     private static IReadOnlyList<SuspectedProcessImpact> AnalyzeSuspiciousProcesses(IReadOnlyList<SystemTelemetrySample> systemSamples)
     {
         var cpuFloor = SuspectCpuFloorPercent(systemSamples);
 
-        return systemSamples
-            .SelectMany(item => item.TopCpuProcesses.Concat(item.TopDiskProcesses))
-            .Where(item => IsRelevantExternalProcess(item.ProcessName))
-            .GroupBy(item => (item.ProcessName, item.ProcessId))
-            .Select(group => new
-            {
-                group.Key.ProcessName,
-                group.Key.ProcessId,
-                PeakCpu = group.Max(entry => entry.CpuPercent),
-                PeakIo = group.Max(entry => ToMegabytes(entry.IoBytesPerSecond)),
-                Samples = group.Count(),
-                IsService = group.Any(entry => entry.IsSystemService),
-            })
+        var perInstance = systemSamples
+            .SelectMany(sample => sample.TopCpuProcesses
+                .Concat(sample.TopDiskProcesses)
+                .Where(row => IsRelevantExternalProcess(row.ProcessName))
+
+                // One process id is one process however many of the two lists it turned up in.
+                .GroupBy(row => row.ProcessId)
+                .Select(rows => new
+                {
+                    sample.Timestamp,
+                    rows.First().ProcessName,
+                    ProcessId = rows.Key,
+                    Cpu = rows.Max(row => row.CpuPercent),
+                    Io = rows.Max(row => ToMegabytes(row.IoBytesPerSecond)),
+                    IsService = rows.Any(row => row.IsSystemService),
+                }))
+            .ToArray();
+
+        return perInstance
             .GroupBy(instance => instance.ProcessName, StringComparer.OrdinalIgnoreCase)
             .Select(byName =>
             {
-                // Summed across instances: two renderer processes holding a tenth of the machine each
-                // cost the machine a fifth, and that is the figure the reader is deciding on.
-                var peakCpu = Math.Round(byName.Sum(instance => instance.PeakCpu), 1);
-                var peakIoMegabytes = Math.Round(byName.Sum(instance => instance.PeakIo), 1);
-                var busiest = byName.OrderByDescending(instance => instance.PeakCpu).First();
-                var instances = byName.Count();
+                var perSample = byName.GroupBy(instance => instance.Timestamp).ToArray();
+                var busiestSample = perSample.MaxBy(sample => sample.Sum(instance => instance.Cpu))!;
+
+                var peakCpu = Math.Round(busiestSample.Sum(instance => instance.Cpu), 1);
+                var peakIoMegabytes = Math.Round(perSample.Max(sample => sample.Sum(instance => instance.Io)), 1);
+                var busiest = byName.OrderByDescending(instance => instance.Cpu).First();
+                var instances = busiestSample.Count();
 
                 var reason = DescribeProcessReason(byName.Key, peakCpu, peakIoMegabytes)
                     + (instances > 1 ? $" ({instances} processer med samma namn, summerade)" : string.Empty);
@@ -2932,7 +2972,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
                         busiest.ProcessId,
                         peakCpu,
                         peakIoMegabytes,
-                        byName.Max(instance => instance.Samples),
+                        perSample.Length,
                         reason,
                         byName.Any(instance => instance.IsService)),
                     Score = SuspectScore(byName.Key, peakCpu, peakIoMegabytes),

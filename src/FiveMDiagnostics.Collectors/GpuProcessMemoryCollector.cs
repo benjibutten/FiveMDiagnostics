@@ -65,6 +65,12 @@ public sealed class GpuProcessMemoryCollector : ITelemetryCollector
 
         while (!cancellationToken.IsCancellationRequested)
         {
+            // Stops with the game, unlike the adapter poll, which keeps reading through the post-game
+            // window. The table is anchored on the adapter the game holds memory on, and with the game
+            // gone there is no anchor: the fallback picks the adapter with the largest total, which is
+            // exactly what a capture program's cross-adapter instance sum wins — the obs64 row that
+            // stood at 213 GB on a 10 GB card in 145 incident reports. A table that cannot be anchored
+            // is not worth the minutes it would describe.
             if (context.ProcessResolver.TryGetTargetProcess() is { } target)
             {
                 var sample = Sample(context, probe, target.ProcessId);

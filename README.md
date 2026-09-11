@@ -1,4 +1,4 @@
-# FiveM Diagnostics
+﻿# FiveM Diagnostics
 
 FiveM Diagnostics is a Windows-only WPF desktop app for collecting local evidence around intermittent FiveM stutter incidents and ranking likely root causes.
 
@@ -9,6 +9,7 @@ The collection and analysis pipeline is designed to be generic and work with any
 - WPF desktop app with tray mode
 - MVVM-based UI with tray context menu controls
 - Background collectors that only sample while a FiveM/GTA process is active
+- The session follows the game process by default: started when FiveM appears, ended ten minutes after it goes away
 - Ring buffer retention of at least 90 seconds in memory
 - Incident materialization with 30 seconds before and 60 seconds after a marker
 - Automatic incident marking when a frame crosses a relative stutter threshold, so an unattended session still produces evidence
@@ -446,6 +447,7 @@ The UI lets you edit:
 - optional ping host/IP for lightweight RTT probing
 - optional endpoint label for detected connections
 - language
+- whether the session starts and stops with FiveM (on by default; see below)
 - advanced PresentMon/path settings when needed
 - export redaction toggles
 
@@ -807,6 +809,29 @@ All setup fields are optional. The app can start a session with the default path
 - right-click the tray icon to start or stop a session
 - right-click the tray icon to mark normal or severe stutter while a session is active
 - right-click the tray icon to export the latest incident or reopen the main window
+
+## The session follows the game
+
+`AutoSession` is **on by default**. The session starts when the FiveM game process appears and ends
+itself once that process has been gone for ten minutes; the checkbox *Start and stop the session with
+FiveM* turns it off and leaves both ends to the buttons.
+
+It is a default rather than an option because the evidence is what depends on it: this machine is
+switched off with the session still running, so the closing summaries and the journal's `session-end`
+line were written on a minority of evenings. It also decides what a session *is* — the unit every
+per-session share below is divided by, and the unit two evenings are compared on. Worth knowing:
+
+- **The game process, not the app.** A session carries a snapshot taken when it opens — machine uptime,
+  whether OBS was up, the graphics settings, the displays — and one that began at boot answers all of
+  those about the wrong moment. It would also leave WPR's ring buffer recording all day.
+- **A restart inside the ten minutes is the same evening**, so a night the game crashed twice reads as
+  one session rather than three. Everything measured per process is still two series across that line,
+  and the journal says so.
+- **The ten minutes are measured but not counted**: the card is still sampled, because what is held
+  after the game exits is what the game was not holding, and those readings go to the GPU CSV and to the
+  post-game release figure. They are kept out of the session's own band share.
+- **Stopping by hand stays stopped** while that game keeps running; closing or restarting it arms the
+  automation again.
 
 ## Session journal
 

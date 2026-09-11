@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <root>
   <xsd:schema id="root" xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata">
     <xsd:element name="root" msdata:IsDataSet="true">
@@ -98,6 +98,11 @@
   <data name="ExportDirectory" xml:space="preserve"><value>Exportkatalog</value></data>
   <data name="ArtifactDirectory" xml:space="preserve"><value>Artefaktkatalog</value></data>
   <data name="AutoDetectEnabled" xml:space="preserve"><value>Markera stutter automatiskt (utan snabbtangent)</value></data>
+  <data name="AutoSessionEnabled" xml:space="preserve"><value>Starta och avsluta sessionen med FiveM</value></data>
+  <data name="AutoSessionStarted" xml:space="preserve"><value>FiveM hittades — sessionen startade automatiskt.</value></data>
+  <data name="AutoSessionStoppedFormat" xml:space="preserve"><value>Spelet har varit stängt i {0:F0} minuter. Sessionen avslutas automatiskt och sammanfattningarna skrivs till journalen.</value></data>
+  <data name="AutoSessionStartFailedFormat" xml:space="preserve"><value>Sessionen kunde inte startas automatiskt: {0}. Starta den med knappen.</value></data>
+  <data name="AutoSessionStopFailedFormat" xml:space="preserve"><value>Sessionen kunde inte avslutas automatiskt: {0}. Stoppa den med knappen.</value></data>
   <data name="IncludeSensitiveFields" xml:space="preserve"><value>Inkludera känsliga fält i export</value></data>
   <data name="IncludeAttachedArtifacts" xml:space="preserve"><value>Inkludera bifogade artefakter i export</value></data>
   <data name="SaveSettings" xml:space="preserve"><value>Spara inställningar</value></data>
@@ -117,6 +122,7 @@
   <data name="AppHiddenToTrayMessage" xml:space="preserve"><value>Appen gömdes till trayen. Diagnostik kan fortsätta i bakgrunden.</value></data>
   <data name="TraySessionStartingMessage" xml:space="preserve"><value>Session startar i bakgrunden.</value></data>
   <data name="TraySessionStoppedMessage" xml:space="preserve"><value>Session stoppad.</value></data>
+  <data name="TrayAutoSessionStopped" xml:space="preserve"><value>Sessionen avslutades — kvällen är skriven till journalen.</value></data>
   <data name="TrayMarkStutterMessage" xml:space="preserve"><value>Stutter markerad.</value></data>
   <data name="TrayMarkSevereMessage" xml:space="preserve"><value>Allvarlig stutter markerad.</value></data>
   <data name="TrayExportStartingMessage" xml:space="preserve"><value>Exporterar senaste incidenten.</value></data>
@@ -147,6 +153,8 @@
   <data name="CaptureFeedbackWarmingFormat" xml:space="preserve"><value>Väntar på kontinuerliga PresentMon-frames och pre-buffer: {0:F0}/{1:F0} sekunder.</value></data>
   <data name="CaptureNormalManualIncidents" xml:space="preserve"><value>Deep capture för normala manuella markeringar</value></data>
   <data name="SessionIdle" xml:space="preserve"><value>Session inaktiv.</value></data>
+  <data name="SessionIdleAuto" xml:space="preserve"><value>Session inaktiv. Startar av sig själv när FiveM hittas.</value></data>
+  <data name="SessionPostGameTail" xml:space="preserve"><value>Spelet stängdes. Mäter vad kortet släpper.</value></data>
   <data name="WaitingForProcess" xml:space="preserve"><value>Väntar på FiveM/GTA-process</value></data>
   <data name="SelectIncidentHint" xml:space="preserve"><value>Välj en incident för att se sammanfattning och stödjande bevis.</value></data>
   <data name="SettingsSavedFormat" xml:space="preserve"><value>Inställningar sparade till {0}.</value></data>

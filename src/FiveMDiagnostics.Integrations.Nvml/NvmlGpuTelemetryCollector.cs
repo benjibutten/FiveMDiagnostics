@@ -12,6 +12,17 @@ using FiveMDiagnostics.Core;
 public sealed class NvmlGpuTelemetryCollector : ITelemetryCollector, IDisposable
 {
     /// <summary>
+    /// Keeps the card measured for a while after the game closes.
+    /// </summary>
+    /// <remarks>
+    /// The one measurement that says whose memory the card was full of. While the game runs, every
+    /// reading is the game plus everything else together; the minutes after it exits separate them,
+    /// because whatever is still held then is not the game's. It is also the cheapest reading in the
+    /// session — one NVML query twice a second, against a card nothing is rendering on.
+    /// </remarks>
+    private readonly PostGameWindow _postGame = new();
+
+    /// <summary>
     /// Tracked separately from <see cref="_deviceReady"/>: NVML requires every successful init to be
     /// matched by a shutdown, and init can succeed even when the device lookup that follows fails.
     /// </summary>
@@ -37,11 +48,15 @@ public sealed class NvmlGpuTelemetryCollector : ITelemetryCollector, IDisposable
 
         OpenCsvLog(context);
 
+        // The manager holds one collector and runs it again for every session, so a window left open by
+        // the previous evening would sample this one before its game has appeared.
+        _postGame.Reset();
+
         try
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                if (context.ProcessResolver.TryGetTargetProcess() is not null)
+                if (_postGame.IsOpen(context.ProcessResolver.TryGetTargetProcess() is not null, context.UtcNow()))
                 {
                     var sample = Sample(context);
 

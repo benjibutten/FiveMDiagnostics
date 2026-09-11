@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <root>
   <xsd:schema id="root" xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata">
     <xsd:element name="root" msdata:IsDataSet="true">
@@ -98,6 +98,11 @@
   <data name="ExportDirectory" xml:space="preserve"><value>Export directory</value></data>
   <data name="ArtifactDirectory" xml:space="preserve"><value>Artifact directory</value></data>
   <data name="AutoDetectEnabled" xml:space="preserve"><value>Mark stutters automatically (no hotkey needed)</value></data>
+  <data name="AutoSessionEnabled" xml:space="preserve"><value>Start and stop the session with FiveM</value></data>
+  <data name="AutoSessionStarted" xml:space="preserve"><value>FiveM was found — the session started by itself.</value></data>
+  <data name="AutoSessionStoppedFormat" xml:space="preserve"><value>The game has been closed for {0:F0} minutes. The session is ending by itself and the summaries are written to the journal.</value></data>
+  <data name="AutoSessionStartFailedFormat" xml:space="preserve"><value>The session could not be started automatically: {0}. Start it with the button.</value></data>
+  <data name="AutoSessionStopFailedFormat" xml:space="preserve"><value>The session could not be ended automatically: {0}. Stop it with the button.</value></data>
   <data name="IncludeSensitiveFields" xml:space="preserve"><value>Include sensitive fields in export</value></data>
   <data name="IncludeAttachedArtifacts" xml:space="preserve"><value>Include attached artifacts in export</value></data>
   <data name="SaveSettings" xml:space="preserve"><value>Save Settings</value></data>
@@ -117,6 +122,7 @@
   <data name="AppHiddenToTrayMessage" xml:space="preserve"><value>App hidden to tray. Diagnostics can keep running in the background.</value></data>
   <data name="TraySessionStartingMessage" xml:space="preserve"><value>Session starting in the background.</value></data>
   <data name="TraySessionStoppedMessage" xml:space="preserve"><value>Session stopped.</value></data>
+  <data name="TrayAutoSessionStopped" xml:space="preserve"><value>Session ended — the evening is written to the journal.</value></data>
   <data name="TrayMarkStutterMessage" xml:space="preserve"><value>Stutter marked.</value></data>
   <data name="TrayMarkSevereMessage" xml:space="preserve"><value>Severe stutter marked.</value></data>
   <data name="TrayExportStartingMessage" xml:space="preserve"><value>Exporting the latest incident.</value></data>
@@ -147,6 +153,8 @@
   <data name="CaptureFeedbackWarmingFormat" xml:space="preserve"><value>Waiting for continuous PresentMon frames and pre-buffer: {0:F0}/{1:F0} seconds.</value></data>
   <data name="CaptureNormalManualIncidents" xml:space="preserve"><value>Deep capture for normal manual markers</value></data>
   <data name="SessionIdle" xml:space="preserve"><value>Session idle.</value></data>
+  <data name="SessionIdleAuto" xml:space="preserve"><value>Session idle. It starts by itself when FiveM appears.</value></data>
+  <data name="SessionPostGameTail" xml:space="preserve"><value>The game closed. Measuring what the card releases.</value></data>
   <data name="WaitingForProcess" xml:space="preserve"><value>Waiting for FiveM/GTA process</value></data>
   <data name="SelectIncidentHint" xml:space="preserve"><value>Select an incident to inspect its summary and supporting evidence.</value></data>
   <data name="SettingsSavedFormat" xml:space="preserve"><value>Settings saved to {0}.</value></data>

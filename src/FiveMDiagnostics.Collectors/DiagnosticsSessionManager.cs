@@ -80,6 +80,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private NeighbourCpuTrendMonitor? _neighbourCpu;
     private ObsVramFootprintMonitor? _obsVram;
     private VramPressureBandMonitor? _vramPressure;
+    private PostGameVramRelease? _postGameVram;
     private SlowFrameWaitProfile? _slowFrameWaits;
     private GameFocusMonitor? _gameFocus;
     private AntiCheatCostMonitor? _antiCheatCost;
@@ -385,6 +386,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _vramAccounting = new VramAccountingMonitor();
             _vramBudget = new VramBudgetMonitor();
             _vramPressure = new VramPressureBandMonitor(Environment?.DisplayRefreshRateHz);
+            _postGameVram = new PostGameVramRelease();
             _slowFrameWaits = new SlowFrameWaitProfile();
             _gameFocus = new GameFocusMonitor(Environment?.DisplayRefreshRateHz);
             _antiCheatCost = new AntiCheatCostMonitor();
@@ -926,6 +928,30 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     }
 
     /// <summary>
+    /// Writes what the card gave back once the game closed.
+    /// </summary>
+    /// <remarks>
+    /// Silent until the game has exited and the tail has measured something, which on an evening that
+    /// ends with the machine being switched off is never — the same evenings that lose every other
+    /// closing line.
+    /// </remarks>
+    private void FinalizePostGameVram(bool final)
+    {
+        if (_postGameVram?.Summary() is { } report && ShouldWriteSummary("GpuVram.PostGame", report.Message))
+        {
+            Report(
+                report.StillHeld ? StatusLevel.Warning : StatusLevel.Info,
+                "GpuVram.PostGame",
+                report.Message);
+        }
+
+        if (final)
+        {
+            _postGameVram = null;
+        }
+    }
+
+    /// <summary>
     /// Writes how many of the session's largest frames still had CPU slack, which is the line that
     /// separates a blocked thread from a pipeline working flat out.
     /// </summary>
@@ -1121,6 +1147,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         FinalizeDisplayCadence(final);
         FinalizeCaptureCost(final);
         FinalizeVramPressure(final);
+        FinalizePostGameVram(final);
         FinalizeSlowFrameWaits(final);
         FinalizeGameFocus(final);
         FinalizeAntiCheatCost(final);
@@ -2099,6 +2126,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                     _vramAccounting?.Observe(gpuSample);
                     _vramBudget?.Observe(gpuSample);
                     _vramPressure?.Observe(gpuSample);
+                    _postGameVram?.Observe(gpuSample);
                     _obsVram?.Observe(gpuSample);
                     GpuTelemetryUpdated?.Invoke(this, gpuSample);
                 }
@@ -2256,6 +2284,10 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 var startedAt = target.StartedAt ?? DateTimeOffset.UtcNow;
                 _vramPressure?.NoteGameStart(startedAt);
 
+                // A game inside the tail took its memory straight back, so there is no release to
+                // describe — and the dip between the two processes is a reload, not what the card gave up.
+                _postGameVram?.NoteGameRunning();
+
                 // The same minutes the band monitor sets aside. A capture taken during a reload was
                 // being charged for the reload's own hitches.
                 _captureCost?.NoteGameStart(startedAt);
@@ -2292,11 +2324,25 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         }
 
         _reportedTargetProcessExit = true;
+
+        var exitedAt = DateTimeOffset.UtcNow;
+        _postGameVram?.NoteGameExit(exitedAt);
+
+        // The same exit, told to the band monitor for the opposite reason: the ten minutes the card is
+        // still measured are what the release is read from, and they are not minutes of the evening.
+        _vramPressure?.NoteGameExit(exitedAt);
+
+        var tailMinutes = PostGameWindow.Duration.TotalMinutes;
         Report(
             StatusLevel.Info,
             "Spelprocess",
-            "Spelet avslutades. Mätningen pausas här och sessionen fortsätter tills du stoppar den; "
-            + "sammanfattningarna nedan gäller det som hann mätas.");
+            $"Spelet avslutades. Kortet mäts vidare i {tailMinutes:F0} minuter för att visa vad som "
+            + "släpps, och startar spelet om inom den tiden fortsätter den här sessionen — allt per "
+            + "process är fortfarande två serier över den punkten. "
+            + (_settings.AutoSession
+                ? "Annars avslutar sessionen sig själv när tiden gått."
+                : "Sessionen fortsätter tills du stoppar den.")
+            + " Sammanfattningarna nedan gäller det som hann mätas.");
 
         WriteSessionSummaries(final: false);
     }
