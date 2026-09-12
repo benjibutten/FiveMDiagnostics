@@ -55,6 +55,27 @@ public sealed class AutoDetectOptionsTests
         Assert.Equal(300, options.MinimumSamples);
     }
 
+    /// <summary>
+    /// Zero is a real setting and means the multiplier decides alone, which is what the detector did
+    /// before the floor existed. A floor of several seconds would be the detector switched off.
+    /// </summary>
+    [Fact]
+    public void Normalize_BoundsTheIncidentFloor()
+    {
+        var off = new AutoDetectOptions { IncidentFloorMs = 0 };
+        var absurd = new AutoDetectOptions { IncidentFloorMs = 60_000 };
+        var nonFinite = new AutoDetectOptions { IncidentFloorMs = double.NaN };
+
+        Assert.False(off.Normalize());
+        Assert.Equal(0, off.IncidentFloorMs);
+
+        Assert.True(absurd.Normalize());
+        Assert.Equal(1000, absurd.IncidentFloorMs);
+
+        Assert.True(nonFinite.Normalize());
+        Assert.Equal(100, nonFinite.IncidentFloorMs);
+    }
+
     [Fact]
     public void Normalize_ReplacesNonFiniteMultipliers()
     {

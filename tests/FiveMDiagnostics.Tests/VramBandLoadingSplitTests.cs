@@ -23,7 +23,7 @@ public sealed class VramBandLoadingSplitTests
     [Fact]
     public void TheBandTimeIsSplitIntoLoadingAndRunning()
     {
-        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        var monitor = new VramPressureBandMonitor(new HitchThreshold(60));
         monitor.NoteGameStart(Start);
 
         Play(monitor, Start, minutes: 10, vramPercent: 92);
@@ -51,7 +51,7 @@ public sealed class VramBandLoadingSplitTests
     [Fact]
     public void EachRestartOpensItsOwnLoadingWindow()
     {
-        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        var monitor = new VramPressureBandMonitor(new HitchThreshold(60));
         monitor.NoteGameStart(Start);
         Play(monitor, Start, minutes: 5, vramPercent: 92);
         Play(monitor, Start.AddMinutes(5), minutes: 55, vramPercent: 70);
@@ -76,7 +76,7 @@ public sealed class VramBandLoadingSplitTests
     [Fact]
     public void TheSameStartToldRepeatedlyIsOneStart()
     {
-        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        var monitor = new VramPressureBandMonitor(new HitchThreshold(60));
 
         for (var i = 0; i < 50; i++)
         {
@@ -100,7 +100,7 @@ public sealed class VramBandLoadingSplitTests
     [Fact]
     public void WithNoStartTheLineIsUndivided()
     {
-        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        var monitor = new VramPressureBandMonitor(new HitchThreshold(60));
 
         Play(monitor, Start, minutes: 5, vramPercent: 92);
         Play(monitor, Start.AddMinutes(5), minutes: 20, vramPercent: 70);
@@ -123,7 +123,7 @@ public sealed class VramBandLoadingSplitTests
     [Fact]
     public void AMinuteInTheBandExoneratesNothing()
     {
-        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        var monitor = new VramPressureBandMonitor(new HitchThreshold(60));
 
         // Well past the session gate, and a single quiet minute inside the band.
         Play(monitor, Start, minutes: 40, vramPercent: 70);
@@ -145,7 +145,7 @@ public sealed class VramBandLoadingSplitTests
     [Fact]
     public void EnoughTimeInTheBandRestoresTheVerdict()
     {
-        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        var monitor = new VramPressureBandMonitor(new HitchThreshold(60));
 
         Play(monitor, Start, minutes: 40, vramPercent: 70);
         PlayQuiet(monitor, Start.AddMinutes(40), minutes: 8, vramPercent: 92);
@@ -170,7 +170,7 @@ public sealed class VramBandLoadingSplitTests
     [Fact]
     public void TheMinutesAfterTheGameClosesAreNotCounted()
     {
-        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        var monitor = new VramPressureBandMonitor(new HitchThreshold(60));
         monitor.NoteGameStart(Start);
         Play(monitor, Start, minutes: 30, vramPercent: 70);
 
@@ -196,7 +196,7 @@ public sealed class VramBandLoadingSplitTests
     [Fact]
     public void AGameThatComesBackIsMeasuredAgain()
     {
-        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        var monitor = new VramPressureBandMonitor(new HitchThreshold(60));
         monitor.NoteGameStart(Start);
         Play(monitor, Start, minutes: 30, vramPercent: 70);
 

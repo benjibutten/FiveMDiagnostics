@@ -74,6 +74,13 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private VramAccountingMonitor? _vramAccounting;
     private VramBudgetMonitor? _vramBudget;
     private LiveVramTracker? _liveVram;
+    private HalfHourBreakdownMonitor? _halfHourBreakdown;
+
+    /// <summary>Every process name this session has seen holding VRAM, for the next session's comparison.</summary>
+    private HashSet<string> _processNamesThisSession = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>What the previous session saw, read once at session start.</summary>
+    private IReadOnlySet<string> _previousSessionProcessNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     private DisplayCadenceMonitor? _displayCadence;
     private CaptureCostMonitor? _captureCost;
     private DeepCaptureLedger? _captureLedger;
@@ -83,6 +90,15 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private PostGameVramRelease? _postGameVram;
     private SlowFrameWaitProfile? _slowFrameWaits;
     private GameFocusMonitor? _gameFocus;
+
+    /// <summary>
+    /// The one bar every hitch in this session is counted against. Owned here because it is the session
+    /// that has every frame; the monitors only read it.
+    /// </summary>
+    private HitchThreshold? _hitchThreshold;
+
+    /// <summary>Whether the evening's bar has been written to the journal yet. See ObserveFrame.</summary>
+    private bool _hitchThresholdWritten;
     private AntiCheatCostMonitor? _antiCheatCost;
 
     /// <summary>Whether this session has already retired the anti-cheat question. See ShouldWriteAntiCheatCost.</summary>
@@ -143,6 +159,13 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private DateTimeOffset? _lastStallFrameAtUtc;
 
     private double _stallFrameThresholdMs = DefaultStallFrameMs;
+
+    /// <summary>
+    /// When the last out-of-focus stall opened an incident of its own, for the cooldown in
+    /// <see cref="ObserveOutOfFocusStall"/>. Held here rather than in <see cref="AutoIncidentDetector"/>
+    /// because these frames never reach the detector at all.
+    /// </summary>
+    private DateTimeOffset? _lastOutOfFocusStallAt;
 
     /// <summary>Whether the game has been seen at all, and whether its exit has been reported.</summary>
     private bool _targetProcessSeen;
@@ -206,6 +229,19 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
     /// <summary>Frame time from which a stall counts as still running, before the session has a level.</summary>
     private const double DefaultStallFrameMs = 60;
+
+    /// <summary>
+    /// Frame time from which an out-of-focus frame still becomes an incident.
+    /// </summary>
+    /// <remarks>
+    /// Fixed rather than baseline-relative, because the baseline it would otherwise multiply is built
+    /// from in-focus frames only — the same protection <see cref="GameFocusMonitor"/> exists for. Three
+    /// frames over 2.5 seconds each, all within eight seconds of a background program starting or
+    /// closing, went unmarked on 2026-09-11 because the focus gate suppressed the incident along with the
+    /// metric; a 47 ms frame in the same window was marked. 500 ms is comfortably above anything a normal
+    /// alt-tab produces on its own.
+    /// </remarks>
+    private const double OutOfFocusStallThresholdMs = 500;
 
     /// <summary>
     /// Trace evidence that arrived before the incident it belongs to had been published.
@@ -379,25 +415,31 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _autoCaptureBudget = new AutoDeepCaptureBudget(_settings.DeepCapture);
             _framePacing = new FramePacingMonitor(_settings.FramePacing, Environment?.DisplayRefreshRateHz);
             _displayCadence = new DisplayCadenceMonitor(Environment?.DisplayRefreshRateHz);
-            _captureCost = new CaptureCostMonitor(Environment?.DisplayRefreshRateHz);
+            _hitchThreshold = new HitchThreshold(Environment?.DisplayRefreshRateHz);
+            _hitchThresholdWritten = false;
+            _captureCost = new CaptureCostMonitor(_hitchThreshold);
             _captureLedger = new DeepCaptureLedger();
             _neighbourCpu = new NeighbourCpuTrendMonitor();
             _obsVram = new ObsVramFootprintMonitor();
             _vramAccounting = new VramAccountingMonitor();
             _vramBudget = new VramBudgetMonitor();
-            _vramPressure = new VramPressureBandMonitor(Environment?.DisplayRefreshRateHz);
+            _vramPressure = new VramPressureBandMonitor(_hitchThreshold);
             _postGameVram = new PostGameVramRelease();
             _slowFrameWaits = new SlowFrameWaitProfile();
-            _gameFocus = new GameFocusMonitor(Environment?.DisplayRefreshRateHz);
+            _gameFocus = new GameFocusMonitor(_hitchThreshold);
             _antiCheatCost = new AntiCheatCostMonitor();
             _antiCheatCostWritten = false;
             _systemMemory = new SystemMemoryMonitor();
             _diskLatency = new DiskLatencyMonitor();
             _verdicts = new IncidentVerdictTally();
             _liveVram = new LiveVramTracker();
+            _halfHourBreakdown = new HalfHourBreakdownMonitor(_hitchThreshold);
+            _processNamesThisSession = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            _previousSessionProcessNames = PreviousSessionProcessLog.TryLoad(_settings.WorkingDirectory);
 
             _lastSummaryLine.Clear();
             _lastStallFrameAtUtc = null;
+            _lastOutOfFocusStallAt = null;
             _targetProcessSeen = false;
             _reportedTargetProcessExit = false;
             _targetProcessId = null;
@@ -581,6 +623,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         _vramPressure = null;
         _slowFrameWaits = null;
         _gameFocus = null;
+        _hitchThreshold = null;
         _antiCheatCost = null;
         _systemMemory = null;
         _verdicts = null;
@@ -672,8 +715,6 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         _channel = null;
         _analysisChannel = null;
         _analysisTask = null;
-        _autoDetector = null;
-        _autoCaptureBudget = null;
         _collectorTasks = [];
         _isSessionActive = false;
 
@@ -859,6 +900,29 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     }
 
     /// <summary>
+    /// Writes the evening's hitch bar to the journal, the first time it is known.
+    /// </summary>
+    /// <remarks>
+    /// It cannot be written with the rest of the session-start block: the bar follows the cadence the
+    /// session actually holds, and that is not known until the warm-up has run. This is the first moment
+    /// it exists, and the notes compare evenings on the decimal, so the figure has to be in the journal
+    /// rather than inferred from the summary lines that quote it rounded.
+    /// </remarks>
+    private void WriteHitchThresholdOnce()
+    {
+        if (_hitchThresholdWritten || _hitchThreshold is not { IsSettled: true } threshold)
+        {
+            return;
+        }
+
+        _hitchThresholdWritten = true;
+        Report(
+            StatusLevel.Info,
+            "Hitch",
+            $"Hitch = {threshold.ThresholdMs:F1} ms i kväll (2 × baslinjen {threshold.BaselineMs:F1} ms).");
+    }
+
+    /// <summary>
     /// Writes what this session's own deep captures coincided with.
     /// </summary>
     /// <remarks>
@@ -890,10 +954,19 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 ledger.Message);
         }
 
+        // Only at the end: the mid-session line already said it once, at the moment it happened, and
+        // repeating it every quarter of an hour would outweigh the one fact worth carrying into the
+        // summary — that the ceiling was reached at all.
+        if (final && _autoCaptureBudget?.DescribeCeilingReached() is { } ceiling)
+        {
+            Report(StatusLevel.Info, "DeepCapture.Budget", ceiling);
+        }
+
         if (final)
         {
             _captureCost = null;
             _captureLedger = null;
+            _autoCaptureBudget = null;
         }
     }
 
@@ -1030,9 +1103,16 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// </remarks>
     private void FinalizeNeighbourCpu(bool final)
     {
-        if (_neighbourCpu?.Summary() is { } report && ShouldWriteSummary("Process.CpuStep", report.Message))
+        var report = _neighbourCpu?.Summary();
+        if (report is { } found && ShouldWriteSummary("Process.CpuStep", found.Message))
         {
-            Report(StatusLevel.Warning, "Process.CpuStep", report.Message);
+            Report(StatusLevel.Warning, "Process.CpuStep", found.Message);
+        }
+        else if (report is null && final && _neighbourCpu?.DescribeNoStep() is { } reason)
+        {
+            // Silence is the common case and usually the right answer, but it cannot be told apart from
+            // the rule never getting a real look at the data. Only worth saying once, at the end.
+            Report(StatusLevel.Info, "Process.CpuStep", reason);
         }
 
         if (final)
@@ -1144,6 +1224,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// </remarks>
     private void WriteSessionSummaries(bool final)
     {
+        FinalizeMachineUptime();
         FinalizeDisplayCadence(final);
         FinalizeCaptureCost(final);
         FinalizeVramPressure(final);
@@ -1156,15 +1237,135 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         FinalizeSystemMemory(final);
         FinalizeDiskLatency(final);
         FinalizeVerdicts(final);
+        FinalizeBackgroundProcesses(final);
+        FinalizeHalfHourBreakdown(final);
+        FinalizeAutoIncidentFloor(final);
     }
 
     /// <summary>
-    /// Writes how little RAM the machine had.
+    /// Says how many hitches the incident floor held back, so the drop in incident count has a stated
+    /// cause rather than reading as an evening that went well.
     /// </summary>
     /// <remarks>
-    /// The only writer of that line. Each one describes the session so far, and the interesting one is
-    /// whichever came after the worst minute, so it is repeated at session end as well.
+    /// Only at the end, and only when there were any: the frames are already in the hitch figures every
+    /// other line quotes, and this exists to reconcile two numbers a reader would otherwise compare
+    /// against last week's.
     /// </remarks>
+    private void FinalizeAutoIncidentFloor(bool final)
+    {
+        if (!final)
+        {
+            return;
+        }
+
+        var floorMs = _settings.AutoDetect.IncidentFloorMs;
+        if (_autoDetector is { HitchesBelowFloor: > 0 } detector && floorMs > 0)
+        {
+            Report(
+                StatusLevel.Info,
+                "Incident.Floor",
+                $"{detector.HitchesBelowFloor} frames över {_settings.AutoDetect.SpikeMultiplier:0.#}× baslinje "
+                    + $"men under {floorMs:F0} ms räknades som hitches utan incident.");
+        }
+
+        _autoDetector = null;
+    }
+
+    /// <summary>
+    /// Writes the session's half-hour table, once, at the end.
+    /// </summary>
+    /// <remarks>
+    /// Reprinting every bucket on the quarter-hour cadence the other summaries use would mean the whole
+    /// table so far, again, every fifteen minutes — the interesting form of this is the finished shape,
+    /// not its partial state five minutes after the session began.
+    /// </remarks>
+    private void FinalizeHalfHourBreakdown(bool final)
+    {
+        if (!final)
+        {
+            return;
+        }
+
+        if (_halfHourBreakdown?.Summary() is { } report)
+        {
+            Report(StatusLevel.Info, "Session.HalfHours", report.Message);
+        }
+
+        _halfHourBreakdown = null;
+    }
+
+    /// <summary>
+    /// Compares this session's VRAM-holding processes against the previous session's, and says what is
+    /// new — only at the end, since the comparison is only meaningful once the session is done growing.
+    /// </summary>
+    /// <remarks>
+    /// The Voicemod finding of 2026-09-11 was made by sorting two evenings' <c>gpuprocs</c> CSVs side by
+    /// side by hand, and the same pass would also have caught <c>TwitchOverlayHelper</c>, <c>Spotify</c>
+    /// and <c>ChatGPT</c> — three processes new that same evening and mentioned nowhere else in the log.
+    /// Saved at the end of every session and read at the start of the next, via
+    /// <see cref="PreviousSessionProcessLog"/>.
+    /// </remarks>
+    private void FinalizeBackgroundProcesses(bool final)
+    {
+        if (!final)
+        {
+            return;
+        }
+
+        // Nothing to compare the first time this runs on a machine, or the first session after the log
+        // file is missing or unreadable — that is a fact about history, not a finding to report.
+        if (_previousSessionProcessNames.Count > 0)
+        {
+            var newThisSession = _processNamesThisSession
+                .Where(name => !_previousSessionProcessNames.Contains(name))
+                .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            var message = newThisSession.Length == 0
+                ? $"Inga nya processer med videominne mot förra sessionen ({_processNamesThisSession.Count} processer i kväll)."
+                : $"{newThisSession.Length} process{(newThisSession.Length == 1 ? "" : "er")} syntes i kväll som "
+                    + $"inte syntes förra sessionen: {string.Join(", ", newThisSession)}. "
+                    + $"({_processNamesThisSession.Count} processer med videominne i kväll mot "
+                    + $"{_previousSessionProcessNames.Count} förra sessionen.)";
+
+            Report(StatusLevel.Info, "GpuProcessMemory.SessionDiff", message);
+        }
+
+        // Never with nothing. A session whose process probe never answered — the counter set missing, the
+        // collector disabled, a session stopped in its first seconds — would otherwise overwrite the
+        // previous evening's baseline with an empty file and cost the comparison two sessions instead of
+        // none.
+        if (_processNamesThisSession.Count > 0)
+        {
+            PreviousSessionProcessLog.Save(_settings.WorkingDirectory, _processNamesThisSession);
+        }
+    }
+
+    /// <summary>
+    /// Writes how long the machine has been up, on the same quarter-hour cadence as the other summaries.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="SessionStartAge"/> only ever wrote this once, at the first frame. The drifttidsserie
+    /// that decided the restart hypothesis on 2026-09-11 — hitches per hour against how long the machine
+    /// had been up — had to be reconstructed by hand afterwards, by adding each half hour's play time to
+    /// the session-start reading. Nothing new is collected for this: the figure is the session-start
+    /// reading plus how long the session itself has run, so it only needs the current time.
+    /// </remarks>
+    private void FinalizeMachineUptime()
+    {
+        if (Environment is not { MachineUptime: { } uptimeAtStart } environment)
+        {
+            return;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var sinceStart = now - environment.SessionStartedAt;
+        var message = $"Maskinen har nu varit uppe i {SessionStartAge.Humanise(uptimeAtStart + sinceStart)} "
+            + $"({SessionStartAge.Humanise(sinceStart)} in i sessionen, kl. {now.ToLocalTime():HH:mm:ss}).";
+
+        Report(StatusLevel.Info, "SessionStart.Uptime", message);
+    }
+
     /// <summary>
     /// Writes how each volume behaved, so a disk that answered once and badly is not one line among
     /// fifty identical ones.
@@ -1188,6 +1389,13 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         }
     }
 
+    /// <summary>
+    /// Writes how little RAM the machine had.
+    /// </summary>
+    /// <remarks>
+    /// The only writer of that line. Each one describes the session so far, and the interesting one is
+    /// whichever came after the worst minute, so it is repeated at session end as well.
+    /// </remarks>
     private void FinalizeSystemMemory(bool final)
     {
         if (_systemMemory?.Summary() is { } report && ShouldWriteSummary("SystemMemory", report.Message))
@@ -2057,6 +2265,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// </remarks>
     private void ReportLiveVram(GpuProcessMemorySample sample)
     {
+        foreach (var process in sample.Processes)
+        {
+            _processNamesThisSession.Add(process.ProcessName);
+        }
+
         if (_liveVram?.Observe(sample) is not { } snapshot)
         {
             return;
@@ -2065,6 +2278,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         foreach (var growth in snapshot.Growth)
         {
             Report(StatusLevel.Info, "GpuProcessMemory.Live", growth.Message);
+        }
+
+        foreach (var change in snapshot.Lifecycle)
+        {
+            Report(StatusLevel.Info, "GpuProcessMemory.Lifecycle", change.Message);
         }
 
         LiveVramUpdated?.Invoke(this, snapshot);
@@ -2128,6 +2346,10 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                     _vramPressure?.Observe(gpuSample);
                     _postGameVram?.Observe(gpuSample);
                     _obsVram?.Observe(gpuSample);
+                    if (gpuSample.VramUsagePercent is { } vramPercent)
+                    {
+                        _halfHourBreakdown?.ObserveVram(gpuSample.Timestamp, vramPercent);
+                    }
                     GpuTelemetryUpdated?.Invoke(this, gpuSample);
                 }
                 else if (telemetryEvent is GpuProcessMemorySample gpuProcessSample)
@@ -2184,8 +2406,15 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     {
         if (_gameFocus?.ObserveFrame(frameSample.Timestamp, frameSample.FrameTimeMs) == false)
         {
+            ObserveOutOfFocusStall(frameSample);
             return;
         }
+
+        // After the focus gate and before the monitors that read it: the bar describes how the evening
+        // runs when it is being played, and an alt-tab in the first ten seconds would otherwise set it
+        // for the rest of the session.
+        _hitchThreshold?.Observe(frameSample.FrameTimeMs);
+        WriteHitchThresholdOnce();
 
         // Every frame, not only the ones that trigger something: the capture thresholds are derived from
         // the session's own distribution, and a sample taken only from frames that already crossed a
@@ -2201,6 +2430,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         _captureCost?.Observe(frameSample);
         _vramPressure?.Observe(frameSample);
         _slowFrameWaits?.Observe(frameSample);
+        _halfHourBreakdown?.ObserveFrame(frameSample.Timestamp, frameSample.FrameTimeMs, frameSample.CpuBusyMs);
 
         // The marker has to be raised before the materializer sees this event, so the frame that
         // triggered the incident lands inside its own window rather than one event short of it.
@@ -2220,6 +2450,67 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         {
             OnPacingWindow(pacingWindow);
         }
+    }
+
+    /// <summary>
+    /// Still raises an incident for a frame that stalled badly while the game was out of focus, so a
+    /// freeze the player's own alt-tab triggered is not invisible next to a 47 ms frame that happened to
+    /// keep focus.
+    /// </summary>
+    /// <remarks>
+    /// The frame stays out of every metric — <see cref="GameFocusMonitor"/> already excludes it, and that
+    /// exclusion is correct — this only stops it from being excluded from the incident list as well. It
+    /// cannot go through <see cref="_autoDetector"/>: that detector's baseline is exactly what the focus
+    /// gate protects from out-of-focus frame times, so this uses a fixed, coarse threshold instead of the
+    /// baseline-relative one. It escalates an incident window already open rather than always opening a
+    /// new one, for the same reason a cooldown-suppressed frame does — a burst of huge frames around one
+    /// alt-tab is one event, not several.
+    /// <para>
+    /// Escalation alone is not enough spacing, because it only reaches a window that is still open. A
+    /// game left behind another window for ten minutes presents at a few frames a second the whole time,
+    /// and every one of those clears the threshold — which is one Severe incident per closed window, each
+    /// asking the capture budget for a trace of somebody reading Discord. So the detector's own cooldown
+    /// is applied here too, held separately because the detector never sees these frames.
+    /// </para>
+    /// </remarks>
+    private void ObserveOutOfFocusStall(FrameTelemetrySample frameSample)
+    {
+        if (_incidentMaterializer is null || frameSample.FrameTimeMs < OutOfFocusStallThresholdMs)
+        {
+            return;
+        }
+
+        var label = $"Auto: {frameSample.FrameTimeMs:F0} ms frame, spelet låg ur fokus (räknas inte i "
+            + "kvällens mätvärden, men något orsakade den)";
+
+        // Offered to the open window first, and unconditionally: folding a worse frame into an incident
+        // that already exists costs nothing and is what keeps the window named after the worst thing in
+        // it. The cooldown below governs opening a new one.
+        var escalation = _incidentMaterializer.TryEscalate(
+            frameSample.Timestamp, IncidentSeverity.Severe, label, frameSample.FrameTimeMs, out _);
+        if (escalation != IncidentEscalation.NoOpenIncident)
+        {
+            return;
+        }
+
+        if (_lastOutOfFocusStallAt is { } last && frameSample.Timestamp - last < _settings.AutoDetect.Cooldown)
+        {
+            return;
+        }
+
+        // Out of the same allowance the detector spends, not alongside it. The cooldown above spaces
+        // these two minutes apart, which on its own is thirty an hour for a game left behind another
+        // window — each with a ring buffer, an analysis queue entry and a trace of somebody reading
+        // Discord attached to it.
+        if (_autoDetector?.TryTakeBudget(frameSample.Timestamp) == false)
+        {
+            return;
+        }
+
+        _lastOutOfFocusStallAt = frameSample.Timestamp;
+
+        var captureThis = TryReserveAutoCapture(frameSample.Timestamp, frameSample.FrameTimeMs);
+        CreateMarker(frameSample.Timestamp, IncidentSeverity.Severe, label, allowDeepCapture: captureThis, frameSample.FrameTimeMs);
     }
 
     private async Task FinalizeLoopAsync(CancellationToken cancellationToken)

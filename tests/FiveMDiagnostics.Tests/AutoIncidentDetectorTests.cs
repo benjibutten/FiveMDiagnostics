@@ -21,16 +21,61 @@ public sealed class AutoIncidentDetectorTests
         Assert.Null(trigger);
     }
 
+    /// <summary>
+    /// Played at the 45 ms cadence of 11 September, because the incident floor leaves no room for a
+    /// Normal incident at 60 fps: a frame that clears 100 ms against a 16.7 ms baseline has already
+    /// cleared four times it.
+    /// </summary>
     [Fact]
     public void FiresOnASpikeOnceBaselineIsKnown()
     {
         var detector = new AutoIncidentDetector(new AutoDetectOptions(), 60);
 
-        var trigger = Feed(detector, frameCount: 200, frameTimeMs: 16.7, finalFrameMs: 40);
+        var trigger = Feed(detector, frameCount: 200, frameTimeMs: 45, finalFrameMs: 120);
 
         Assert.NotNull(trigger);
         Assert.Equal(IncidentSeverity.Normal, trigger!.Severity);
-        Assert.Contains("40 ms", trigger.Label);
+        Assert.Contains("120 ms", trigger.Label);
+    }
+
+    /// <summary>
+    /// The floor, which is the whole of this change: a frame may be twice the baseline and still be
+    /// nothing a player could point at.
+    /// </summary>
+    /// <remarks>
+    /// 11 September produced 123 auto incidents with a median of 45 ms, 74 of them under 50 ms, and one
+    /// of those was a 36 ms frame ruled <c>ExternalProcessInterference</c> against <c>SearchIndexer</c>
+    /// at confidence 0.51. Twice a 16.9 ms baseline is 33.8 ms, so the multiplier alone called that a
+    /// hitch worth a 90 second window and fourteen hypotheses.
+    /// </remarks>
+    [Fact]
+    public void AFrameUnderTheFloorIsAHitchButNotAnIncident()
+    {
+        var detector = new AutoIncidentDetector(new AutoDetectOptions(), 60);
+
+        var trigger = Feed(detector, frameCount: 200, frameTimeMs: 16.9, finalFrameMs: 36);
+
+        Assert.Null(trigger);
+        Assert.Equal(0, detector.TriggerCount);
+
+        // Not discarded either — the session writes the count at the end, or an incident total that
+        // fell by two orders of magnitude would read as the machine having got better.
+        Assert.Equal(1, detector.HitchesBelowFloor);
+    }
+
+    /// <summary>Above the floor the multipliers decide, exactly as they did before it existed.</summary>
+    [Fact]
+    public void AboveTheFloorTheMultipliersStillDecideSeverity()
+    {
+        var normal = new AutoIncidentDetector(new AutoDetectOptions(), 60);
+        var severe = new AutoIncidentDetector(new AutoDetectOptions(), 60);
+
+        var normalTrigger = Feed(normal, frameCount: 200, frameTimeMs: 45, finalFrameMs: 120);
+        var severeTrigger = Feed(severe, frameCount: 200, frameTimeMs: 45, finalFrameMs: 180);
+
+        Assert.Equal(IncidentSeverity.Normal, normalTrigger!.Severity);
+        Assert.Equal(IncidentSeverity.Severe, severeTrigger!.Severity);
+        Assert.Equal(0, normal.HitchesBelowFloor);
     }
 
     [Fact]
@@ -78,7 +123,7 @@ public sealed class AutoIncidentDetectorTests
         for (var i = 0; i < 400; i++)
         {
             // Two spikes twenty seconds apart; only the first may raise an incident.
-            var frameTimeMs = i is 200 or 250 ? 60 : 16.7;
+            var frameTimeMs = i is 200 or 250 ? 160 : 16.7;
             var result = detector.Observe(Frame(timestamp, frameTimeMs));
             if (i == 200)
             {
@@ -97,7 +142,7 @@ public sealed class AutoIncidentDetectorTests
 
         Assert.NotNull(second);
         Assert.True(second!.IsSuppressed);
-        Assert.Equal(60, second.Trigger.FrameTimeMs, 1);
+        Assert.Equal(160, second.Trigger.FrameTimeMs, 1);
 
         // Suppressed observations must not spend the budget, or a burst would disarm the detector.
         Assert.Equal(1, detector.TriggerCount);

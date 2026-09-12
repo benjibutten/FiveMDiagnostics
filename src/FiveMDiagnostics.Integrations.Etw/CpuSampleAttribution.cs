@@ -139,10 +139,22 @@ internal sealed class CpuSampleAttribution
     /// so the cost is proportional to the thread rather than to the trace.
     /// </para>
     /// </remarks>
-    public IReadOnlyList<ModuleShare> ModulesForThread(int threadId, int take = 3)
+    /// <param name="from">
+    /// Start of the interval to count inside, or null for the whole retained window. Passed with
+    /// <paramref name="to"/>: a thread's mix across a twenty second window says little about what it did
+    /// during a one second freeze inside it.
+    /// </param>
+    public IReadOnlyList<ModuleShare> ModulesForThread(int threadId, int take = 3, DateTime? from = null, DateTime? to = null)
     {
         var processId = _processByThread.GetValueOrDefault(threadId, -1);
-        var seconds = SampledSeconds;
+        if (_firstSample is not { } first)
+        {
+            return [];
+        }
+
+        var fromMs = from is { } start ? (start - first).TotalMilliseconds : 0;
+        var toMs = to is { } end ? (end - first).TotalMilliseconds : double.MaxValue;
+        var seconds = from is { } windowStart && to is { } windowEnd ? (windowEnd - windowStart).TotalSeconds : SampledSeconds;
         if (seconds <= 0)
         {
             return [];
@@ -153,7 +165,7 @@ internal sealed class CpuSampleAttribution
 
         foreach (var sample in _samples)
         {
-            if (sample.ThreadId != threadId)
+            if (sample.ThreadId != threadId || sample.OffsetMs < fromMs || sample.OffsetMs > toMs)
             {
                 continue;
             }
@@ -188,6 +200,9 @@ internal sealed class CpuSampleAttribution
     public bool IsGameProcess(int processId) => IsGameProcess(Name(processId));
 
     public int ProcessIdForThread(int threadId) => _processByThread.GetValueOrDefault(threadId, -1);
+
+    /// <summary>The module a frame falls in, resolved in the thread's own address space.</summary>
+    public string ModuleForFrame(int threadId, ulong instructionPointer) => Resolve(ProcessIdForThread(threadId), instructionPointer);
 
     /// <summary>
     /// Main/render game threads spend a material share in the GTA executable. Requiring that share
@@ -278,13 +293,22 @@ internal sealed class CpuSampleAttribution
 
     public void OnSample(SampledProfileTraceData data)
     {
-        SampleCount++;
-        _firstSample ??= data.TimeStamp;
-        _lastSample = data.TimeStamp;
+        RecordSample(data.ThreadID, data.ProcessID, data.InstructionPointer, data.TimeStamp);
+    }
 
-        if (data.ProcessID >= 0 && data.ThreadID >= 0)
+    /// <summary>
+    /// The body of <see cref="OnSample"/>, separated from the event type so the window arithmetic can be
+    /// tested: a <c>TraceEvent</c> cannot be constructed outside the library that decodes one.
+    /// </summary>
+    internal void RecordSample(int threadId, int processId, ulong instructionPointer, DateTime timestamp)
+    {
+        SampleCount++;
+        _firstSample ??= timestamp;
+        _lastSample = timestamp;
+
+        if (processId >= 0 && threadId >= 0)
         {
-            _processByThread.TryAdd(data.ThreadID, data.ProcessID);
+            _processByThread.TryAdd(threadId, processId);
         }
 
         if (_samples.Count >= MaxBufferedSamples)
@@ -295,8 +319,8 @@ internal sealed class CpuSampleAttribution
 
         // Offset rather than a timestamp: four bytes instead of eight, and every question asked of it
         // is "where in the retained window", never "at what wall clock".
-        var offsetMs = _firstSample is { } first ? (int)Math.Clamp((data.TimeStamp - first).TotalMilliseconds, 0, int.MaxValue) : 0;
-        _samples.Add((data.ThreadID, data.InstructionPointer, offsetMs));
+        var offsetMs = _firstSample is { } first ? (int)Math.Clamp((timestamp - first).TotalMilliseconds, 0, int.MaxValue) : 0;
+        _samples.Add((threadId, instructionPointer, offsetMs));
     }
 
     /// <summary>

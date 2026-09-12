@@ -118,7 +118,13 @@ public sealed class GameFocusMonitor
     private readonly Dictionary<string, TimeSpan> _excursionHolders = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly object _sync = new();
-    private readonly double _hitchThresholdMs;
+    private readonly HitchThreshold _hitch;
+
+    /// <summary>
+    /// Frames held back until the bar is fixed. They are counted on the same rule as the rest of the
+    /// session once it is, rather than against a provisional bar nothing else in the session uses.
+    /// </summary>
+    private readonly List<(DateTimeOffset At, double FrameTimeMs)> _warmup = [];
 
     private DateTimeOffset? _firstSampleAt;
     private DateTimeOffset? _lastSampleAt;
@@ -131,19 +137,16 @@ public sealed class GameFocusMonitor
     private TimeSpan _totalUnfocused;
     private TimeSpan _longestUnfocused;
 
-    /// <param name="refreshRateHz">
-    /// The display's rate, which floors what may be called a hitch at two refreshes. The same bar
-    /// <see cref="VramPressureBandMonitor"/> uses, so the two lines of a session summary count the same
-    /// frames.
+    /// <param name="hitch">
+    /// The session's hitch bar. The same one <see cref="VramPressureBandMonitor"/> and
+    /// <see cref="CaptureCostMonitor"/> read, so the lines of a session summary count the same frames.
+    /// This counted against two refreshes alone until 2026-09-12, which is a different figure whenever
+    /// the game is not running at the panel's rate.
     /// </param>
-    public GameFocusMonitor(double? refreshRateHz)
+    public GameFocusMonitor(HitchThreshold hitch)
     {
-        var refreshIntervalMs = refreshRateHz is > 0 ? 1000d / refreshRateHz.Value : 1000d / 60;
-        _hitchThresholdMs = Math.Max(refreshIntervalMs, 1000d / 60) * 2;
+        _hitch = hitch;
     }
-
-    /// <summary>What counts as a hitch here, in milliseconds.</summary>
-    public double HitchThresholdMs => _hitchThresholdMs;
 
     /// <summary>
     /// Folds one reading of the foreground in, and returns a line for the journal when an excursion long
@@ -226,35 +229,78 @@ public sealed class GameFocusMonitor
     {
         lock (_sync)
         {
-            var isHitch = frameTimeMs >= _hitchThresholdMs;
+            var inPlay = IsInPlay(at);
 
-            if (StateAtCore(at) is GameFocusState.NotInFocus or GameFocusState.Settling)
+            if (!_hitch.IsSettled)
             {
-                _framesExcluded++;
-                if (isHitch)
-                {
-                    _hitchesExcluded++;
-                }
-
-                return false;
+                _warmup.Add((at, frameTimeMs));
+                return inPlay;
             }
 
-            _framesInPlay++;
-            if (isHitch)
-            {
-                _hitchesInPlay++;
-            }
-
-            // Held only long enough for a focus loss noticed a moment later to take them back.
-            _recentCounted.Enqueue((at, frameTimeMs));
-            while (_recentCounted.Count > 0 && at - _recentCounted.Peek().At > LossGrace)
-            {
-                _recentCounted.Dequeue();
-            }
-
-            return true;
+            DrainWarmup();
+            Count(at, frameTimeMs, inPlay);
+            return inPlay;
         }
     }
+
+    /// <summary>Files one frame on the side it belongs to. Called under the lock.</summary>
+    private void Count(DateTimeOffset at, double frameTimeMs, bool inPlay)
+    {
+        var isHitch = frameTimeMs >= _hitch.ThresholdMs;
+
+        if (!inPlay)
+        {
+            _framesExcluded++;
+            if (isHitch)
+            {
+                _hitchesExcluded++;
+            }
+
+            return;
+        }
+
+        _framesInPlay++;
+        if (isHitch)
+        {
+            _hitchesInPlay++;
+        }
+
+        // Held only long enough for a focus loss noticed a moment later to take them back.
+        _recentCounted.Enqueue((at, frameTimeMs));
+        while (_recentCounted.Count > 0 && at - _recentCounted.Peek().At > LossGrace)
+        {
+            _recentCounted.Dequeue();
+        }
+    }
+
+    /// <summary>
+    /// Files the held-back frames now that the bar is known. Called under the lock.
+    /// </summary>
+    /// <remarks>
+    /// Each is classified again rather than on the verdict returned at the time. By now the readings
+    /// that follow it have arrived, so the look-ahead sees a focus loss the live call could not — which
+    /// is what <see cref="ReclaimFramesBefore"/> exists to repair for the frames that were counted.
+    /// </remarks>
+    private void DrainWarmup()
+    {
+        if (_warmup.Count == 0)
+        {
+            return;
+        }
+
+        var held = _warmup.ToArray();
+        _warmup.Clear();
+        _warmup.TrimExcess();
+
+        foreach (var (at, frameTimeMs) in held)
+        {
+            Count(at, frameTimeMs, IsInPlay(at));
+        }
+    }
+
+    /// <summary>Called under the lock.</summary>
+    private bool IsInPlay(DateTimeOffset at) =>
+        StateAtCore(at) is not (GameFocusState.NotInFocus or GameFocusState.Settling);
 
     /// <summary>
     /// The session's focus accounting, or null when nothing was ever observed.
@@ -268,6 +314,10 @@ public sealed class GameFocusMonitor
     {
         lock (_sync)
         {
+            // A session shorter than the warm-up still gets a bar, from the frames it has.
+            _hitch.Settle();
+            DrainWarmup();
+
             if (_transitions.Count == 0 || _firstSampleAt is not { } first || _lastSampleAt is not { } last)
             {
                 return null;
@@ -318,7 +368,7 @@ public sealed class GameFocusMonitor
                 _hitchesInPlay,
                 _framesExcluded,
                 _hitchesExcluded,
-                _hitchThresholdMs,
+                _hitch.ThresholdMs,
                 top);
         }
     }
@@ -475,7 +525,7 @@ public sealed class GameFocusMonitor
 
             _framesInPlay--;
             _framesExcluded++;
-            if (frame.FrameTimeMs >= _hitchThresholdMs)
+            if (frame.FrameTimeMs >= _hitch.ThresholdMs)
             {
                 _hitchesInPlay--;
                 _hitchesExcluded++;

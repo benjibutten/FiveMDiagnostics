@@ -18,7 +18,7 @@ public sealed class CaptureCostMonitorTests
     [Fact]
     public void HitchesAfterAFlushAreSeparatedFromTheRest()
     {
-        var monitor = new CaptureCostMonitor(60);
+        var monitor = new CaptureCostMonitor(new HitchThreshold(60));
 
         // One flush, half an hour in. Recorded before the frames it affects, as it is live: the capture
         // finishes writing and the frames after it are then observed against it.
@@ -58,7 +58,7 @@ public sealed class CaptureCostMonitorTests
     [Fact]
     public void ASessionWithoutCapturesReportsNothing()
     {
-        var monitor = new CaptureCostMonitor(60);
+        var monitor = new CaptureCostMonitor(new HitchThreshold(60));
         for (var minute = 0; minute < 60; minute++)
         {
             monitor.Observe(Frame(Start.AddMinutes(minute), 40));
@@ -80,17 +80,22 @@ public sealed class CaptureCostMonitorTests
     [Fact]
     public void TheHitchThresholdFollowsTheCadenceTheSessionHolds()
     {
-        var uncapped = new CaptureCostMonitor(120);
-        var cappedToSixty = new CaptureCostMonitor(120);
+        var uncappedHitch = new HitchThreshold(120);
+        var cappedHitch = new HitchThreshold(120);
+        var uncapped = new CaptureCostMonitor(uncappedHitch);
+        var cappedToSixty = new CaptureCostMonitor(cappedHitch);
 
         uncapped.RecordCaptureWritten(Start);
         cappedToSixty.RecordCaptureWritten(Start);
 
-        // An hour on the same 120 Hz panel, with a 20 ms frame once a minute in both sessions.
+        // An hour on the same 120 Hz panel, with a 20 ms frame once a minute in both sessions. The bar
+        // is fed the same frames the session feeds it, which is what makes the two sessions differ.
         for (var second = 0; second < 3600; second++)
         {
             var at = Start.AddSeconds(second);
             var slow = second % 60 == 0;
+            uncappedHitch.Observe(slow ? 20 : 8.3);
+            cappedHitch.Observe(slow ? 20 : 16.7);
             uncapped.Observe(Frame(at, slow ? 20 : 8.3));
             cappedToSixty.Observe(Frame(at, slow ? 20 : 16.7));
         }
@@ -113,7 +118,7 @@ public sealed class CaptureCostMonitorTests
     [Fact]
     public async Task CapturesRecordedWhileFramesArriveDoNotThrow()
     {
-        var monitor = new CaptureCostMonitor(60);
+        var monitor = new CaptureCostMonitor(new HitchThreshold(60));
 
         // One frame in four is a hitch, which is what makes an observation walk the capture list at all.
         var frames = Task.Run(() =>
@@ -145,7 +150,7 @@ public sealed class CaptureCostMonitorTests
     [Fact]
     public void ASessionEntirelyInsideCaptureWindowsReportsNothing()
     {
-        var monitor = new CaptureCostMonitor(60);
+        var monitor = new CaptureCostMonitor(new HitchThreshold(60));
         monitor.RecordCaptureWritten(Start);
 
         for (var index = 0; index < 30; index++)
@@ -202,7 +207,7 @@ public sealed class CaptureCostMonitorTests
     /// </summary>
     private static CaptureCostReport? Evening(bool noteGameStart)
     {
-        var monitor = new CaptureCostMonitor(60);
+        var monitor = new CaptureCostMonitor(new HitchThreshold(60));
 
         if (noteGameStart)
         {

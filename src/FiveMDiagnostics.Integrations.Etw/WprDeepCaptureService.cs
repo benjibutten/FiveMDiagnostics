@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.ComponentModel;
 using System.Security.Principal;
 using Microsoft.Diagnostics.Tracing;
@@ -745,7 +745,10 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
             // wrong as a denominator for a ring buffer that holds seconds of samples inside an ETL
             // spanning hours.
             var attribution = cpu.Summarize();
-            var threadWait = threadWaits.Summarize(cpu);
+            // The path, and so a second read of the file, only when the trace carried stacks at all. A
+            // capture taken without stack walking has nothing for the second pass to find, and the pass
+            // costs the same as the first one — twelve seconds on the 900 MB ring buffers measured.
+            var threadWait = threadWaits.Summarize(cpu, stacks.Count > 0 ? path : null, cancellationToken);
 
             // Asked after the parse and about one second, not before it and about the window. The trace
             // is the only thing that knows which second the driver was evacuating in, and that second is
@@ -979,7 +982,17 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
                     {
                         metrics[$"gameThreadBlockerCores_{module.Module}"] = Math.Round(module.Cores, 4);
                     }
+
+                    // The same mix inside the wait itself. On 11 September the thread read as half game
+                    // code across the window and 92 % kernel inside the freeze; the window figure hides
+                    // that.
+                    foreach (var module in threadWait.BlockerModulesDuringWait)
+                    {
+                        metrics[$"gameThreadBlockerWaitCores_{module.Module}"] = Math.Round(module.Cores, 4);
+                    }
                 }
+
+                metrics["gameThreadWaitChainRecordedLinks"] = threadWait.RecordedLinkCount;
 
                 for (var index = 0; index < threadWait.Intervals.Count; index++)
                 {

@@ -394,8 +394,26 @@ public sealed class VramAccountingMonitor
 
             if (_drifting.ContainsKey(process.ProcessId))
             {
-                // Disagreed again, so any recovery streak in progress was not a real one.
-                _recoveringSince.Remove(process.ProcessId);
+                // A row already marked drifting is still watched, not frozen against the moment it was
+                // first proven. Without this, "excess <= 0" is asked of a gap that still carries a
+                // one-time step from hours earlier, which a row that has since tracked the card
+                // perfectly can never clear on its own — the row would have to give the step back, not
+                // merely stop taking more. Recovery then only ever happened when the process restarted
+                // and the anchor reset to zero for free, which is what let 2026-09-10 recover and left
+                // 2026-09-11, where the game never restarted, stuck for the rest of the session. Once
+                // the anchor is old enough to re-ask the same question the original proof used — grown
+                // faster than the card over the last quarter hour — it is retaken from here, whatever
+                // this window's answer was, so staleness never compounds past one window.
+                if (elapsed >= MinimumDriftWindow)
+                {
+                    _growth[process.ProcessId] = new GrowthAnchor(process.ProcessName, sample.Timestamp, process.DedicatedBytes, adapterBytes);
+                }
+                else
+                {
+                    // Disagreed again, so any recovery streak in progress was not a real one.
+                    _recoveringSince.Remove(process.ProcessId);
+                }
+
                 continue;
             }
 

@@ -22,7 +22,7 @@ public sealed class SessionSummaryMeasurementTests
     [Fact]
     public void TheBandIsMeasuredAgainstTheSessionsOwnHitches()
     {
-        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        var monitor = new VramPressureBandMonitor(new HitchThreshold(60));
 
         // Ten quiet minutes at 70%, one hitch each.
         Play(monitor, Start, minutes: 10, vramPercent: 70, hitchesPerMinute: 1);
@@ -65,7 +65,7 @@ public sealed class SessionSummaryMeasurementTests
     [Fact]
     public void HalfMinuteExcursionsIntoTheBandAreNotFiledAsTimeOutsideIt()
     {
-        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        var monitor = new VramPressureBandMonitor(new HitchThreshold(60));
 
         for (var minute = 0; minute < 20; minute++)
         {
@@ -103,7 +103,7 @@ public sealed class SessionSummaryMeasurementTests
     [Fact]
     public void ABandThatCostNothingLeadsWithTheConclusionAndIsNotAWarning()
     {
-        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        var monitor = new VramPressureBandMonitor(new HitchThreshold(60));
 
         // Twenty minutes at 92% with one hitch each, then twenty at 70% with five — enough material to
         // state the conclusion rather than only to gesture at it. See the thin-data test below for why
@@ -132,7 +132,7 @@ public sealed class SessionSummaryMeasurementTests
     [Fact]
     public void ABandThatCostNothingOnThinMaterialSaysSoInsteadOfExonerating()
     {
-        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        var monitor = new VramPressureBandMonitor(new HitchThreshold(60));
 
         // Same 1:5 hitch-rate shape as the test above, only a tenth of the minutes.
         Play(monitor, Start, minutes: 2, vramPercent: 92, hitchesPerMinute: 1);
@@ -154,7 +154,7 @@ public sealed class SessionSummaryMeasurementTests
     [Fact]
     public void AHigherRateInTheBandOnThinMaterialIsNotAFindingEither()
     {
-        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        var monitor = new VramPressureBandMonitor(new HitchThreshold(60));
 
         Play(monitor, Start, minutes: 2, vramPercent: 92, hitchesPerMinute: 10);
         Play(monitor, Start.AddMinutes(2), minutes: 2, vramPercent: 70, hitchesPerMinute: 1);
@@ -178,7 +178,7 @@ public sealed class SessionSummaryMeasurementTests
     [Fact]
     public void AThinExonerationDoesNotDowngradeTheLine()
     {
-        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        var monitor = new VramPressureBandMonitor(new HitchThreshold(60));
 
         Play(monitor, Start, minutes: 2, vramPercent: 92, hitchesPerMinute: 1);
         Play(monitor, Start.AddMinutes(2), minutes: 2, vramPercent: 70, hitchesPerMinute: 5);
@@ -197,7 +197,7 @@ public sealed class SessionSummaryMeasurementTests
     [Fact]
     public void AnEveningBelowTheBandIsReportedAsSuch()
     {
-        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        var monitor = new VramPressureBandMonitor(new HitchThreshold(60));
         Play(monitor, Start, minutes: 10, vramPercent: 62, hitchesPerMinute: 1);
 
         var report = monitor.Summary();
@@ -281,7 +281,7 @@ public sealed class SessionSummaryMeasurementTests
     [Fact]
     public void AnEveningWhoseHitchesAreAllInTheBandSaysSo()
     {
-        var monitor = new VramPressureBandMonitor(refreshRateHz: 60);
+        var monitor = new VramPressureBandMonitor(new HitchThreshold(60));
         Play(monitor, Start, minutes: 10, vramPercent: 70, hitchesPerMinute: 0);
         Play(monitor, Start.AddMinutes(10), minutes: 3, vramPercent: 92, hitchesPerMinute: 10);
 

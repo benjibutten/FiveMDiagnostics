@@ -65,7 +65,7 @@ public static class SessionStartAge
     }
 
     /// <summary>Hours and minutes, or minutes alone below the hour — the resolution the question needs.</summary>
-    private static string Humanise(TimeSpan span)
+    public static string Humanise(TimeSpan span)
     {
         var totalMinutes = (int)Math.Round(span.TotalMinutes);
         var hours = totalMinutes / 60;

@@ -46,9 +46,8 @@ The analysis intentionally prefers evidence correlation over averages. It also e
 
 Three decisions shape the scoring:
 
-- **Spike thresholds are derived, not fixed.** They come from `max(median frame time, display refresh
-  interval)`, because stutter is deviation from the achieved cadence. A fixed threshold either misses
-  every hitch on a high-refresh display or fires constantly on a low-refresh one.
+- **Spike thresholds are derived, not fixed.** They are multiples of the session's baseline rather than
+  millisecond constants — see [Hitch threshold and incident thresholds](#hitch-threshold-and-incident-thresholds).
 - **Slow frames are attributed, not guessed.** The PresentMon v2 CPU/GPU breakdown decides whether a
   spike was CPU-bound, GPU-bound or present-bound. Without that breakdown the engine falls back to
   frame-time-only reasoning but caps its confidence lower, so a measured attribution always outranks
@@ -101,6 +100,10 @@ Three decisions shape the scoring:
   burst lasts two to four tenths of one
 - the release chain behind the game thread's longest wait, which separates "the game blocked on
   itself" from "something outside took the processor"
+- a second read of the same ETL for the stacks the first read could not know it wanted: the
+  ReadyThread stacks that name each waker as a fact instead of a processor inference, and the sample
+  stacks inside the wait that say what the thread at the end of the chain was doing there, as module
+  chains. Costs a few seconds per capture; see `StackSecondPass`
 - disk service time per **volume**, not per process. A machine's disks are not alike, and averaging
   them hides the one that is broken: a system drive answering thousands of operations at 0.1 ms and a
   second drive answering tens at 20–450 ms read as one unremarkable disk when summed together
@@ -136,6 +139,53 @@ Important concrete event types:
 - `ArtifactEvidence`
 
 This lets the app preserve one merged timeline while still keeping type-specific analysis.
+
+## Hitch threshold and incident thresholds
+
+Everything that grades a frame grades it against one number:
+
+    baseline = max(median frame time, display refresh interval)
+
+`HitchThreshold.BaselineFrom` is that line, and it is the only place it is written. Take whichever is
+larger: a game locked to 60 fps on a 165 Hz panel is not stuttering, so the achieved cadence is the
+honest figure; a game that should reach 120 Hz must not be graded against a median a bad window has
+already dragged upwards.
+
+What differs is the multiplier, because the questions differ:
+
+| Bar | Multiplier | Who reads it | What it answers |
+|---|---|---|---|
+| Hitch | 2× | `GameFocusMonitor`, `CaptureCostMonitor`, `VramPressureBandMonitor`, `HalfHourBreakdownMonitor` | Did the player feel this frame? |
+| Incident, spike | 2× **and** ≥ 100 ms (`AutoIncidentDetector`), 1.5× (`FiveMCorrelationEngine`) | the detector live, the engine afterwards | Is this worth opening a window and running hypotheses over? |
+| Incident, severe | 4× / 2.5×, the detector's also behind the 100 ms floor | the same two | Is this worth a deep capture? |
+| Capture-worthy | adaptive, floored at 120 ms | `AutoDeepCaptureBudget` | Is this large enough that a ~900 MB trace of it will show anything? |
+
+The hitch bar is fixed once per session, after a 600-frame warm-up, by `HitchThreshold`, and every
+monitor that counts hitches reads that one instance. It used to be computed in four places — two
+refreshes alone in the focus line, two copies of one cadence median in capture cost and the VRAM band,
+and whatever the focus line happened to hold in the half-hour table. At 59.94 Hz they all land near
+33.3 ms, so the divergence never showed inside a single summary; it showed between evenings, where the
+same figure has been written up as both 1.4× and 3.4× because two lines counted against two bars. The
+notes compare evenings on the decimal, so the session writes the bar it settled on into the journal as
+soon as it knows it.
+
+The incident thresholds are deliberately *not* the hitch bar, and unlike it they are not fixed for the
+session: the detector's median rolls over the last 600 frames, so it follows a machine that degrades
+during an evening, and the engine's is taken over the frames inside the window it is analysing. Hitch
+frequency is a measurement of the evening; an incident is a decision to spend a window, fourteen
+hypotheses and possibly a deep capture. Changing one must not move the other.
+
+The detector's absolute floor (`AutoDetectOptions.IncidentFloorMs`, 100 ms) is there because a
+multiplier measures the wrong thing at the bottom of its range. Twice a 16.7 ms baseline is 33 ms, and
+11 September produced 123 auto incidents at a median of 45 ms — 74 under 50 ms, one of them a 36 ms
+frame ruled `ExternalProcessInterference` against `SearchIndexer` at confidence 0.51. With the floor
+that evening keeps 11 of the 123. The frames below it are still hitches and still counted as such by
+all four monitors, and the session writes how many at the end so the drop has a stated cause. One
+consequence worth knowing when reading a journal: at a 16.7 ms baseline every frame past the floor is
+already past four times the baseline, so a 60 fps evening produces only Severe incidents, and the
+Normal tier only reappears on an evening whose baseline is above 25 ms. The out-of-focus path in
+`DiagnosticsSessionManager` keeps its own fixed 500 ms limit and never sees the floor; so does
+`AutoDeepCaptureBudget`, whose 120 ms is a different question again.
 
 ## Incident lifecycle
 

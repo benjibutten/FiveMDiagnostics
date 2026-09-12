@@ -113,6 +113,47 @@ public sealed class TraceFileContentionBelongsToTheIncidentTests
     }
 
     /// <summary>
+    /// With the disk counters present and quiet, contention the trace timed to the incident still decides
+    /// it — the counters cannot see this workload at all.
+    /// </summary>
+    /// <remarks>
+    /// The tests above leave the timeline without system samples, so the hypothesis is already held under
+    /// the classification floor by the missing-counter ceiling and only its presence in the list can be
+    /// asserted. A real session has the counters, and 2 September is the case where all three of them —
+    /// latency, queue depth, paging — read normally while a neighbour ran 48 000 file operations a
+    /// second. Reading "the counters exonerate the disk" off those quiet readings would retire the one
+    /// signal that fires here, so it has to be the top hypothesis and not merely a listed one.
+    /// </remarks>
+    [Fact]
+    public void QuietDiskCountersDoNotOverrideContentionTimedToTheIncident()
+    {
+        var analysis = new FiveMCorrelationEngine().Analyze(
+            Incident(coveredFrom: Start.AddMinutes(-5), contendingFrom: Start.AddSeconds(25), coveredSeconds: 400, withQuietDiskCounters: true));
+
+        Assert.Equal(RootCauseCategory.StreamingOrDiskStall, analysis.Hypotheses[0].Category);
+        Assert.False(analysis.InsufficientEvidence);
+    }
+
+    /// <summary>
+    /// The same quiet counters with no contention inside the window leave nothing to classify on.
+    /// </summary>
+    /// <remarks>
+    /// The 01:53 incident of 2026-09-11, which scored 75% as a disk stall while its own trace reported
+    /// fifteen disk operations at 14 ms worst and eight hard faults. What carried it there was a
+    /// streaming hint plus contention the trace could only state as an average over the whole file —
+    /// signals that are leads rather than measurements of these seconds. A disk that answered normally
+    /// outranks both of them.
+    /// </remarks>
+    [Fact]
+    public void QuietDiskCountersWithNoContentionHoldTheVerdictUnderTheFloor()
+    {
+        var analysis = new FiveMCorrelationEngine().Analyze(
+            Incident(coveredFrom: Start, withQuietDiskCounters: true, withStreamingHint: true));
+
+        Assert.NotEqual(RootCauseCategory.StreamingOrDiskStall, analysis.Hypotheses[0].Category);
+    }
+
+    /// <summary>
     /// A quiet timeline whose only storage signal is the trace: no competing throughput, no latency,
     /// no queue, so the covered span is the one variable that decides the hypothesis.
     /// </summary>
@@ -124,11 +165,21 @@ public sealed class TraceFileContentionBelongsToTheIncidentTests
     /// <param name="timedTheTraffic">
     /// True with no burst: the parser looked, and the neighbour never held a contending second.
     /// </param>
+    /// <param name="withQuietDiskCounters">
+    /// Adds system samples whose disk counters are all present and all normal — the shape of a real
+    /// session, where the absence of a counter is not what holds the hypothesis down.
+    /// </param>
+    /// <param name="withStreamingHint">
+    /// Adds a second artefact naming the streamer, worth 0.2 on its own. It is what carried the 01:53
+    /// incident over the floor, and without it the untimed contention alone never reaches it.
+    /// </param>
     private static IncidentRecord Incident(
         DateTimeOffset? coveredFrom,
         DateTimeOffset? contendingFrom = null,
         bool timedTheTraffic = false,
-        double coveredSeconds = 40)
+        double coveredSeconds = 40,
+        bool withQuietDiskCounters = false,
+        bool withStreamingHint = false)
     {
         var markedAt = Start.AddSeconds(30);
         var windowEnd = Start.AddSeconds(90);
@@ -146,6 +197,41 @@ public sealed class TraceFileContentionBelongsToTheIncidentTests
                 ProcessName: "FiveM_b3407_GTAProcess.exe",
                 CpuBusyMs: 6.9,
                 CpuWaitMs: 0.3));
+        }
+
+        if (withQuietDiskCounters)
+        {
+            // One frame that actually cost something, and not on the CPU side: a window of nothing but
+            // healthy frames gives the hypothesis no spike to explain, and one whose lost time is CPU-busy
+            // is down-weighted by the attribution rule rather than by the ceiling under test.
+            events.Add(new FrameTelemetrySample(
+                Start.AddSeconds(9),
+                220,
+                GpuBusyMs: 4.2,
+                DisplayLatencyMs: 224,
+                MsBetweenPresents: 220,
+                Dropped: false,
+                ProcessName: "FiveM_b3407_GTAProcess.exe",
+                CpuBusyMs: 5.1,
+                CpuWaitMs: 0.2));
+
+            // The 01:53 readings: a disk answering in single-digit milliseconds, no queue to speak of,
+            // and paging in the single digits per second.
+            for (var i = 0; i < 90; i++)
+            {
+                events.Add(new SystemTelemetrySample(
+                    Start.AddSeconds(i),
+                    TotalCpuUsagePercent: 41,
+                    PerCoreUsagePercent: new Dictionary<string, double>(),
+                    MemoryCommitPercent: 48,
+                    AvailableMemoryMb: 11_000,
+                    TopCpuProcesses: [],
+                    TopDiskProcesses: [],
+                    DiskAverageLatencyMs: 5.3,
+                    DiskQueueLength: 0.3,
+                    HardFaultPagesPerSecond: 8,
+                    WorstDiskInstance: "F:"));
+            }
         }
 
         var metrics = new Dictionary<string, double>
@@ -179,6 +265,16 @@ public sealed class TraceFileContentionBelongsToTheIncidentTests
             "Deep capture: 48 000 filoperationer i sekunden fran SearchIndexer.exe.",
             metrics,
             "capture.etl"));
+
+        if (withStreamingHint)
+        {
+            events.Add(new ArtifactEvidence(
+                markedAt,
+                ArtifactKind.EtlTrace,
+                "Deep capture: streaming-lager laste in tillgangar under fonstret.",
+                new Dictionary<string, double>(),
+                "streaming.etl"));
+        }
 
         return new IncidentRecord(
             Guid.NewGuid(),

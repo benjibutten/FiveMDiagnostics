@@ -19,7 +19,7 @@ public sealed class GameFocusMonitorTests
 
     private const double SixtyHertz = 60;
 
-    /// <summary>Two refreshes at 60 Hz, which is what the monitor calls a hitch.</summary>
+    /// <summary>Twice the cadence of a session running at 60 Hz, which is what counts as a hitch.</summary>
     private const double HitchMs = 34;
 
     /// <summary>
@@ -29,7 +29,7 @@ public sealed class GameFocusMonitorTests
     [Fact]
     public void HitchesBehindAnotherWindowAreCountedSeparately()
     {
-        var monitor = new GameFocusMonitor(SixtyHertz);
+        var monitor = new GameFocusMonitor(new HitchThreshold(SixtyHertz));
 
         monitor.Observe(Focus(Start, gameHasFocus: true, "FiveM_b3407_GTAProcess"));
         Assert.True(monitor.ObserveFrame(Start.AddSeconds(1), HitchMs));
@@ -57,7 +57,7 @@ public sealed class GameFocusMonitorTests
     [Fact]
     public void TheSecondsAfterTabbingBackAreStillTheSwitch()
     {
-        var monitor = new GameFocusMonitor(SixtyHertz);
+        var monitor = new GameFocusMonitor(new HitchThreshold(SixtyHertz));
 
         monitor.Observe(Focus(Start, gameHasFocus: true, "FiveM_b3407_GTAProcess"));
         monitor.Observe(Focus(Start.AddSeconds(5), gameHasFocus: false, "explorer"));
@@ -78,7 +78,7 @@ public sealed class GameFocusMonitorTests
     [Fact]
     public void AFrameCountedJustBeforeTheSwitchIsReclaimed()
     {
-        var monitor = new GameFocusMonitor(SixtyHertz);
+        var monitor = new GameFocusMonitor(new HitchThreshold(SixtyHertz));
 
         monitor.Observe(Focus(Start, gameHasFocus: true, "FiveM_b3407_GTAProcess"));
 
@@ -103,7 +103,7 @@ public sealed class GameFocusMonitorTests
     [Fact]
     public void TheReclaimDoesNotReachBackFurtherThanTheSwitchItself()
     {
-        var monitor = new GameFocusMonitor(SixtyHertz);
+        var monitor = new GameFocusMonitor(new HitchThreshold(SixtyHertz));
 
         monitor.Observe(Focus(Start, gameHasFocus: true, "FiveM_b3407_GTAProcess"));
         Assert.True(monitor.ObserveFrame(Start.AddSeconds(5), 500));
@@ -124,7 +124,7 @@ public sealed class GameFocusMonitorTests
     [Fact]
     public void WithoutObservationsEveryFrameCounts()
     {
-        var monitor = new GameFocusMonitor(SixtyHertz);
+        var monitor = new GameFocusMonitor(new HitchThreshold(SixtyHertz));
 
         Assert.Equal(GameFocusState.Unknown, monitor.StateAt(Start));
         Assert.True(monitor.ObserveFrame(Start, 900));
@@ -138,7 +138,7 @@ public sealed class GameFocusMonitorTests
     [Fact]
     public void AnExcursionStillOpenIsCounted()
     {
-        var monitor = new GameFocusMonitor(SixtyHertz);
+        var monitor = new GameFocusMonitor(new HitchThreshold(SixtyHertz));
 
         monitor.Observe(Focus(Start, gameHasFocus: true, "FiveM_b3407_GTAProcess"));
         monitor.Observe(Focus(Start.AddMinutes(1), gameHasFocus: false, "chrome"));
@@ -158,7 +158,7 @@ public sealed class GameFocusMonitorTests
     [Fact]
     public void OnlyExcursionsWorthReadingAboutAreReported()
     {
-        var monitor = new GameFocusMonitor(SixtyHertz);
+        var monitor = new GameFocusMonitor(new HitchThreshold(SixtyHertz));
 
         monitor.Observe(Focus(Start, gameHasFocus: true, "FiveM_b3407_GTAProcess"));
         monitor.Observe(Focus(Start.AddSeconds(10), gameHasFocus: false, "ShellExperienceHost"));
@@ -184,7 +184,7 @@ public sealed class GameFocusMonitorTests
     [Fact]
     public void MovingBetweenTwoBackgroundWindowsIsOneExcursion()
     {
-        var monitor = new GameFocusMonitor(SixtyHertz);
+        var monitor = new GameFocusMonitor(new HitchThreshold(SixtyHertz));
 
         monitor.Observe(Focus(Start, gameHasFocus: true, "FiveM_b3407_GTAProcess"));
         Assert.Null(monitor.Observe(Focus(Start.AddSeconds(10), gameHasFocus: false, "Discord")));
@@ -224,7 +224,7 @@ public sealed class GameFocusMonitorTests
     [Fact]
     public void WritingTheSummaryDuringAnExcursionDoesNotChangeIt()
     {
-        var monitor = new GameFocusMonitor(SixtyHertz);
+        var monitor = new GameFocusMonitor(new HitchThreshold(SixtyHertz));
 
         monitor.Observe(Focus(Start, gameHasFocus: true, "FiveM_b3407_GTAProcess"));
         monitor.Observe(Focus(Start.AddMinutes(1), gameHasFocus: false, "chrome"));
@@ -287,6 +287,37 @@ public sealed class GameFocusMonitorTests
         Assert.Equal(GameFocusState.InPlay, GameFocusMonitor.Classify(readings, Start.AddSeconds(30.5)));
         Assert.Equal(GameFocusState.InPlay, GameFocusMonitor.Classify(readings, Start.AddSeconds(33)));
         Assert.Equal(GameFocusState.InPlay, GameFocusMonitor.Classify(readings, Start.AddSeconds(55)));
+    }
+
+    /// <summary>
+    /// The focus line counted against two refreshes of the panel, floored at 60 Hz, until 2026-09-12.
+    /// On a 144 Hz panel the game keeps up with, that is 33.3 ms against the 13.9 ms every other line of
+    /// the summary uses, so one evening's frames were smooth play in one sentence and hitches in the
+    /// next. It reads <see cref="HitchThreshold"/> with the rest of them now.
+    /// </summary>
+    [Fact]
+    public void TheHitchBarFollowsTheSessionsCadenceRatherThanTheRefreshRate()
+    {
+        var hitch = new HitchThreshold(144);
+        var monitor = new GameFocusMonitor(hitch);
+
+        monitor.Observe(Focus(Start, gameHasFocus: true, "FiveM_b3407_GTAProcess"));
+
+        for (var index = 0; index < 600; index++)
+        {
+            var at = Start.AddMilliseconds(index * 6.9);
+            hitch.Observe(6.9);
+            Assert.True(monitor.ObserveFrame(at, 6.9));
+        }
+
+        // Half of what the old bar was, and a hitch on a panel this fast.
+        Assert.True(monitor.ObserveFrame(Start.AddSeconds(10), 20));
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report);
+        Assert.Equal(13.9, report.HitchThresholdMs, 1);
+        Assert.Equal(1, report.HitchesInPlay);
     }
 
     private static WindowFocusSample Focus(DateTimeOffset at, bool gameHasFocus, string process) =>

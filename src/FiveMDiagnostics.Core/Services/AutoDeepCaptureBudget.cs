@@ -143,6 +143,12 @@ public sealed class AutoDeepCaptureBudget
     /// </summary>
     private readonly List<double> _largestFrames = [];
 
+    /// <summary>
+    /// How many times a worse frame has taken an already-spent capture's slot this session. Guarded by
+    /// <see cref="_sync"/> along with <see cref="_captures"/>.
+    /// </summary>
+    private int _replacementCount;
+
     private DateTimeOffset? _lastCaptureAt;
 
     /// <summary>
@@ -238,6 +244,48 @@ public sealed class AutoDeepCaptureBudget
 
     /// <summary>Captures still available, for the UI to show rather than leaving the user to guess.</summary>
     public int Remaining => Math.Max(0, _options.MaxAutoCapturesPerSession - Spent);
+
+    /// <summary>
+    /// A line for the end-of-session summary when the ceiling was reached at least once, or null when it
+    /// never was.
+    /// </summary>
+    /// <remarks>
+    /// The mid-session line in <see cref="CaptureReplacement"/>'s caller is written once, in the middle of
+    /// whatever else is happening, and is easy to miss reading a session back later. Whether the ceiling
+    /// was reached at all belongs in the summary instead: it means the session does not have a trace over
+    /// every one of its worst events, which changes how much weight the deep captures it does have can
+    /// carry.
+    /// </remarks>
+    public string? DescribeCeilingReached()
+    {
+        int spent;
+        int replacements;
+        lock (_sync)
+        {
+            spent = _captures.Count;
+            replacements = _replacementCount;
+        }
+
+        // The ceiling being full is the fact worth reporting, and a replacement is only one of the two
+        // ways a session gets there. Keying this on replacements alone stayed silent on the ordinary
+        // case — six captures spent and every later hitch refused outright — which is precisely the
+        // session that is missing traces of its worst events.
+        if (spent < _options.MaxAutoCapturesPerSession)
+        {
+            return null;
+        }
+
+        var displaced = replacements switch
+        {
+            0 => "Ingen capture behövde kastas för en värre",
+            1 => "En svagare capture fick ge plats för en värre",
+            _ => $"{replacements} svagare captures fick ge plats för värre",
+        };
+
+        return $"Taket på {_options.MaxAutoCapturesPerSession} automatiska captures nåddes under sessionen. "
+            + $"{displaced}. Kvällen har alltså inte spår över alla sina värsta händelser, bara över de "
+            + $"{_options.MaxAutoCapturesPerSession} som fick plats.";
+    }
 
     /// <summary>
     /// Frame time a hitch has to reach right now, which is the configured threshold until the session
@@ -624,6 +672,7 @@ public sealed class AutoDeepCaptureBudget
             {
                 _captures.Remove(displaced);
                 replaced = new CaptureReplacement(displaced.At, displaced.FrameTimeMs, displaced.Path);
+                _replacementCount++;
             }
 
             _captures.Add(new SpentCapture(timestamp, frameTimeMs));

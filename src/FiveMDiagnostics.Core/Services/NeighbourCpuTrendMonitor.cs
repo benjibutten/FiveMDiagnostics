@@ -142,7 +142,25 @@ public sealed class NeighbourCpuTrendMonitor
     /// </remarks>
     private static IEnumerable<NeighbourCpuTrendReport> StepsWithinInstances(string process, List<Sample> series)
     {
-        var restarts = 0;
+        var restartsSeen = 0;
+        foreach (var run in SplitRuns(series))
+        {
+            if (run.Count >= MinimumTraces && FindStep(process, run, restartsSeen) is { } step)
+            {
+                yield return step;
+            }
+
+            restartsSeen++;
+        }
+    }
+
+    /// <summary>
+    /// Splits one process's samples into runs on the same process id, oldest first. Shared by the step
+    /// search and <see cref="DescribeNoStep"/>, which both need to know where a restart broke the series
+    /// without disagreeing on where.
+    /// </summary>
+    private static IEnumerable<List<Sample>> SplitRuns(List<Sample> series)
+    {
         var run = new List<Sample>();
 
         foreach (var sample in series.OrderBy(item => item.At))
@@ -150,21 +168,56 @@ public sealed class NeighbourCpuTrendMonitor
             var known = run.LastOrDefault(item => item.ProcessId is not null).ProcessId;
             if (sample.ProcessId is { } pid && known is { } previous && pid != previous)
             {
-                restarts++;
-                if (run.Count >= MinimumTraces && FindStep(process, run, restarts - 1) is { } step)
-                {
-                    yield return step;
-                }
-
+                yield return run;
                 run = [];
             }
 
             run.Add(sample);
         }
 
-        if (run.Count >= MinimumTraces && FindStep(process, run, restarts) is { } tail)
+        yield return run;
+    }
+
+    /// <summary>
+    /// Why <see cref="Summary"/> found no step, so a session that had nothing to say can be told apart
+    /// from one where the monitor never got a real look. Meaningful only when <see cref="Summary"/>
+    /// returns null.
+    /// </summary>
+    /// <remarks>
+    /// A session that fills six deep captures across two process instances of the same neighbour never
+    /// reaches <see cref="MinimumTraces"/> in either run, and silence there reads exactly like the silence
+    /// of an evening with nothing going on. The two need different sentences.
+    /// </remarks>
+    public string? DescribeNoStep()
+    {
+        lock (_sync)
         {
-            yield return tail;
+            if (_byProcess.Count == 0)
+            {
+                return "Ingen grannprocess hade CPU-kärnor med i någon trace den här sessionen; regeln hade inget att jämföra.";
+            }
+
+            var byProcess = _byProcess
+                .Select(entry => (entry.Key, RunLengths: SplitRuns(entry.Value).Select(run => run.Count).Where(length => length > 0).ToArray()))
+                .ToArray();
+
+            var eligible = byProcess.SelectMany(entry => entry.RunLengths).Where(length => length >= MinimumTraces).ToArray();
+            if (eligible.Length == 0)
+            {
+                var longestProcess = byProcess.OrderByDescending(entry => entry.RunLengths.DefaultIfEmpty(0).Max()).First();
+                var longest = longestProcess.RunLengths.DefaultIfEmpty(0).Max();
+                return $"Ingen processinstans nådde de {MinimumTraces} spår regeln kräver för att jämföra en "
+                    + $"nivå före och efter (längst kom {longestProcess.Key} med {longest}).";
+            }
+
+            var runsText = string.Join(" och ", eligible
+                .GroupBy(length => length)
+                .OrderByDescending(group => group.Key)
+                .Select(group => group.Count() == 1
+                    ? $"en körning om {group.Key} spår"
+                    : $"{group.Count()} körningar om {group.Key} spår"));
+
+            return $"{runsText} hade underlag nog att jämföras; inget steg inom någon av dem.";
         }
     }
 

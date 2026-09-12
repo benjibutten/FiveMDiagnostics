@@ -886,6 +886,21 @@ public sealed record AutoDetectOptions
     /// <summary>Frame time, as a multiple of baseline, that marks a severe incident.</summary>
     public double SevereMultiplier { get; set; } = 4.0;
 
+    /// <summary>
+    /// Absolute floor a frame also has to clear before it becomes an incident, on top of
+    /// <see cref="SpikeMultiplier"/>. Zero means the multiplier decides alone.
+    /// </summary>
+    /// <remarks>
+    /// The multiplier alone measures the wrong thing at the bottom of its range. At a 16.7 ms baseline
+    /// twice the cadence is 33 ms, and the evening of 11 September produced 123 auto incidents with a
+    /// median of 45 ms — 74 of them under 50 ms, one of them a 36 ms frame blamed on <c>SearchIndexer</c>
+    /// at confidence 0.51. Each of those spent a 90 second window, fourteen hypotheses and a line in the
+    /// verdict summary on a frame nobody could point at. The machinery was built for the events a human
+    /// would have marked by hand, and the floor is what keeps it pointed at them; the frames below it are
+    /// still counted as hitches, which is the measurement that describes the evening.
+    /// </remarks>
+    public double IncidentFloorMs { get; set; } = 100;
+
     /// <summary>Consecutive undisplayed frames that count as a visible freeze on their own.</summary>
     public int DroppedFrameRun { get; set; } = 3;
 
@@ -947,6 +962,14 @@ public sealed record AutoDetectOptions
 
         SpikeMultiplier = ClampMultiplier(SpikeMultiplier, fallback: 2.0);
         SevereMultiplier = Math.Max(ClampMultiplier(SevereMultiplier, fallback: 4.0), SpikeMultiplier);
+
+        // Zero is meaningful and means "the multiplier alone", which is what the detector did before the
+        // floor existed. A floor above a second would be the detector switched off under another name:
+        // the freeze this investigation is still chasing is 1.2 s, and everything else worth a window
+        // has been between 100 and 900 ms.
+        IncidentFloorMs = double.IsNaN(IncidentFloorMs)
+            ? 100
+            : Math.Clamp(IncidentFloorMs, 0, 1000);
 
         // One undisplayed frame is a dropped frame, not a freeze; a run is at least two.
         DroppedFrameRun = Math.Clamp(DroppedFrameRun, 2, 600);

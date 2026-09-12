@@ -110,6 +110,7 @@ public sealed class AutoIncidentDetector
     private double _baselineMs;
     private int _droppedRun;
     private int _triggerCount;
+    private int _hitchesBelowFloor;
     private DateTimeOffset? _lastTriggerAt;
 
     public AutoIncidentDetector(AutoDetectOptions options, double? displayRefreshRateHz)
@@ -125,11 +126,26 @@ public sealed class AutoIncidentDetector
         _sortBuffer = new double[windowSize];
     }
 
-    /// <summary>Current cadence the machine is achieving, in milliseconds. Exposed for the UI and tests.</summary>
-    public double BaselineMs => _baselineMs;
+    /// <summary>
+    /// What this detector grades a frame against: the cadence the machine is achieving, never below one
+    /// refresh. The same baseline the hitch bar is built on — see <c>docs/ARCHITECTURE.md</c> for why the
+    /// two carry different multipliers. Exposed for the UI and tests.
+    /// </summary>
+    public double BaselineMs => HitchThreshold.BaselineFrom(_baselineMs, _refreshIntervalMs);
 
     /// <summary>How many incidents this detector has raised over the whole session.</summary>
     public int TriggerCount => _triggerCount;
+
+    /// <summary>
+    /// Frames that cleared <see cref="AutoDetectOptions.SpikeMultiplier"/> but not
+    /// <see cref="AutoDetectOptions.IncidentFloorMs"/>, over the whole session.
+    /// </summary>
+    /// <remarks>
+    /// The evening's incident count dropped from 123 to about a dozen when the floor arrived, and a
+    /// number that falls by two orders of magnitude without anything saying where it went is the kind of
+    /// change that gets read as the machine improving. The session writes this at the end.
+    /// </remarks>
+    public int HitchesBelowFloor => _hitchesBelowFloor;
 
     /// <summary>
     /// Incidents raised inside the current budget window, against
@@ -218,24 +234,51 @@ public sealed class AutoIncidentDetector
         return _triggersInWindow.Count < _options.MaxIncidentsPerWindow;
     }
 
+    /// <summary>
+    /// Spends one incident from the rate ceiling on behalf of a caller that raises its own.
+    /// </summary>
+    /// <remarks>
+    /// The out-of-focus path raises incidents from frames the focus gate keeps out of this detector, so
+    /// they cannot pass through <see cref="Observe"/> — but a second issuer with no share in
+    /// <see cref="AutoDetectOptions.MaxIncidentsPerWindow"/> makes it no ceiling at all: a game left
+    /// behind another window for an hour would add one incident per cooldown on top of the twenty this
+    /// allows. The cooldown stays the caller's, held separately because the frames never reach here.
+    /// Not counted in <see cref="TriggerCount"/>, which is what this detector itself classified.
+    /// </remarks>
+    public bool TryTakeBudget(DateTimeOffset timestamp)
+    {
+        if (!HasBudget(timestamp))
+        {
+            return false;
+        }
+
+        _triggersInWindow.Enqueue(timestamp);
+        return true;
+    }
+
     private AutoIncidentTrigger? Classify(FrameTelemetrySample sample)
     {
-        var baseline = Math.Max(_baselineMs, _refreshIntervalMs);
-
-        if (sample.FrameTimeMs >= baseline * _options.SevereMultiplier)
-        {
-            return new AutoIncidentTrigger(
-                IncidentSeverity.Severe,
-                $"Auto: {sample.FrameTimeMs:F0} ms frame (baslinje {baseline:F1} ms)",
-                sample.FrameTimeMs);
-        }
+        var baseline = BaselineMs;
 
         if (sample.FrameTimeMs >= baseline * _options.SpikeMultiplier)
         {
-            return new AutoIncidentTrigger(
-                IncidentSeverity.Normal,
-                $"Auto: {sample.FrameTimeMs:F0} ms frame (baslinje {baseline:F1} ms)",
-                sample.FrameTimeMs);
+            // Both gates, not either. The multiplier says the frame was out of step with the evening;
+            // the floor says it was long enough for a window and fourteen hypotheses to have anything to
+            // find. Below it the frame is still a hitch, counted by the four monitors that measure the
+            // evening — only the incident is withheld.
+            if (sample.FrameTimeMs >= _options.IncidentFloorMs)
+            {
+                var severity = sample.FrameTimeMs >= baseline * _options.SevereMultiplier
+                    ? IncidentSeverity.Severe
+                    : IncidentSeverity.Normal;
+
+                return new AutoIncidentTrigger(
+                    severity,
+                    $"Auto: {sample.FrameTimeMs:F0} ms frame (baslinje {baseline:F1} ms)",
+                    sample.FrameTimeMs);
+            }
+
+            _hitchesBelowFloor++;
         }
 
         // A run of frames that never reached the screen is a visible freeze even when each individual

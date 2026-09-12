@@ -107,7 +107,7 @@ public sealed class BudgetApproachAndQuietLinesTests
     [Fact]
     public void MoreCapturesThanTheAnalysisNeedsIsSaidOutLoud()
     {
-        var monitor = new CaptureCostMonitor(refreshRateHz: 59);
+        var monitor = new CaptureCostMonitor(new HitchThreshold(59));
         Play(monitor, captures: 12);
 
         var report = monitor.Summary();
@@ -123,7 +123,7 @@ public sealed class BudgetApproachAndQuietLinesTests
     [Fact]
     public void ASensibleNumberOfCapturesGetsNoAdvice()
     {
-        var monitor = new CaptureCostMonitor(refreshRateHz: 59);
+        var monitor = new CaptureCostMonitor(new HitchThreshold(59));
         Play(monitor, captures: 4);
 
         Assert.DoesNotContain("fler än analysen behöver", monitor.Summary()!.Message, StringComparison.Ordinal);

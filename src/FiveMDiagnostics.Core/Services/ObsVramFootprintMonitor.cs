@@ -58,6 +58,20 @@ public sealed class ObsVramFootprintMonitor
     private static readonly TimeSpan UsableComparison = TimeSpan.FromMinutes(15);
 
     /// <summary>
+    /// How far apart the stream stopping and OBS quitting have to land for the two steps to be read as
+    /// separate.
+    /// </summary>
+    /// <remarks>
+    /// On 2026-09-11 the two were four seconds apart, and the encoder's step was measured at 692 MB
+    /// against roughly 235 MB on three other evenings where the routine — stop the stream, wait, then
+    /// quit — was followed. <see cref="Before"/> and <see cref="After"/> put roughly eighteen seconds of
+    /// reading around each transition; closer than that and the "before" window of the second step is
+    /// already inside the "after" window of the first, so each step's drop partly counts the other one's.
+    /// Twenty seconds clears both windows with margin.
+    /// </remarks>
+    private static readonly TimeSpan MinimumStepSeparation = TimeSpan.FromSeconds(20);
+
+    /// <summary>
     /// How much of the reading history is kept.
     /// </summary>
     /// <remarks>
@@ -153,7 +167,13 @@ public sealed class ObsVramFootprintMonitor
             var lastTransition = _processStoppedAt ?? _streamStoppedAt;
             var tail = _lastReadingAt is { } last && lastTransition is { } at ? last - at : TimeSpan.Zero;
 
-            return new ObsVramFootprintReport(_encoderStep, _restOfStackStep, _totalVramGb, tail, tail >= UsableComparison);
+            var separation = _streamStoppedAt is { } stream && _processStoppedAt is { } process
+                ? (process - stream).Duration()
+                : (TimeSpan?)null;
+            var stepsTooClose = separation is { } gap && gap < MinimumStepSeparation;
+
+            return new ObsVramFootprintReport(
+                _encoderStep, _restOfStackStep, _totalVramGb, tail, tail >= UsableComparison, separation, stepsTooClose);
         }
     }
 
@@ -199,12 +219,21 @@ public sealed record ObsVramStep(DateTimeOffset At, double PercentBefore, double
 /// <param name="TailIsUsable">
 /// Whether that tail is long enough to compare anything but video memory across.
 /// </param>
+/// <param name="StepSeparation">
+/// How far apart the stream stopping and OBS quitting landed, or null when only one of them happened.
+/// </param>
+/// <param name="StepsTooClose">
+/// Whether that separation is short enough that the two steps' reading windows overlap, which makes
+/// each step's own figure unreliable even though both were measured.
+/// </param>
 public sealed record ObsVramFootprintReport(
     ObsVramStep? Encoder,
     ObsVramStep? RestOfStack,
     double TotalVramGb,
     TimeSpan TailWithoutObs,
-    bool TailIsUsable)
+    bool TailIsUsable,
+    TimeSpan? StepSeparation = null,
+    bool StepsTooClose = false)
 {
     public double TotalMegabytesFreed =>
         (Encoder?.MegabytesFreed(TotalVramGb) ?? 0) + (RestOfStack?.MegabytesFreed(TotalVramGb) ?? 0);
@@ -255,7 +284,15 @@ public sealed record ObsVramFootprintReport(
                 : $" Perioden efter är {TailWithoutObs.TotalMinutes:F0} minuter, vilket är för kort för att "
                     + "jämföra frametider över — VRAM-stegen är sekundupplösta och står ändå.";
 
-            return $"OBS-avstängningen mätt: {string.Join("; ", steps)}.{total}{missing}{caveat} "
+            // Overlapping windows, not a failed measurement: both steps have a figure, but each one's
+            // "efter"-läsning may already include part of the other transition's drop.
+            var overlap = StepsTooClose && Encoder is not null && RestOfStack is not null
+                ? $" VARNING: stegen låg {StepSeparation!.Value.TotalSeconds:F0} s isär, vilket är för tätt "
+                    + "för att skilja encodern från resten — siffrorna ovan överlappar och ska inte jämföras "
+                    + "med kvällar där rutinen (stoppa strömmen, vänta, avsluta OBS) hölls."
+                : string.Empty;
+
+            return $"OBS-avstängningen mätt: {string.Join("; ", steps)}.{total}{missing}{overlap}{caveat} "
                 + "Stegen är lästa sekunderna runt varje övergång, inte som medianer över perioderna: spelet "
                 + "fyller på i det lediga inom en halvminut.";
         }

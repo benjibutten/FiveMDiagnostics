@@ -2,6 +2,10 @@ using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
 
 namespace FiveMDiagnostics.Integrations.Etw;
 
+// TimeStampQPC is marked "discouraged" in favour of relative milliseconds, but it is the exact integer
+// a StackWalk event carries to name the event its stack belongs to. See StackSecondPass.
+#pragma warning disable CS0618
+
 /// <summary>
 /// Reconstructs off-CPU intervals from context switches. PresentMon's CPU-busy column covers the whole
 /// frame-side delay; this class separates time actually executing from time the game thread slept.
@@ -64,7 +68,8 @@ internal sealed class ThreadWaitAttribution
     /// ReadyThread event carries the thread it woke and leaves the header's own thread id at -1; what it
     /// does carry is the processor it fired on, and this says which thread was running there. That holds
     /// for an ordinary user mode wake and is what a trace viewer shows — it is still an inference, and
-    /// every sentence built on it says so.
+    /// every sentence built on it says so. The second pass replaces it with the stack's own thread id
+    /// where the trace has the stack.
     /// </remarks>
     private readonly Dictionary<int, int> _runningByProcessor = [];
 
@@ -81,7 +86,8 @@ internal sealed class ThreadWaitAttribution
         RecordReady(
             data.AwakenedThreadID,
             data.ProcessorNumber,
-            data.Flags.HasFlag(DispatcherReadyThreadTraceData.ReadyThreadFlags.ReadiedFromDPC));
+            data.Flags.HasFlag(DispatcherReadyThreadTraceData.ReadyThreadFlags.ReadiedFromDPC),
+            data.TimeStampQPC);
     }
 
     public void OnContextSwitch(CSwitchTraceData data)
@@ -105,7 +111,11 @@ internal sealed class ThreadWaitAttribution
     /// otherwise reachable only by parsing a real ETL. The release chain is the most delicate reasoning
     /// in this file and it must not be the least covered.
     /// </remarks>
-    internal void RecordReady(int awakenedThreadId, int processorNumber, bool fromDeferredProcedureCall)
+    /// <param name="qpc">
+    /// The event's own tick, which is what its stack is keyed by on the second pass. Zero when the
+    /// caller has no trace to read it back from.
+    /// </param>
+    internal void RecordReady(int awakenedThreadId, int processorNumber, bool fromDeferredProcedureCall, long qpc = 0)
     {
         if (awakenedThreadId < 0)
         {
@@ -115,6 +125,7 @@ internal sealed class ThreadWaitAttribution
         _readyByThread[awakenedThreadId] = new Ready(
             fromDeferredProcedureCall ? -1 : _runningByProcessor.GetValueOrDefault(processorNumber, -1),
             processorNumber,
+            qpc,
             fromDeferredProcedureCall);
     }
 
@@ -162,19 +173,39 @@ internal sealed class ThreadWaitAttribution
 
     /// <summary>
     /// The release chain behind a given thread's longest wait, for tests and for
-    /// <see cref="Summarize"/>.
+    /// <see cref="Summarize(CpuSampleAttribution, string?, CancellationToken)"/>.
     /// </summary>
     internal IReadOnlyList<ThreadWaitChainLink> ChainFor(int threadId, Func<int, string> processNameOf)
+    {
+        return ChainFor(threadId, processNameOf, TraceStacks.Empty.Wakers);
+    }
+
+    /// <summary>The same, with the wakers a second pass read out of the ReadyThread stacks.</summary>
+    internal IReadOnlyList<ThreadWaitChainLink> ChainFor(
+        int threadId,
+        Func<int, string> processNameOf,
+        IReadOnlyDictionary<(int Processor, long Qpc), int> recordedWakers)
     {
         var anchor = _longWaits
             .Where(wait => wait.ThreadId == threadId)
             .OrderByDescending(wait => wait.DurationMs)
             .FirstOrDefault();
 
-        return WalkChain(anchor, processNameOf);
+        return WalkChain(anchor, processNameOf, recordedWakers);
     }
 
     public ThreadWaitSummary? Summarize(CpuSampleAttribution cpu)
+    {
+        return Summarize(cpu, stacksFrom: null, CancellationToken.None);
+    }
+
+    /// <param name="stacksFrom">
+    /// The trace to read stacks out of on a second pass, or null to settle for what the switch stream
+    /// alone can say. The stacks make the waker a recorded fact instead of an inference, and they are
+    /// the only way to see what the thread at the end of the chain was doing <em>during</em> the wait
+    /// rather than across the whole retained window.
+    /// </param>
+    public ThreadWaitSummary? Summarize(CpuSampleAttribution cpu, string? stacksFrom, CancellationToken cancellationToken)
     {
         if (cpu.FirstSampleTimestamp is not { } windowStart || cpu.LastSampleTimestamp is not { } windowEnd)
         {
@@ -225,17 +256,24 @@ internal sealed class ThreadWaitAttribution
             .Select(group => $"{group.Key} ×{group.Count()}")
             .ToArray();
 
-        var chain = WalkChain(selectedWaits.FirstOrDefault(), processId => cpu.Name(cpu.ProcessIdForThread(processId)));
+        var anchor = selectedWaits[0];
+        var stacks = stacksFrom is null
+            ? TraceStacks.Empty
+            : StackSecondPass.Read(stacksFrom, ReadyKeysAround(anchor), anchor.Start, anchor.End, cpu.ModuleForFrame, cancellationToken);
+
+        var chain = WalkChain(anchor, threadId => cpu.Name(cpu.ProcessIdForThread(threadId)), stacks.Wakers);
 
         // What the thread at the end of the chain was executing. Without it the sentence names a thread
         // id and a duration, and the reader has to run etlanalyzer by hand to learn that the id belongs
-        // to the render thread and that it was sitting in Direct3D — which is the whole finding.
+        // to the render thread and that it was sitting in Direct3D — which is the whole finding. Measured
+        // inside the wait as well as across the window: the window is twenty seconds and the wait one,
+        // and everything the thread did before and after dilutes the answer.
         var blocker = chain.LastOrDefault(link => link is { EndsChain: true, FromDpc: false });
-        var blockerModules = blocker is null
+        var blockerModules = blocker is null ? [] : cpu.ModulesForThread(blocker.ThreadId, take: 4);
+        var blockerModulesDuringWait = blocker is null
             ? []
-            : cpu.ModulesForThread(blocker.ThreadId, take: 4)
-                .Select(module => $"{module.Share:P0} {ModuleGlossary.Annotate(module.Module)}")
-                .ToArray();
+            : cpu.ModulesForThread(blocker.ThreadId, take: int.MaxValue, anchor.Start, anchor.End);
+        var blockerStacksDuringWait = blocker is null ? [] : stacks.TopChains(blocker.ThreadId, take: 4);
 
         return new ThreadWaitSummary(
             candidates.ThreadId,
@@ -250,7 +288,35 @@ internal sealed class ThreadWaitAttribution
             candidates.Samples,
             reasons,
             chain,
-            blockerModules);
+            blockerModules,
+            blockerModulesDuringWait.Take(4).ToArray(),
+            blockerModulesDuringWait.Sum(module => module.Cores),
+            blockerStacksDuringWait);
+    }
+
+    /// <summary>
+    /// The ReadyThread events the chain may step through: those of every long wait overlapping the
+    /// anchor, the anchor's own included.
+    /// </summary>
+    /// <remarks>
+    /// Overlap rather than the inferred waker picks the set, because which thread released which is
+    /// exactly what the stacks are being fetched to establish; selecting on it here would only retain
+    /// the links the inference already agreed with.
+    /// </remarks>
+    private HashSet<(int Processor, long Qpc)> ReadyKeysAround(ThreadWait anchor)
+    {
+        var keys = new HashSet<(int Processor, long Qpc)>();
+        foreach (var wait in _longWaits)
+        {
+            if (wait.Ready is { FromDeferredProcedureCall: false, Qpc: not 0 } ready
+                && wait.Start < anchor.End
+                && wait.End > anchor.Start)
+            {
+                keys.Add((ready.Processor, ready.Qpc));
+            }
+        }
+
+        return keys;
     }
 
     /// <summary>
@@ -263,7 +329,14 @@ internal sealed class ThreadWaitAttribution
     /// it, because there is nothing to step to; and <see cref="MaxChainDepth"/> ends it, because neither
     /// of the first two is a guarantee on a trace whose switch stream wrapped mid-stall.
     /// </remarks>
-    private IReadOnlyList<ThreadWaitChainLink> WalkChain(ThreadWait? anchor, Func<int, string> processNameOf)
+    /// <param name="recordedWakers">
+    /// The thread each ReadyThread stack belongs to, by the event's processor and tick. A key found here
+    /// names the waker as a fact; one missing falls back to the switch stream's inference.
+    /// </param>
+    private IReadOnlyList<ThreadWaitChainLink> WalkChain(
+        ThreadWait? anchor,
+        Func<int, string> processNameOf,
+        IReadOnlyDictionary<(int Processor, long Qpc), int> recordedWakers)
     {
         if (anchor is null)
         {
@@ -289,33 +362,36 @@ internal sealed class ThreadWaitAttribution
                 break;
             }
 
-            if (ready.WakerThreadId < 0 || !seen.Add(ready.WakerThreadId))
+            var recorded = recordedWakers.TryGetValue((ready.Processor, ready.Qpc), out var fromStack);
+            var wakerThreadId = recorded ? fromStack : ready.WakerThreadId;
+            if (wakerThreadId < 0 || !seen.Add(wakerThreadId))
             {
                 break;
             }
 
-            var wakerProcess = processNameOf(ready.WakerThreadId);
+            var wakerProcess = processNameOf(wakerThreadId);
 
             // The link's own wait has to cover the interval it is supposed to explain, or it is a
             // different wait on the same thread that happens to be in the trace.
             var blocking = _longWaits
-                .Where(candidate => candidate.ThreadId == ready.WakerThreadId && Covers(candidate, current))
+                .Where(candidate => candidate.ThreadId == wakerThreadId && Covers(candidate, current))
                 .OrderByDescending(candidate => candidate.DurationMs)
                 .FirstOrDefault();
 
             if (blocking is null)
             {
-                links.Add(new ThreadWaitChainLink(ready.WakerThreadId, wakerProcess, 0, ready.Processor, EndsChain: true, FromDpc: false));
+                links.Add(new ThreadWaitChainLink(wakerThreadId, wakerProcess, 0, ready.Processor, EndsChain: true, FromDpc: false, recorded));
                 break;
             }
 
             links.Add(new ThreadWaitChainLink(
-                ready.WakerThreadId,
+                wakerThreadId,
                 wakerProcess,
                 blocking.DurationMs,
                 ready.Processor,
                 EndsChain: false,
-                FromDpc: false));
+                FromDpc: false,
+                recorded));
 
             current = blocking;
         }
@@ -346,7 +422,8 @@ internal sealed class ThreadWaitAttribution
     /// The thread the switch stream had on <paramref name="Processor"/> when the wake fired, or -1 when
     /// nothing can be claimed. Always an inference — see <see cref="_runningByProcessor"/>.
     /// </param>
-    private sealed record Ready(int WakerThreadId, int Processor, bool FromDeferredProcedureCall);
+    /// <param name="Qpc">The event's tick, which keys its stack on the second pass; zero when unknown.</param>
+    private sealed record Ready(int WakerThreadId, int Processor, long Qpc, bool FromDeferredProcedureCall);
 
     private sealed record ThreadWait(
         int ProcessId,
@@ -369,21 +446,39 @@ internal sealed class ThreadWaitAttribution
 /// True when the wake came from a deferred procedure call, which names no thread at all: the thread on
 /// that processor is merely the one the interrupt suspended.
 /// </param>
+/// <param name="WakerRecorded">
+/// True when the thread id was read out of the ReadyThread event's own stack, false when it was inferred
+/// from which thread the switch stream had on the processor at the time.
+/// </param>
 internal sealed record ThreadWaitChainLink(
     int ThreadId,
     string ProcessName,
     double WaitMs,
     int Processor,
     bool EndsChain,
-    bool FromDpc);
+    bool FromDpc,
+    bool WakerRecorded = false);
 
 /// <param name="ReleaseChain">
 /// The threads behind the longest wait, nearest first. Empty when nothing readied the thread — a timer
 /// expiry — or when the trace could not attribute the wake to anything.
 /// </param>
 /// <param name="BlockerModules">
-/// What the thread at the end of the chain was executing, already formatted as share and module. Empty
-/// when the chain names no such thread.
+/// What the thread at the end of the chain was executing across the whole retained window. Empty when
+/// the chain names no such thread.
+/// </param>
+/// <param name="BlockerModulesDuringWait">
+/// The same, restricted to the longest wait itself. Empty when the thread was never sampled inside it.
+/// </param>
+/// <param name="BlockerCoresDuringWait">
+/// How much of the wait the blocker was actually on a processor, as a share of one core. The chain
+/// only knows the thread had no single wait of 100 ms or more; on 10 September the thread at the end
+/// of a 2.9 s chain was sampled for 1 % of it, which is a thread waiting in short steps, not a thread
+/// running.
+/// </param>
+/// <param name="BlockerStacksDuringWait">
+/// The blocker's sample stacks inside the wait, collapsed to module chains and already formatted with
+/// their share. Empty without a second pass over the trace.
 /// </param>
 internal sealed record ThreadWaitSummary(
     int ThreadId,
@@ -392,7 +487,10 @@ internal sealed record ThreadWaitSummary(
     int CpuSampleCount,
     IReadOnlyList<string> Reasons,
     IReadOnlyList<ThreadWaitChainLink> ReleaseChain,
-    IReadOnlyList<string> BlockerModules)
+    IReadOnlyList<ModuleShare> BlockerModules,
+    IReadOnlyList<ModuleShare> BlockerModulesDuringWait,
+    double BlockerCoresDuringWait,
+    IReadOnlyList<string> BlockerStacksDuringWait)
 {
     public int LongWaitCount => Intervals.Count;
     public double MaxWaitMs => Intervals.Select(wait => wait.DurationMs).DefaultIfEmpty().Max();
@@ -403,6 +501,9 @@ internal sealed record ThreadWaitSummary(
     /// ends on a DPC or was never established.
     /// </summary>
     public ThreadWaitChainLink? Blocker => ReleaseChain.LastOrDefault(link => link is { EndsChain: true, FromDpc: false });
+
+    /// <summary>Links that name a thread and so had a waker to record or infer.</summary>
+    public int RecordedLinkCount => ReleaseChain.Count(link => link is { FromDpc: false, WakerRecorded: true });
 
     public string Describe()
     {
@@ -425,26 +526,74 @@ internal sealed record ThreadWaitSummary(
                 + "eller så saknas keywordet i spåret, så kedjan går inte att följa.";
         }
 
+        var threadLinks = ReleaseChain.Count(link => !link.FromDpc);
+        var recorded = RecordedLinkCount;
+        var mixed = recorded > 0 && recorded < threadLinks;
+
         var steps = string.Join(
             " → ",
             ReleaseChain.Select(link => link.FromDpc
                 ? $"en DPC på CPU {link.Processor}"
-                : link.EndsChain
-                    ? $"tid {link.ThreadId} ({link.ProcessName}), som låg på processorn hela tiden"
-                    : $"tid {link.ThreadId} ({link.ProcessName}), som väntade {link.WaitMs:F0} ms"));
+                : $"tid {link.ThreadId} ({link.ProcessName}{(mixed && !link.WakerRecorded ? ", härledd" : string.Empty)}), "
+                    + (link.EndsChain ? "utan egen väntan ≥100 ms" : $"som väntade {link.WaitMs:F0} ms")));
+
+        // Whether the reader may treat the chain as fact. Only the inferred case gets the caveat; a chain
+        // read out of the stacks has earned the plain statement.
+        var derivation = threadLinks == 0
+            ? string.Empty
+            : recorded == threadLinks
+                ? " Varje länk är avläst ur ReadyThread-stacken."
+                : recorded == 0
+                    ? " Vem som släppte tråden är härlett ur vilken tråd som låg på samma processor när "
+                        + "ReadyThread-händelsen kom, inte avläst ur dess stack."
+                    : " Länkar märkta härledd bygger på vilken tråd som låg på samma processor när "
+                        + "ReadyThread-händelsen kom; övriga är avlästa ur dess stack.";
 
         var ending = ReleaseChain[^1].FromDpc
             ? " En DPC namnger ingen tråd, så kedjan slutar där."
             : Blocker is null
                 ? " Kedjan kunde inte följas hela vägen."
-                : BlockerModules.Count > 0
-                    ? $" Tråd {Blocker.ThreadId} körde {string.Join(", ", BlockerModules)}."
-                    : string.Empty;
+                : DescribeBlocker();
 
-        return $" Kedjan bakom den längsta väntan: tid {ThreadId} → {steps}."
-            + " Vem som släppte tråden är härlett ur vilken tråd som låg på samma processor när "
-            + "ReadyThread-händelsen kom, inte avläst ur dess stack."
-            + ending;
+        return $" Kedjan bakom den längsta väntan: tid {ThreadId} → {steps}." + derivation + ending;
+    }
+
+    /// <summary>
+    /// What the blocker did inside the wait — how much of it on a processor, and in what — with the
+    /// window-wide mix beside it so the reader can see whether the thread changed behaviour.
+    /// </summary>
+    private string DescribeBlocker()
+    {
+        if (BlockerModules.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var threadId = Blocker!.ThreadId;
+        var presence = BlockerCoresDuringWait switch
+        {
+            >= 0.9 => $" Tråd {threadId} låg på processorn nästan hela väntan ({MaxWaitMs:F0} ms)",
+            >= 0.1 => $" Tråd {threadId} var på processorn {BlockerCoresDuringWait:P0} av väntan ({MaxWaitMs:F0} ms) "
+                + "och däremellan i väntor kortare än 100 ms",
+            > 0 => $" Tråd {threadId} var på processorn bara {BlockerCoresDuringWait:P0} av väntan ({MaxWaitMs:F0} ms) "
+                + "— den väntade själv, i steg kortare än 100 ms",
+            _ => $" Tråd {threadId} har inga samples alls under väntan ({MaxWaitMs:F0} ms)",
+        };
+
+        var duringWait = BlockerModulesDuringWait.Count > 0
+            ? $" och körde då {Modules(BlockerModulesDuringWait)}"
+            : string.Empty;
+
+        var stacks = BlockerStacksDuringWait.Count > 0
+            ? $" Dess stackar i väntan: {string.Join("; ", BlockerStacksDuringWait)}."
+            : string.Empty;
+
+        return $"{presence}{duringWait}; över hela fönstret {Modules(BlockerModules)}.{stacks}";
+    }
+
+    private static string Modules(IReadOnlyList<ModuleShare> modules)
+    {
+        return string.Join(", ", modules.Select(module => $"{module.Share:P0} {ModuleGlossary.Annotate(module.Module)}"));
     }
 }
 

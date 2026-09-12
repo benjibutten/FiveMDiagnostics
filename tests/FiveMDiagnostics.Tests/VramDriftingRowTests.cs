@@ -298,6 +298,52 @@ public sealed class VramDriftingRowTests
     }
 
     /// <summary>
+    /// A row that stepped once and then tracked the card perfectly must still recover without the process
+    /// restarting.
+    /// </summary>
+    /// <remarks>
+    /// Before the anchor was periodically refreshed, a row already marked drifting was judged forever
+    /// against the divergence measured at the moment it was first proven — so "excess &lt;= 0" was asking
+    /// whether the row had given the whole step back, which a row that has merely stopped taking more can
+    /// never do. On 2026-09-11 the game's row stepped once, the game never restarted for the rest of the
+    /// eight-hour session, and the budget breakdown stayed refused the whole time; on 2026-09-10 a restart
+    /// reset the anchor to zero and recovery happened "for free", which is what made it look
+    /// restart-dependent rather than broken. This reproduces the 2026-09-11 shape directly: no restart,
+    /// row and card both flat after the step.
+    /// </remarks>
+    [Fact]
+    public void ARowThatStepsOnceAndThenTracksTheCardRecoversWithoutARestart()
+    {
+        var monitor = new VramAccountingMonitor();
+
+        Observe(monitor, Start, gameGigabytes: 4.3, cardGigabytes: 8.0);
+        Assert.Null(monitor.ObserveDrift(Sample(Start, gameGigabytes: 4.3)));
+
+        var driftAt = Start.AddMinutes(40);
+        Observe(monitor, driftAt, gameGigabytes: 5.9, cardGigabytes: 8.1);
+        Assert.Single(monitor.ObserveDrift(Sample(driftAt, gameGigabytes: 5.9))!.Rows);
+
+        GpuProcessMemorySample annotated = monitor.Annotate(Sample(driftAt, gameGigabytes: 5.9), out _);
+        Assert.True(annotated.IsDrifting(annotated.Processes[0]), "the step itself should still be flagged");
+
+        // Forty minutes with the row exactly where it stepped to and the card exactly where it was — no
+        // further growth on either side, and no process restart. Sampled every five seconds, the process
+        // collector's real cadence: the recovery streak is dropped once ten seconds pass without a
+        // reading, so a coarser test cadence would fail for a reason that has nothing to do with the fix.
+        for (var seconds = 5; seconds <= 40 * 60; seconds += 5)
+        {
+            var at = driftAt.AddSeconds(seconds);
+            monitor.Observe(Adapter(at, usedGigabytes: 8.1));
+            monitor.ObserveDrift(Sample(at, gameGigabytes: 5.9));
+            annotated = monitor.Annotate(Sample(at, gameGigabytes: 5.9), out _);
+        }
+
+        Assert.False(
+            annotated.IsDrifting(annotated.Processes[0]),
+            "a row that tracked the card perfectly for forty minutes never recovered without a process restart");
+    }
+
+    /// <summary>
     /// A process id recycled to a different program inherits no drift verdict.
     /// </summary>
     /// <remarks>

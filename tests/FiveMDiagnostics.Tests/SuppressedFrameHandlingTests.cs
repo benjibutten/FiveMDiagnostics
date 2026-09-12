@@ -44,7 +44,7 @@ public sealed class SuppressedFrameHandlingTests : IDisposable
         var collector = new ScriptedFrameCollector(
         [
             // Opens an incident. Its window ends at 70 s; the cooldown runs to 130 s.
-            new Hitch(AtSecond: 10, FrameTimeMs: 40),
+            new Hitch(AtSecond: 10, FrameTimeMs: 120),
 
             // At 100 s nothing is open any more, and the detector is still inside its cooldown.
             new Hitch(AtSecond: 100, FrameTimeMs: 2846),
@@ -65,15 +65,22 @@ public sealed class SuppressedFrameHandlingTests : IDisposable
     /// The same dead zone, for a frame that is merely a spike. Overriding the cooldown for these would
     /// roughly double the incident count for no gain, so they stay suppressed.
     /// </summary>
+    /// <remarks>
+    /// Played at a 45 ms cadence — the median of 11 September — because a Normal-severity incident is
+    /// unreachable at 60 fps now that a frame has to clear 100 ms as well: against a 16.7 ms baseline
+    /// anything past the floor is already past four times the baseline, so every 60 fps incident is
+    /// Severe and would qualify for its own window here.
+    /// </remarks>
     [Fact]
     public async Task AnOrdinarySpikeInTheDeadZoneStaysQuiet()
     {
         var settings = CreateSettings();
         var collector = new ScriptedFrameCollector(
         [
-            new Hitch(AtSecond: 10, FrameTimeMs: 40),
-            new Hitch(AtSecond: 100, FrameTimeMs: 45),
-        ]);
+            new Hitch(AtSecond: 10, FrameTimeMs: 120),
+            new Hitch(AtSecond: 100, FrameTimeMs: 110),
+        ],
+        HealthyFrameMs: 45);
 
         await using var manager = CreateManager(settings, collector);
         await manager.StartSessionAsync();
@@ -92,7 +99,7 @@ public sealed class SuppressedFrameHandlingTests : IDisposable
         var settings = CreateSettings();
         var collector = new ScriptedFrameCollector(
         [
-            new Hitch(AtSecond: 10, FrameTimeMs: 41),
+            new Hitch(AtSecond: 10, FrameTimeMs: 141),
             new Hitch(AtSecond: 19, FrameTimeMs: 1018),
         ]);
 
@@ -145,7 +152,7 @@ public sealed class SuppressedFrameHandlingTests : IDisposable
         var settings = CreateSettings();
         var collector = new ScriptedFrameCollector(
         [
-            new Hitch(AtSecond: 10, FrameTimeMs: 40),
+            new Hitch(AtSecond: 10, FrameTimeMs: 120),
         ],
         DroppedRunAtSecond: 100);
 
@@ -155,6 +162,40 @@ public sealed class SuppressedFrameHandlingTests : IDisposable
         await manager.StopSessionAsync();
 
         Assert.Contains(IncidentLabels(), label => label.Contains("aldrig skärmen", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The same ceiling, for the incidents raised from frames the game was not in focus for.
+    /// </summary>
+    /// <remarks>
+    /// Those frames never reach the detector — the focus gate keeps them out of its baseline on purpose —
+    /// so that path holds its own cooldown and used to hold nothing else. Two minutes of spacing is
+    /// thirty incidents an hour on top of the ceiling, for a game sitting behind another window, each one
+    /// with a ring buffer and an analysis queue entry attached.
+    /// </remarks>
+    [Fact]
+    public async Task TheIncidentBudgetCannotBeBypassedByAnOutOfFocusStall()
+    {
+        var settings = CreateSettings();
+        settings.AutoDetect.MaxIncidentsPerWindow = 2;
+        settings.AutoDetect.IncidentBudgetWindow = TimeSpan.FromHours(1);
+
+        // Frames past the out-of-focus threshold, spaced past that path's cooldown so only the budget
+        // can stop them. The game goes behind another window first, and stays there.
+        var hitches = Enumerable.Range(0, 6)
+            .Select(index => new Hitch(AtSecond: 30 + (index * 180), FrameTimeMs: 2000))
+            .ToArray();
+
+        var collector = new ScriptedFrameCollector(hitches, OutOfFocusFromSecond: 20);
+        await using var manager = CreateManager(settings, collector);
+        await manager.StartSessionAsync();
+        await collector.Completed;
+        await manager.StopSessionAsync();
+
+        var labels = IncidentLabels();
+
+        Assert.All(labels, label => Assert.Contains("ur fokus", label, StringComparison.Ordinal));
+        Assert.Equal(2, labels.Count);
     }
 
     private IReadOnlyList<string> IncidentLabels()
@@ -204,9 +245,12 @@ public sealed class SuppressedFrameHandlingTests : IDisposable
     /// exercised at their real durations without the test taking minutes to run. The trailing run of
     /// healthy frames pushes the finalizer past the last incident window so every incident completes.
     /// </remarks>
-    private sealed class ScriptedFrameCollector(IReadOnlyList<Hitch> hitches, double? DroppedRunAtSecond = null) : ITelemetryCollector
+    private sealed class ScriptedFrameCollector(
+        IReadOnlyList<Hitch> hitches,
+        double? DroppedRunAtSecond = null,
+        double HealthyFrameMs = 16.67,
+        double? OutOfFocusFromSecond = null) : ITelemetryCollector
     {
-        private const double HealthyFrameMs = 16.67;
         private static readonly DateTimeOffset Origin = new(2026, 8, 22, 21, 0, 0, TimeSpan.Zero);
 
         private readonly TaskCompletionSource _completed = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -225,9 +269,20 @@ public sealed class SuppressedFrameHandlingTests : IDisposable
             var totalFrames = (int)(lastSecond * 1000 / HealthyFrameMs);
             var pending = new Queue<Hitch>(hitches.OrderBy(item => item.AtSecond));
 
+            var focusLost = false;
+
             for (var index = 0; index < totalFrames; index++)
             {
                 var elapsedMs = index * HealthyFrameMs;
+
+                if (OutOfFocusFromSecond is { } behindFrom && !focusLost && elapsedMs >= behindFrom * 1000)
+                {
+                    focusLost = true;
+                    await context.Writer.WriteAsync(
+                        new WindowFocusSample(Origin.AddMilliseconds(elapsedMs), GameHasFocus: false, 4321, "chrome.exe"),
+                        cancellationToken).ConfigureAwait(false);
+                }
+
                 var isHitch = pending.Count > 0 && elapsedMs >= pending.Peek().AtSecond * 1000;
                 var frameTimeMs = isHitch ? pending.Dequeue().FrameTimeMs : HealthyFrameMs;
 

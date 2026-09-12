@@ -77,17 +77,26 @@ public sealed class LiveVramTracker
     private readonly Dictionary<int, ProcessHistory> _history = [];
 
     /// <summary>
+    /// Whether a sample has been folded in yet. The first one is the session's baseline — every process
+    /// in it was already running when measurement started — so only a process first seen after it is a
+    /// genuine arrival worth a line of its own.
+    /// </summary>
+    private bool _baselineCaptured;
+
+    /// <summary>
     /// Folds a sample into the live view and returns it, along with any step change worth reporting.
     /// </summary>
     public LiveVramSnapshot Observe(GpuProcessMemorySample sample)
     {
         if (!sample.IsAvailable)
         {
-            return new LiveVramSnapshot(sample.Timestamp, [], []);
+            return new LiveVramSnapshot(sample.Timestamp, [], [], []);
         }
 
         var alerts = new List<LiveVramGrowth>();
         var rows = new List<LiveVramRow>();
+        var lifecycle = new List<LiveVramProcessEvent>();
+        var isBaselineSample = !_baselineCaptured;
 
         foreach (var process in sample.Processes)
         {
@@ -109,6 +118,11 @@ public sealed class LiveVramTracker
             {
                 history = new ProcessHistory(process.ProcessName, process.DedicatedBytes);
                 _history[process.ProcessId] = history;
+
+                if (!isBaselineSample)
+                {
+                    lifecycle.Add(new LiveVramProcessEvent(process.ProcessName, process.ProcessId, sample.Timestamp, Appeared: true));
+                }
             }
 
             history.LastSeenAt = sample.Timestamp;
@@ -135,40 +149,47 @@ public sealed class LiveVramTracker
             }
         }
 
-        Forget(sample.Timestamp);
+        lifecycle.AddRange(Forget(sample.Timestamp)
+            .Select(gone => new LiveVramProcessEvent(gone.ProcessName, gone.ProcessId, gone.LastSeenAt, Appeared: false)));
+
+        _baselineCaptured = true;
 
         // Untrusted rows sort with the rest on their own reported size, which puts them at the top where
         // their label is impossible to miss. That is the right place for a number that is wrong.
         rows.Sort((left, right) => right.DedicatedBytes.CompareTo(left.DedicatedBytes));
 
-        return new LiveVramSnapshot(sample.Timestamp, rows, alerts);
+        return new LiveVramSnapshot(sample.Timestamp, rows, alerts, lifecycle);
     }
 
     /// <summary>Drops the history of processes that have not been seen for <see cref="ForgetAfter"/>.</summary>
     /// <remarks>
     /// Over a dozen entries, once a sample. It bounds the dictionary over a long evening as much as it
-    /// keeps a dead process's numbers from being handed to whatever lands on its id next.
+    /// keeps a dead process's numbers from being handed to whatever lands on its id next. The processes
+    /// dropped are returned, with the last moment each was actually seen, so a caller can report a
+    /// disappearance without keeping its own copy of the same history.
     /// </remarks>
-    private void Forget(DateTimeOffset now)
+    private List<(string ProcessName, int ProcessId, DateTimeOffset LastSeenAt)> Forget(DateTimeOffset now)
     {
-        List<int>? expired = null;
+        List<(string ProcessName, int ProcessId, DateTimeOffset LastSeenAt)>? expired = null;
         foreach (var (processId, history) in _history)
         {
             if (now - history.LastSeenAt > ForgetAfter)
             {
-                (expired ??= []).Add(processId);
+                (expired ??= []).Add((history.ProcessName, processId, history.LastSeenAt));
             }
         }
 
         if (expired is null)
         {
-            return;
+            return [];
         }
 
-        foreach (var processId in expired)
+        foreach (var (_, processId, _) in expired)
         {
             _history.Remove(processId);
         }
+
+        return expired;
     }
 
     /// <summary>What one process has held, since the session started and over the recent past.</summary>
@@ -289,8 +310,27 @@ public sealed record LiveVramGrowth(
         + "Ett sådant steg ges sällan tillbaka; jämför det mot vad ett steg upp i texturkvalitet kostar.";
 }
 
+/// <summary>
+/// A process that started or stopped holding VRAM after the session's own baseline was read.
+/// </summary>
+/// <remarks>
+/// The Voicemod finding of 2026-09-11 — twenty minutes in the process list, and the session's three
+/// worst frames within eight seconds of each end of that window — was made by reading a CSV by hand and
+/// diffing its process column against the previous evening's. The card already carries this once a
+/// second; the only thing missing was saying so.
+/// </remarks>
+public sealed record LiveVramProcessEvent(string ProcessName, int ProcessId, DateTimeOffset At, bool Appeared)
+{
+    public string Message => Appeared
+        ? $"{ProcessName} (PID {ProcessId}) dök upp i VRAM-processlistan {At.ToLocalTime():HH:mm:ss}; "
+            + "fanns inte där vid sessionsstart."
+        : $"{ProcessName} (PID {ProcessId}) sågs sist i VRAM-processlistan {At.ToLocalTime():HH:mm:ss} "
+            + "och har inte synts sedan dess.";
+}
+
 /// <summary>The live view as of one sample.</summary>
 public sealed record LiveVramSnapshot(
     DateTimeOffset Timestamp,
     IReadOnlyList<LiveVramRow> Rows,
-    IReadOnlyList<LiveVramGrowth> Growth);
+    IReadOnlyList<LiveVramGrowth> Growth,
+    IReadOnlyList<LiveVramProcessEvent> Lifecycle);

@@ -8,9 +8,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
     public Func<DateTimeOffset, bool>? ComposedPresentExplainedAt { get; set; }
 
     /// <summary>
-    /// Stutter is deviation from the cadence the machine is actually achieving, not absolute frame time.
-    /// A fixed 25 ms threshold misses every hitch on a 120 Hz display and fires constantly on a 30 fps
-    /// one, so thresholds are derived from the observed median and the display's refresh interval.
+    /// What an incident is worth analysing at, as multiples of <see cref="HitchThreshold.BaselineFrom"/>.
+    /// Deliberately not the hitch bar; <c>docs/ARCHITECTURE.md</c> says why the two differ.
     /// </summary>
     private const double SpikeMultiplier = 1.5;
     private const double SevereMultiplier = 2.5;
@@ -504,11 +503,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         var sorted = frameSamples.Select(item => item.FrameTimeMs).OrderBy(value => value).ToArray();
         var median = Percentile(sorted, 0.50);
         var refreshInterval = refreshRateHz is > 0 ? 1000d / refreshRateHz.Value : 1000d / 60;
-
-        // Take whichever is larger: a game locked to 60 fps on a 165 Hz panel is not stuttering, so the
-        // achieved cadence is the honest baseline; a game that should hit 120 Hz should not get graded
-        // against a median that a bad window has already dragged upwards.
-        var baseline = Math.Max(median, refreshInterval);
+        var baseline = HitchThreshold.BaselineFrom(median, refreshInterval);
         var spikeThreshold = Math.Max(baseline * SpikeMultiplier, 10);
         var severeThreshold = Math.Max(baseline * SevereMultiplier, 16);
 
@@ -1870,6 +1865,33 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             // hard faults. The measurements that would have ruled a disk stall out were the missing ones,
             // so the ceiling has to reflect their absence rather than the tally of what remained.
             var ceiling = hasDiskCounterData ? MeasuredConfidenceCeiling : FallbackConfidenceCeiling;
+
+            // A disk that answered normally has already ruled itself out, whatever throughput or streaming
+            // hints add up to. Mirrors the floor AddGpuResidencyStallHypothesis applies when the card
+            // itself is not full: the 01:53 incident on 2026-09-11 scored 75% here while its own trace
+            // showed fifteen disk operations at 14 ms worst and eight hard faults, and the wait chain
+            // ended in the game's own render thread. Capped under ClassificationFloor rather than to zero,
+            // so the observation still surfaces as a runner-up instead of vanishing outright.
+            //
+            // File contention timed to the incident is exempt, because it is the one storage measurement
+            // here that does not come from the counters this clause reads. The 2 September frame cost
+            // 48 000 file operations a second with latency, queue depth and megabytes all unremarkable —
+            // capping that case out of existence would retire the exact signal the clause above exists
+            // for. Contention the trace could not place inside the window stays capped: that one is a
+            // lead, not a measurement of these seconds, and says so where it is scored.
+            var contentionDuringIncident = fileContention is { IsContending: true, MeasuredDuringIncident: true };
+
+            // Only when there is a ceiling left to lower. Without counter data the ceiling is already
+            // FallbackConfidenceCeiling, which is under the floor, and adding a second cap would put two
+            // different ceilings for the same hypothesis in the evidence list.
+            if (!hasMeasuredStallSignal && !contentionDuringIncident && ceiling > ClassificationFloor)
+            {
+                ceiling = ContradictedConfidenceCeiling;
+                evidence.Add(
+                    $"TAKAT: ingen diskoperation nådde tröskeln för latens, kö eller paging i fönstret, och "
+                    + $"spåret mätte ingen filsystemsträngsel under incidenten, så konfidensen är takad till "
+                    + $"{ContradictedConfidenceCeiling:P0} oavsett övriga signaler.");
+            }
 
             // Per-frame attribution outranks every storage signal there is, the measured ones included.
             // A stalled disk stalls a frame by making the CPU wait; time the CPU spent executing is time

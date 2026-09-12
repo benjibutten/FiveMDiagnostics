@@ -32,15 +32,11 @@ public sealed class CaptureCostMonitor
     private static readonly TimeSpan Window = TimeSpan.FromMinutes(1);
 
     /// <summary>
-    /// Frames held back before the threshold is fixed, so it can be set from the cadence the session
-    /// actually holds rather than from the one the display is capable of.
+    /// Frames held back until <see cref="HitchThreshold"/> has settled. They are not discarded: once the
+    /// bar is known they are counted against it, so the session's first seconds are compared on the same
+    /// threshold as the rest of it.
     /// </summary>
-    /// <remarks>
-    /// A few seconds of play, matching <c>DisplayCadenceMonitor</c>'s own warm-up. The frames are not
-    /// discarded: once the cadence is known they are counted against it, so the session's first seconds
-    /// are compared on the same threshold as the rest of it.
-    /// </remarks>
-    private const int CadenceWarmupFrames = 600;
+    private readonly List<(DateTimeOffset At, double FrameTimeMs)> _warmup = [];
 
     /// <summary>
     /// Guards every field below. <see cref="Observe"/> runs on the telemetry pump while
@@ -53,23 +49,22 @@ public sealed class CaptureCostMonitor
 
     private readonly List<DateTimeOffset> _captures = [];
     private readonly List<DateTimeOffset> _gameStarts = [];
-    private readonly List<(DateTimeOffset At, double FrameTimeMs)> _warmup = new(CadenceWarmupFrames);
-    private readonly double _refreshIntervalMs;
+    private readonly HitchThreshold _hitch;
 
-    private double _hitchThresholdMs;
+    private bool _warmupDrained;
     private int _hitches;
     private int _hitchesNearCapture;
     private int _hitchesWhileLoading;
     private DateTimeOffset? _firstFrameAt;
     private DateTimeOffset? _lastFrameAt;
 
-    /// <param name="refreshRateHz">
-    /// The display's rate, which sets the floor under what can count as a hitch: two refreshes rather
-    /// than one. A fixed millisecond threshold would mean something different on every machine.
+    /// <param name="hitch">
+    /// The session's hitch bar, shared with every other monitor that counts hitches, so that two lines
+    /// of one summary cannot count different frames.
     /// </param>
-    public CaptureCostMonitor(double? refreshRateHz)
+    public CaptureCostMonitor(HitchThreshold hitch)
     {
-        _refreshIntervalMs = refreshRateHz is > 0 ? 1000d / refreshRateHz.Value : 1000d / 60;
+        _hitch = hitch;
     }
 
     /// <summary>Notes that a capture finished writing.</summary>
@@ -114,17 +109,14 @@ public sealed class CaptureCostMonitor
             _firstFrameAt ??= sample.Timestamp;
             _lastFrameAt = sample.Timestamp;
 
-            if (_hitchThresholdMs > 0)
+            if (!_hitch.IsSettled)
             {
-                Count(sample.Timestamp, sample.FrameTimeMs);
+                _warmup.Add((sample.Timestamp, sample.FrameTimeMs));
                 return;
             }
 
-            _warmup.Add((sample.Timestamp, sample.FrameTimeMs));
-            if (_warmup.Count >= CadenceWarmupFrames)
-            {
-                SettleThreshold();
-            }
+            DrainWarmup();
+            Count(sample.Timestamp, sample.FrameTimeMs);
         }
     }
 
@@ -135,11 +127,9 @@ public sealed class CaptureCostMonitor
     {
         lock (_sync)
         {
-            if (_warmup.Count > 0)
-            {
-                // A session shorter than the warm-up still gets a threshold, from the frames it has.
-                SettleThreshold();
-            }
+            // A session shorter than the warm-up still gets a bar, from the frames it has.
+            _hitch.Settle();
+            DrainWarmup();
 
             if (_captures.Count == 0
                 || _firstFrameAt is not { } first
@@ -173,7 +163,7 @@ public sealed class CaptureCostMonitor
                 _hitchesNearCapture,
                 _hitchesNearCapture / nearHours,
                 (_hitches - _hitchesNearCapture) / elsewhereHours,
-                _hitchThresholdMs,
+                _hitch.ThresholdMs,
                 _hitchesWhileLoading,
                 TimeSpan.FromHours(loadingHours));
         }
@@ -245,27 +235,15 @@ public sealed class CaptureCostMonitor
 
     private static DateTimeOffset Min(DateTimeOffset a, DateTimeOffset b) => a < b ? a : b;
 
-    /// <summary>
-    /// Fixes what counts as a hitch at twice the interval the session is actually running at, never
-    /// below twice the display's own refresh, and counts the held-back frames against it.
-    /// </summary>
-    /// <remarks>
-    /// The threshold was two refreshes of the display, which is right only when the game runs at the
-    /// display's rate. On a 120 Hz panel with the game capped to 60 fps it lands at 16.67 ms — the
-    /// cadence itself — so every frame of a perfectly smooth evening counts as a hitch and the line
-    /// reports two indistinguishable five-figure rates. Taking the cadence from the frames is what
-    /// <c>DisplayCadenceMonitor</c> already does for the same reason: nothing outside these classes
-    /// knows whether it is looking at a capped game or a slow panel. The refresh interval stays as the
-    /// floor, because a frame inside two refreshes cannot be seen as a hitch however the game is capped.
-    /// </remarks>
-    private void SettleThreshold()
+    /// <summary>Counts the held-back frames now that the bar is known. Called under the lock.</summary>
+    private void DrainWarmup()
     {
-        var frameTimes = _warmup.Select(frame => frame.FrameTimeMs).OrderBy(value => value).ToArray();
+        if (_warmupDrained)
+        {
+            return;
+        }
 
-        // Median rather than mean: the warm-up is where a session's loading stutters live, and the whole
-        // point of the figure is the interval the evening settles at.
-        var cadenceMs = frameTimes.Length > 0 ? frameTimes[frameTimes.Length / 2] : _refreshIntervalMs;
-        _hitchThresholdMs = Math.Max(cadenceMs, _refreshIntervalMs) * 2;
+        _warmupDrained = true;
 
         foreach (var (at, frameTimeMs) in _warmup)
         {
@@ -279,7 +257,7 @@ public sealed class CaptureCostMonitor
     /// <summary>Counts one frame, and whether it fell in the wake of a capture. Called under the lock.</summary>
     private void Count(DateTimeOffset at, double frameTimeMs)
     {
-        if (frameTimeMs < _hitchThresholdMs)
+        if (frameTimeMs < _hitch.ThresholdMs)
         {
             return;
         }

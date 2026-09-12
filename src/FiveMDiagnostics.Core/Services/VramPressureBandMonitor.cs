@@ -60,17 +60,6 @@ public sealed class VramPressureBandMonitor
     /// </remarks>
     private const int MaxPendingFrames = 4096;
 
-    /// <summary>
-    /// Frames held back before the hitch threshold is fixed, so it follows the cadence the session
-    /// actually holds rather than the one the display is capable of.
-    /// </summary>
-    /// <remarks>
-    /// The same warm-up <see cref="CaptureCostMonitor"/> uses, and for the same reason: on a 120 Hz
-    /// panel with the game capped to 60 fps a threshold of two refreshes lands on the cadence itself and
-    /// every frame of a smooth evening counts as a hitch. The held-back frames are not discarded.
-    /// </remarks>
-    private const int CadenceWarmupFrames = 600;
-
     /// <summary>The band, in percent of the card's own capacity.</summary>
     public const double BandPercent = 88;
 
@@ -122,23 +111,28 @@ public sealed class VramPressureBandMonitor
     /// PresentMon keeps running produces a restart and barely a gap.
     /// </remarks>
     private readonly List<DateTimeOffset> _gameStarts = [];
-    private readonly List<(DateTimeOffset At, double FrameTimeMs)> _warmup = new(CadenceWarmupFrames);
-    private readonly double _refreshIntervalMs;
+
+    /// <summary>
+    /// Frames held back until <see cref="HitchThreshold"/> has settled, then returned to the queue so
+    /// the session's first seconds are counted against the same bar as the rest of it.
+    /// </summary>
+    private readonly List<(DateTimeOffset At, double FrameTimeMs)> _warmup = [];
+
+    private readonly HitchThreshold _hitch;
 
     /// <summary>When the game was last seen to go away, while it is still away.</summary>
     private DateTimeOffset? _gameExitedAt;
 
-    private double _hitchThresholdMs;
     private double _peakPercent;
     private int _unpairedFrames;
 
-    /// <param name="refreshRateHz">
-    /// The display's rate, which sets the floor under what can count as a hitch: two refreshes rather
-    /// than one.
+    /// <param name="hitch">
+    /// The session's hitch bar, shared with every other monitor that counts hitches, so that the band
+    /// line and the focus line describe the same frames.
     /// </param>
-    public VramPressureBandMonitor(double? refreshRateHz)
+    public VramPressureBandMonitor(HitchThreshold hitch)
     {
-        _refreshIntervalMs = refreshRateHz is > 0 ? 1000d / refreshRateHz.Value : 1000d / 60;
+        _hitch = hitch;
     }
 
     /// <summary>
@@ -216,24 +210,20 @@ public sealed class VramPressureBandMonitor
     {
         lock (_sync)
         {
-            if (_hitchThresholdMs > 0)
+            if (!_hitch.IsSettled)
             {
-                _pending.Add((sample.Timestamp, sample.FrameTimeMs));
-
-                if (_pending.Count > MaxPendingFrames)
-                {
-                    var unpairable = _pending.Count - (MaxPendingFrames / 2);
-                    _unpairedFrames += unpairable;
-                    _pending.RemoveRange(0, unpairable);
-                }
-
+                _warmup.Add((sample.Timestamp, sample.FrameTimeMs));
                 return;
             }
 
-            _warmup.Add((sample.Timestamp, sample.FrameTimeMs));
-            if (_warmup.Count >= CadenceWarmupFrames)
+            ReleaseWarmup();
+            _pending.Add((sample.Timestamp, sample.FrameTimeMs));
+
+            if (_pending.Count > MaxPendingFrames)
             {
-                SettleThreshold();
+                var unpairable = _pending.Count - (MaxPendingFrames / 2);
+                _unpairedFrames += unpairable;
+                _pending.RemoveRange(0, unpairable);
             }
         }
     }
@@ -250,11 +240,9 @@ public sealed class VramPressureBandMonitor
     {
         lock (_sync)
         {
-            if (_warmup.Count > 0)
-            {
-                // A session shorter than the warm-up still gets a threshold, from the frames it has.
-                SettleThreshold();
-            }
+            // A session shorter than the warm-up still gets a bar, from the frames it has.
+            _hitch.Settle();
+            ReleaseWarmup();
 
             DrainPending(final: true);
 
@@ -290,7 +278,7 @@ public sealed class VramPressureBandMonitor
                 _readings.Count(reading => reading.IsInDeepBand),
                 secondsPerReading,
                 _peakPercent,
-                _hitchThresholdMs,
+                _hitch.ThresholdMs,
                 inBand.Sum(reading => reading.Hitches),
                 outside.Sum(reading => reading.Hitches),
                 inBandRate,
@@ -351,7 +339,7 @@ public sealed class VramPressureBandMonitor
 
         nearest.Frames++;
         nearest.FrameMs += frameTimeMs;
-        if (frameTimeMs >= _hitchThresholdMs)
+        if (frameTimeMs >= _hitch.ThresholdMs)
         {
             nearest.Hitches++;
         }
@@ -436,18 +424,13 @@ public sealed class VramPressureBandMonitor
         return false;
     }
 
-    /// <summary>
-    /// Fixes what counts as a hitch at twice the interval the session is actually running at, never
-    /// below twice the display's own refresh, and returns the held-back frames to the queue.
-    /// </summary>
-    private void SettleThreshold()
+    /// <summary>Returns the held-back frames to the queue now that the bar is known. Called under the lock.</summary>
+    private void ReleaseWarmup()
     {
-        var frameTimes = _warmup.Select(frame => frame.FrameTimeMs).OrderBy(value => value).ToArray();
-
-        // Median rather than mean: the warm-up is where a session's loading stutters live, and the whole
-        // point of the figure is the interval the evening settles at.
-        var cadenceMs = frameTimes.Length > 0 ? frameTimes[frameTimes.Length / 2] : _refreshIntervalMs;
-        _hitchThresholdMs = Math.Max(cadenceMs, _refreshIntervalMs) * 2;
+        if (_warmup.Count == 0)
+        {
+            return;
+        }
 
         _pending.InsertRange(0, _warmup);
         _warmup.Clear();
