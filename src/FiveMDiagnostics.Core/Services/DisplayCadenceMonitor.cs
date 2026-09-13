@@ -63,6 +63,9 @@ public sealed class DisplayCadenceMonitor
     private readonly Dictionary<int, int> _byRefreshCount = [];
     private readonly double _refreshIntervalMs;
 
+    /// <summary>The pump folds frames in while the summaries enumerate the distribution.</summary>
+    private readonly object _sync = new();
+
     private int _countedFrames;
     private int _classifiedFrames;
     private int _composedFrames;
@@ -82,33 +85,45 @@ public sealed class DisplayCadenceMonitor
     /// DWM and a mismatch between the panels costs it nothing. Counted over every frame that named a
     /// mode, including the ones with no display-change figure to place on the cadence.
     /// </remarks>
-    public double? ComposedShare => _classifiedFrames > 0 ? (double)_composedFrames / _classifiedFrames : null;
+    public double? ComposedShare
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _classifiedFrames > 0 ? (double)_composedFrames / _classifiedFrames : null;
+            }
+        }
+    }
 
     /// <summary>Folds one frame into the running distribution.</summary>
     public void Observe(FrameTelemetrySample sample)
     {
-        if (sample.PresentMode is not null)
+        lock (_sync)
         {
-            _classifiedFrames++;
-            if (sample.IsComposedPresent)
+            if (sample.PresentMode is not null)
             {
-                _composedFrames++;
+                _classifiedFrames++;
+                if (sample.IsComposedPresent)
+                {
+                    _composedFrames++;
+                }
             }
-        }
 
-        if (sample.MsBetweenDisplayChange is not > 0 || _refreshIntervalMs <= 0)
-        {
-            return;
-        }
+            if (sample.MsBetweenDisplayChange is not > 0 || _refreshIntervalMs <= 0)
+            {
+                return;
+            }
 
-        var refreshes = (int)Math.Round(sample.MsBetweenDisplayChange.Value / _refreshIntervalMs, MidpointRounding.AwayFromZero);
-        if (refreshes is < 0 or > MaximumCountedRefreshes)
-        {
-            return;
-        }
+            var refreshes = (int)Math.Round(sample.MsBetweenDisplayChange.Value / _refreshIntervalMs, MidpointRounding.AwayFromZero);
+            if (refreshes is < 0 or > MaximumCountedRefreshes)
+            {
+                return;
+            }
 
-        _byRefreshCount[refreshes] = _byRefreshCount.GetValueOrDefault(refreshes) + 1;
-        _countedFrames++;
+            _byRefreshCount[refreshes] = _byRefreshCount.GetValueOrDefault(refreshes) + 1;
+            _countedFrames++;
+        }
     }
 
     /// <summary>
@@ -116,24 +131,27 @@ public sealed class DisplayCadenceMonitor
     /// </summary>
     public DisplayCadenceReport? Snapshot()
     {
-        if (_countedFrames < MinimumFrames || _byRefreshCount.Count == 0)
+        lock (_sync)
         {
-            return null;
+            if (_countedFrames < MinimumFrames || _byRefreshCount.Count == 0)
+            {
+                return null;
+            }
+
+            // The cadence the display actually holds, taken from the frames rather than assumed. A 60 fps
+            // game on a 120 Hz panel holds two refreshes and on a 60 Hz panel one, and nothing outside this
+            // class knows which it is looking at.
+            var modal = _byRefreshCount.OrderByDescending(entry => entry.Value).First();
+            var early = _byRefreshCount.Where(entry => entry.Key < modal.Key).Sum(entry => entry.Value);
+            var late = _byRefreshCount.Where(entry => entry.Key > modal.Key).Sum(entry => entry.Value);
+
+            return new DisplayCadenceReport(
+                _countedFrames,
+                modal.Key,
+                _refreshIntervalMs,
+                (double)early / _countedFrames,
+                (double)late / _countedFrames);
         }
-
-        // The cadence the display actually holds, taken from the frames rather than assumed. A 60 fps
-        // game on a 120 Hz panel holds two refreshes and on a 60 Hz panel one, and nothing outside this
-        // class knows which it is looking at.
-        var modal = _byRefreshCount.OrderByDescending(entry => entry.Value).First();
-        var early = _byRefreshCount.Where(entry => entry.Key < modal.Key).Sum(entry => entry.Value);
-        var late = _byRefreshCount.Where(entry => entry.Key > modal.Key).Sum(entry => entry.Value);
-
-        return new DisplayCadenceReport(
-            _countedFrames,
-            modal.Key,
-            _refreshIntervalMs,
-            (double)early / _countedFrames,
-            (double)late / _countedFrames);
     }
 }
 

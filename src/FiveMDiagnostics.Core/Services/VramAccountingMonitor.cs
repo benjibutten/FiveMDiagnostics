@@ -123,51 +123,40 @@ public sealed class VramAccountingMonitor
     private const double MinimumExcessShareOfGrowth = 0.5;
 
     /// <summary>
-    /// How long a row has to be watched before its growth rate means anything.
+    /// The window a row's growth is measured over, for the verdict and for lifting it alike.
     /// </summary>
     /// <remarks>
     /// The rate is an extrapolation, so a short window extrapolates noise: two collectors that sample a
     /// few seconds apart can differ by a hundred megabytes, which over thirty seconds is twelve gigabytes
-    /// an hour. Fifteen minutes makes the skew worth two gigabytes an hour at worst — still above the
-    /// bar — so the anchor is also re-taken whenever the card moves with the row, which is what an honest
-    /// allocation looks like and what keeps a game filling its budget out of this.
+    /// an hour. Fifteen minutes brings that under the bar together with the share test below.
     /// </remarks>
     private static readonly TimeSpan MinimumDriftWindow = TimeSpan.FromMinutes(15);
 
     /// <summary>
-    /// Where each row was when it was last agreed with, and what the card said at the same moment.
+    /// Where each row and the card stood when the row's current window opened.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Held against the name for the same reason <see cref="_doubleCounted"/> is: a recycled process id
     /// would otherwise inherit an anchor taken hours ago against a different program, and every new
     /// process would start life having apparently grown from whatever its predecessor held.
+    /// </para>
+    /// <para>
+    /// Windows follow one another rather than restarting whenever the row agrees with the card. The
+    /// anchor used to be re-taken on every sample where the row had not outgrown the card, which put it
+    /// at the lowest point of the noise: on 2026-09-12 the game's row was called drifting six times
+    /// against the same card that fixed windows found it in step with all evening.
+    /// </para>
     /// </remarks>
     private readonly Dictionary<int, GrowthAnchor> _growth = [];
 
-    /// <summary>Rows proved to drift, kept for the session like the double counters above.</summary>
+    /// <summary>Rows proved to drift, until a window shows them back in step with the card.</summary>
     private readonly Dictionary<int, string> _drifting = [];
 
     /// <summary>
-    /// How long a drifting row has tracked the card again, unbroken, keyed by process id.
+    /// When each drifting row was last observed, so a window with a gap in it cannot lift the verdict.
     /// </summary>
-    /// <remarks>
-    /// The drift verdict itself never expired before this — once excluded, a row stayed excluded for the
-    /// rest of the session, which is what left <c>VramBudgetMonitor</c> unable to split a budget for five
-    /// hours after the game's own row was marked drifting once at 22:32 on 7 September. Reset the moment
-    /// the row disagrees with the card again, so a brief truce cannot be mistaken for a real recovery the
-    /// way a genuine one is proven below.
-    /// </remarks>
-    private readonly Dictionary<int, (DateTimeOffset Since, DateTimeOffset Last)> _recoveringSince = [];
-
-    /// <summary>
-    /// How long a drifting row has to agree with the card again before the exclusion lifts.
-    /// </summary>
-    /// <remarks>
-    /// The same span the proof itself needs. A shorter window would let the sampling skew between two
-    /// collectors end an exclusion nearly as easily as it started one, and the row would flap between
-    /// excluded and included for as long as the game's texture streaming happened to pace with the card.
-    /// </remarks>
-    private static readonly TimeSpan DriftRecoveryWindow = MinimumDriftWindow;
+    private readonly Dictionary<int, DateTimeOffset> _lastSeenWhileDrifting = [];
 
     private GpuTelemetrySample? _lastAdapter;
     private DateTimeOffset? _lastReportAt;
@@ -239,7 +228,7 @@ public sealed class VramAccountingMonitor
                 && !string.Equals(driftingName, process.ProcessName, StringComparison.OrdinalIgnoreCase))
             {
                 _drifting.Remove(process.ProcessId);
-                _recoveringSince.Remove(process.ProcessId);
+                _lastSeenWhileDrifting.Remove(process.ProcessId);
             }
         }
 
@@ -310,9 +299,7 @@ public sealed class VramAccountingMonitor
     /// <para>
     /// What all three have in common is visible long before the absolute value is: the row grows and the
     /// card does not. A process cannot take memory the adapter does not then report as used, so growth in
-    /// excess of the card's own is a statement about the counter. The anchor is re-taken whenever the two
-    /// move together, which is what filling a texture budget looks like — so a game legitimately taking a
-    /// gigabyte an hour never accumulates any excess to be measured.
+    /// excess of the card's own is a statement about the counter.
     /// </para>
     /// <para>
     /// A drifting row is marked and not excluded. It holds real memory, and the mistake this codebase has
@@ -320,32 +307,34 @@ public sealed class VramAccountingMonitor
     /// else's headroom. What the mark buys is that nothing computes a split or a recommendation from the
     /// row's absolute value — see <c>VramBudgetMonitor</c>, which refuses instead.
     /// </para>
+    /// <para>
+    /// The mark lifts on the same question that set it: a window in which the row did not outgrow the
+    /// card. Recovery used to need every five-second sample of a quarter hour to agree, and the longest
+    /// such run on 2026-09-12 was twenty seconds, so the budget stayed refused from 23:26 to the end of
+    /// the evening while every quarter hour from 23:41 on showed the row in step with the card. Only a
+    /// process restart, which starts a new row, ever cleared it.
+    /// </para>
     /// </remarks>
     public DriftReport? ObserveDrift(GpuProcessMemorySample sample)
     {
         if (!sample.IsAvailable || sample.Processes.Count == 0)
         {
-            _recoveringSince.Clear();
+            _lastSeenWhileDrifting.Clear();
             return null;
         }
 
         if (_lastAdapter is not { UsedVramBytes: { } adapterBytes, IsSingleAdapterMachine: true } adapter
             || (sample.Timestamp - adapter.Timestamp).Duration() > AdapterFreshness)
         {
-            _recoveringSince.Clear();
+            _lastSeenWhileDrifting.Clear();
             return null;
         }
 
-        // Missing rows and gaps are missing evidence, not time spent recovering.
+        // Missing rows and gaps are missing evidence, and a window with a hole in it cannot clear a row.
         var present = sample.Processes.Select(process => process.ProcessId).ToHashSet();
-        foreach (var id in _recoveringSince.Keys.ToArray())
+        foreach (var id in _lastSeenWhileDrifting.Keys.Where(id => !present.Contains(id)).ToArray())
         {
-            var last = _recoveringSince[id].Last;
-            if (!present.Contains(id) || sample.Timestamp <= last
-                || sample.Timestamp - last > AdapterFreshness)
-            {
-                _recoveringSince.Remove(id);
-            }
+            _lastSeenWhileDrifting.Remove(id);
         }
 
         List<DriftingRow>? found = null;
@@ -354,100 +343,57 @@ public sealed class VramAccountingMonitor
 
         foreach (var process in sample.Processes)
         {
+            var id = process.ProcessId;
+
             // The same recycled-id rule the anchor below applies, so this holds even when nothing called
             // Annotate first.
-            if (_drifting.TryGetValue(process.ProcessId, out var driftingName)
+            if (_drifting.TryGetValue(id, out var driftingName)
                 && !string.Equals(driftingName, process.ProcessName, StringComparison.OrdinalIgnoreCase))
             {
-                _drifting.Remove(process.ProcessId);
-                _recoveringSince.Remove(process.ProcessId);
+                _drifting.Remove(id);
+                _lastSeenWhileDrifting.Remove(id);
             }
 
-            if (!_growth.TryGetValue(process.ProcessId, out var anchor)
-                || !string.Equals(anchor.Name, process.ProcessName, StringComparison.OrdinalIgnoreCase))
+            var drifting = _drifting.ContainsKey(id);
+            if (!_growth.TryGetValue(id, out var anchor)
+                || !string.Equals(anchor.Name, process.ProcessName, StringComparison.OrdinalIgnoreCase)
+                || (drifting && !SeenWithoutBreak(id, sample.Timestamp)))
             {
-                _recoveringSince.Remove(process.ProcessId);
-                _growth[process.ProcessId] = new GrowthAnchor(process.ProcessName, sample.Timestamp, process.DedicatedBytes, adapterBytes);
+                _growth[id] = new GrowthAnchor(process.ProcessName, sample.Timestamp, process.DedicatedBytes, adapterBytes);
                 continue;
             }
 
             var elapsed = sample.Timestamp - anchor.At;
+            if (elapsed < MinimumDriftWindow)
+            {
+                continue;
+            }
+
             var rowGrowth = (long)process.DedicatedBytes - (long)anchor.Bytes;
             var cardGrowth = (long)adapterBytes - (long)anchor.AdapterBytes;
-            var excess = rowGrowth - cardGrowth;
+            _growth[id] = new GrowthAnchor(process.ProcessName, sample.Timestamp, process.DedicatedBytes, adapterBytes);
 
-            // The row shrank, or the card kept up with it. Either way this row is behaving, and the
-            // anchor moves forward so the next window is measured from here rather than from an hour of
-            // honest growth the row is still carrying.
-            if (excess <= 0)
+            var outgrew = OutgrewTheCard(rowGrowth, cardGrowth, elapsed);
+            if (drifting)
             {
-                _growth[process.ProcessId] = new GrowthAnchor(process.ProcessName, sample.Timestamp, process.DedicatedBytes, adapterBytes);
-
-                if (_drifting.ContainsKey(process.ProcessId)
-                    && TryRecoverFromDrift(process.ProcessId, sample.Timestamp))
+                if (!outgrew)
                 {
+                    _drifting.Remove(id);
+                    _lastSeenWhileDrifting.Remove(id);
                     (recovered ??= []).Add(process.ProcessName);
                 }
 
                 continue;
             }
 
-            if (_drifting.ContainsKey(process.ProcessId))
-            {
-                // A row already marked drifting is still watched, not frozen against the moment it was
-                // first proven. Without this, "excess <= 0" is asked of a gap that still carries a
-                // one-time step from hours earlier, which a row that has since tracked the card
-                // perfectly can never clear on its own — the row would have to give the step back, not
-                // merely stop taking more. Recovery then only ever happened when the process restarted
-                // and the anchor reset to zero for free, which is what let 2026-09-10 recover and left
-                // 2026-09-11, where the game never restarted, stuck for the rest of the session. Once
-                // the anchor is old enough to re-ask the same question the original proof used — grown
-                // faster than the card over the last quarter hour — it is retaken from here, whatever
-                // this window's answer was, so staleness never compounds past one window.
-                if (elapsed >= MinimumDriftWindow)
-                {
-                    _growth[process.ProcessId] = new GrowthAnchor(process.ProcessName, sample.Timestamp, process.DedicatedBytes, adapterBytes);
-                }
-                else
-                {
-                    // Disagreed again, so any recovery streak in progress was not a real one.
-                    _recoveringSince.Remove(process.ProcessId);
-                }
-
-                continue;
-            }
-
-            if (elapsed < MinimumDriftWindow)
-            {
-                continue;
-            }
-
-            // Both rates have to clear the bar: the row's own growth as well as its excess over the
-            // card's. Excess alone is satisfied by a card that gave memory back, which turns every
-            // stationary row into a drifter — on 5 September the card released 0.71 GB and the session
-            // log filled with fourteen warnings about rows that had moved 0.00 GB. A row that did not
-            // grow is not counting anybody else's memory; the card simply moved underneath it.
-            var perHour = (long)(excess / elapsed.TotalHours);
-            var rowPerHour = (long)(rowGrowth / elapsed.TotalHours);
-            if (perHour < DriftBytesPerHour || rowPerHour < DriftBytesPerHour)
+            if (!outgrew)
             {
                 steady++;
                 continue;
             }
 
-            // And the excess has to be a real share of what the row gained, not a residual on top of
-            // growth the card agreed with. A game filling its texture budget takes 5.58 GB while the card
-            // takes 5.20 — the two moved together, and the 0.38 GB between them is the skew of two
-            // collectors that never sample at the same instant. Judged on the rates alone that residual
-            // is 1.5 GB/h and the game's own row was called drifting on 5 September, which made
-            // VramBudgetMonitor refuse to split the budget for the rest of the evening.
-            if (excess < rowGrowth * MinimumExcessShareOfGrowth)
-            {
-                steady++;
-                continue;
-            }
-
-            _drifting[process.ProcessId] = process.ProcessName;
+            _drifting[id] = process.ProcessName;
+            _lastSeenWhileDrifting[id] = sample.Timestamp;
             (found ??= []).Add(new DriftingRow(process, rowGrowth, cardGrowth, elapsed));
         }
 
@@ -456,31 +402,35 @@ public sealed class VramAccountingMonitor
             : new DriftReport(found ?? [], steady, recovered ?? []);
     }
 
-    /// <summary>
-    /// Advances a drifting row's recovery streak, and lifts the exclusion once it has held long enough.
-    /// </summary>
-    /// <remarks>
-    /// See <see cref="DriftRecoveryWindow"/> for why the streak has to span the same window the original
-    /// proof did. Returns true only on the sample that actually lifts the exclusion, which is the one the
-    /// caller has something to announce about.
-    /// </remarks>
-    private bool TryRecoverFromDrift(int processId, DateTimeOffset now)
+    /// <summary>Whether a row gained, over one window, memory the card never saw.</summary>
+    private static bool OutgrewTheCard(long rowGrowth, long cardGrowth, TimeSpan elapsed)
     {
-        if (!_recoveringSince.TryGetValue(processId, out var streak))
+        var excess = rowGrowth - cardGrowth;
+
+        // Both rates have to clear the bar: the row's own growth as well as its excess over the card's.
+        // Excess alone is satisfied by a card that gave memory back, which turns every stationary row into
+        // a drifter — on 5 September the card released 0.71 GB and the session log filled with fourteen
+        // warnings about rows that had moved 0.00 GB.
+        if (excess / elapsed.TotalHours < DriftBytesPerHour || rowGrowth / elapsed.TotalHours < DriftBytesPerHour)
         {
-            _recoveringSince[processId] = (now, now);
             return false;
         }
 
-        _recoveringSince[processId] = (streak.Since, now);
-        if (now - streak.Since < DriftRecoveryWindow)
-        {
-            return false;
-        }
+        // And the excess has to be a real share of what the row gained. A game filling its texture budget
+        // takes 5.58 GB while the card takes 5.20; the 0.38 GB between them is the skew of two collectors
+        // that never sample at the same instant, and on the rates alone it is 1.5 GB/h.
+        return excess >= rowGrowth * MinimumExcessShareOfGrowth;
+    }
 
-        _drifting.Remove(processId);
-        _recoveringSince.Remove(processId);
-        return true;
+    /// <summary>Notes a drifting row as seen, and says whether it was also seen in the moment before.</summary>
+    private bool SeenWithoutBreak(int processId, DateTimeOffset now)
+    {
+        var unbroken = _lastSeenWhileDrifting.TryGetValue(processId, out var last)
+            && now > last
+            && now - last <= AdapterFreshness;
+
+        _lastSeenWhileDrifting[processId] = now;
+        return unbroken;
     }
 
     /// <summary>

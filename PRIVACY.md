@@ -20,6 +20,10 @@ The app does not upload data to a cloud service by default.
 - OBS runtime stats when OBS is available
 - active TCP endpoints and UDP local ports for the active FiveM/GTA process
 - optional imported artifacts such as net stats, profiler files, logs and ETL traces
+- FiveM's own crash dumps in `FiveM.app\crashes`: only the crash address, the faulting module, the thread
+  name and whether Steam's client was loaded are read. The dumps are not copied, and no memory from them
+  is written anywhere.
+- `app-crash_*.txt` next to the session journals when the app itself dies of an exception
 
 ## Export defaults
 

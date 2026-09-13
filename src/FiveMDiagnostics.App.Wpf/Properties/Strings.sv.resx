@@ -215,4 +215,7 @@ eller hämta senaste utgåvan från https://github.com/benjibutten/FiveMDiagnost
   <data name="UpdateStatusInstalling" xml:space="preserve"><value>Installerar uppdateringen…</value></data>
   <data name="UpdateStatusRestarting" xml:space="preserve"><value>Startar FiveM Diagnostics igen…</value></data>
   <data name="TrayCheckForUpdates" xml:space="preserve"><value>Sök efter uppdateringar…</value></data>
+  <data name="StartWithWindows" xml:space="preserve"><value>Starta med Windows (i systemfältet)</value></data>
+  <data name="StartWithWindowsFailedFormat" xml:space="preserve"><value>Autostart med Windows kunde inte ändras: {0}</value></data>
+  <data name="StartWithWindowsNotElevated" xml:space="preserve"><value>Autostart med Windows är på, men appen körs inte som administratör just nu. Windows startar den då utan administratörsrättigheter, och deep capture fungerar inte. Slå av och på valet medan appen körs som administratör.</value></data>
 </root>

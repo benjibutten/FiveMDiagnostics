@@ -16,6 +16,9 @@ public sealed class HalfHourBreakdownMonitor
     private readonly HitchThreshold _hitch;
     private readonly SortedDictionary<DateTimeOffset, Bucket> _buckets = new();
 
+    /// <summary>The pump folds frames in while the quarter-hour summary reads the table.</summary>
+    private readonly object _sync = new();
+
     /// <summary>Frames held back until the bar is fixed, so this table counts what the other lines count.</summary>
     private readonly List<(DateTimeOffset At, double FrameTimeMs, double? CpuBusyMs)> _warmup = [];
 
@@ -30,14 +33,17 @@ public sealed class HalfHourBreakdownMonitor
     /// </summary>
     public void ObserveFrame(DateTimeOffset at, double frameTimeMs, double? cpuBusyMs)
     {
-        if (!_hitch.IsSettled)
+        lock (_sync)
         {
-            _warmup.Add((at, frameTimeMs, cpuBusyMs));
-            return;
-        }
+            if (!_hitch.IsSettled)
+            {
+                _warmup.Add((at, frameTimeMs, cpuBusyMs));
+                return;
+            }
 
-        DrainWarmup();
-        Count(at, frameTimeMs, cpuBusyMs);
+            DrainWarmup();
+            Count(at, frameTimeMs, cpuBusyMs);
+        }
     }
 
     private void Count(DateTimeOffset at, double frameTimeMs, double? cpuBusyMs)
@@ -65,23 +71,29 @@ public sealed class HalfHourBreakdownMonitor
     /// <summary>Folds one adapter VRAM reading in.</summary>
     public void ObserveVram(DateTimeOffset at, double vramPercent)
     {
-        BucketFor(at).VramReadings.Add(vramPercent);
+        lock (_sync)
+        {
+            BucketFor(at).VramReadings.Add(vramPercent);
+        }
     }
 
-    /// <summary>The finished table, oldest half hour first, or null when nothing was ever observed.</summary>
+    /// <summary>The table so far, oldest half hour first, or null when nothing was ever observed.</summary>
     public HalfHourBreakdownReport? Summary()
     {
-        // A session shorter than the warm-up still gets a bar, from the frames it has.
-        _hitch.Settle();
-        DrainWarmup();
-
-        if (_buckets.Count == 0)
+        lock (_sync)
         {
-            return null;
-        }
+            // A session shorter than the warm-up still gets a bar, from the frames it has.
+            _hitch.Settle();
+            DrainWarmup();
 
-        var rows = _buckets.Select(entry => BuildRow(entry.Key, entry.Value)).ToArray();
-        return new HalfHourBreakdownReport(rows);
+            if (_buckets.Count == 0)
+            {
+                return null;
+            }
+
+            var rows = _buckets.Select(entry => BuildRow(entry.Key, entry.Value)).ToArray();
+            return new HalfHourBreakdownReport(rows);
+        }
     }
 
     private static HalfHourBreakdownRow BuildRow(DateTimeOffset start, Bucket bucket)

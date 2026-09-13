@@ -344,6 +344,44 @@ public sealed class VramDriftingRowTests
     }
 
     /// <summary>
+    /// 2026-09-12: the game's row was marked drifting at 23:26 and the budget stayed refused to the end of
+    /// the evening, while every quarter hour afterwards had the row in step with the card.
+    /// </summary>
+    /// <remarks>
+    /// The real readings are never flat. The two collectors sample a few seconds apart and both figures
+    /// move by tens of megabytes between samples, so recovery that needed every sample of a quarter hour to
+    /// agree never got more than twenty seconds in a row. Same noise below, on a row that tracks the card.
+    /// </remarks>
+    [Theory]
+    [InlineData(0.0, false)]
+    [InlineData(2.0, true)]
+    public void ANoisyRowRecoversWhenItTracksTheCardAndNotWhenItKeepsOutgrowingIt(double excessGigabytesPerHour, bool stillDrifting)
+    {
+        var monitor = new VramAccountingMonitor();
+
+        Observe(monitor, Start, gameGigabytes: 4.3, cardGigabytes: 8.0);
+        monitor.ObserveDrift(Sample(Start, gameGigabytes: 4.3));
+
+        var driftAt = Start.AddMinutes(40);
+        Observe(monitor, driftAt, gameGigabytes: 5.9, cardGigabytes: 8.1);
+        Assert.Single(monitor.ObserveDrift(Sample(driftAt, gameGigabytes: 5.9))!.Rows);
+
+        var noise = new Random(20260912);
+        GpuProcessMemorySample annotated = Sample(driftAt, 5.9);
+        for (var seconds = 5; seconds <= 40 * 60; seconds += 5)
+        {
+            var at = driftAt.AddSeconds(seconds);
+            var gained = excessGigabytesPerHour * seconds / 3600;
+            var game = 5.9 + gained + ((noise.NextDouble() - 0.5) * 0.12);
+            monitor.Observe(Adapter(at, usedGigabytes: 8.1 + ((noise.NextDouble() - 0.5) * 0.12)));
+            monitor.ObserveDrift(Sample(at, game));
+            annotated = monitor.Annotate(Sample(at, game), out _);
+        }
+
+        Assert.Equal(stillDrifting, annotated.IsDrifting(annotated.Processes[0]));
+    }
+
+    /// <summary>
     /// A process id recycled to a different program inherits no drift verdict.
     /// </summary>
     /// <remarks>

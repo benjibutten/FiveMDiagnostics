@@ -7,7 +7,11 @@
 /// The trace it wrote, or null when it never reported one. The caller deletes it — the ceiling is a
 /// ceiling on files as much as on flushes, and a replacement that left both on disk would raise it.
 /// </param>
-public sealed record CaptureReplacement(DateTimeOffset At, double FrameTimeMs, string? Path);
+/// <param name="FromReserve">
+/// True when the slot was taken inside the reserve, with free slots still left, rather than at the
+/// ceiling. The two read alike and are not the same decision.
+/// </param>
+public sealed record CaptureReplacement(DateTimeOffset At, double FrameTimeMs, string? Path, bool FromReserve = false);
 
 /// <summary>Why the most recent reservation was refused, for a caller that wants more than the sentence.</summary>
 public enum CaptureRefusalReason
@@ -126,6 +130,18 @@ public sealed class AutoDeepCaptureBudget
     /// already counts as capture-worthy keeps them apart on any threshold.
     /// </remarks>
     private const double MinimumOverrideRatio = 1.25;
+
+    /// <summary>
+    /// How much worse than the weakest capture already taken a frame has to be to replace it inside the
+    /// reserve.
+    /// </summary>
+    /// <remarks>
+    /// The reserve holds its slots for a worse frame than the ones already traced, and "worse" used to
+    /// mean any amount. On 2026-09-12 a 162 ms frame deleted the trace of a 159 ms one with two of six
+    /// slots free: a flush, a disturbed ring buffer and a lost file for three milliseconds. Half again as
+    /// long is a different event rather than the same one measured twice.
+    /// </remarks>
+    public const double ReserveReplacementRatio = 1.5;
 
     private readonly DeepCaptureOptions _options;
     private readonly List<DateTimeOffset> _spentAt = [];
@@ -618,12 +634,14 @@ public sealed class AutoDeepCaptureBudget
         // Replacement is tried here too, not only once the ceiling is spent outright. On 7 September the
         // budget held four of six slots, so the ceiling gate above never got a chance to displace anything
         // — and four ordinary hitches inside the same cluster were refused by this gate alone, one of them
-        // the frame the session's own worst stall needed a trace for. A frame worse than the weakest slot
-        // already spent may take it here as well; only a frame that beats nothing already taken is left to
-        // the reserve.
+        // the frame the session's own worst stall needed a trace for. A frame clearly worse than the weakest
+        // slot already spent — see ReserveReplacementRatio — may take it here as well; anything else is
+        // left to the reserve.
+        var fromReserve = false;
         if (displaced is null && !maySpendReserve && Spent >= _options.MaxAutoCapturesPerSession - _options.ReservedSevereCaptures)
         {
-            displaced = WeakestCaptureBelow(frameTimeMs);
+            displaced = WeakestCaptureBelow(frameTimeMs / ReserveReplacementRatio);
+            fromReserve = true;
             if (displaced is null)
             {
                 _lastRefusalReason = CaptureRefusalReason.ReservedForSevereFrames;
@@ -671,7 +689,7 @@ public sealed class AutoDeepCaptureBudget
             if (displaced is not null)
             {
                 _captures.Remove(displaced);
-                replaced = new CaptureReplacement(displaced.At, displaced.FrameTimeMs, displaced.Path);
+                replaced = new CaptureReplacement(displaced.At, displaced.FrameTimeMs, displaced.Path, fromReserve);
                 _replacementCount++;
             }
 

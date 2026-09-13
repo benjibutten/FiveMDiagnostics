@@ -6,6 +6,7 @@ using System.Windows.Threading;
 namespace FiveMDiagnostics.App.Wpf;
 
 using FiveMDiagnostics.App.Wpf.Properties;
+using FiveMDiagnostics.App.Wpf.Services;
 using FiveMDiagnostics.Collectors;
 using FiveMDiagnostics.Core;
 using FiveMDiagnostics.Fakes;
@@ -18,6 +19,8 @@ public sealed class MainWindowViewModel : ObservableObject
 
     /// <summary>Status source for everything the session automation says, so the journal groups it.</summary>
     private const string AutoSessionSource = "Session.Auto";
+
+    private const string AutostartSource = "App.Autostart";
 
     private readonly DiagnosticsSessionManager _sessionManager;
     private readonly SettingsStore _settingsStore;
@@ -58,6 +61,7 @@ public sealed class MainWindowViewModel : ObservableObject
     private bool _autoSessionBusy;
     private DateTimeOffset _lastAutoSessionCheckUtc = DateTimeOffset.MinValue;
     private bool _autoSessionEnabled;
+    private bool _startWithWindows = WindowsAutostart.IsEnabled();
 
     private IncidentRecord? _selectedIncident;
     private bool _isSessionActive;
@@ -468,6 +472,42 @@ public sealed class MainWindowViewModel : ObservableObject
                 _autoSession.Reset();
                 OnPropertyChanged(nameof(SessionStateText));
             }
+        }
+    }
+
+    /// <summary>
+    /// Read from the scheduled task itself rather than from settings, so the box cannot claim a task that
+    /// is not there. Applied the moment it is ticked, like the task it stands for.
+    /// </summary>
+    public bool StartWithWindows
+    {
+        get => _startWithWindows;
+        set
+        {
+            if (value == _startWithWindows)
+            {
+                return;
+            }
+
+            try
+            {
+                if (value && !WindowsAutostart.Enable())
+                {
+                    _sessionManager.Report(StatusLevel.Warning, AutostartSource, Strings.StartWithWindowsNotElevated);
+                }
+                else if (!value)
+                {
+                    WindowsAutostart.Disable();
+                }
+
+                _startWithWindows = value;
+            }
+            catch (Exception ex)
+            {
+                _sessionManager.Report(StatusLevel.Warning, AutostartSource, string.Format(Strings.StartWithWindowsFailedFormat, ex.Message));
+            }
+
+            OnPropertyChanged();
         }
     }
 

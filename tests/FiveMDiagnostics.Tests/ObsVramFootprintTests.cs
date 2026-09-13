@@ -92,8 +92,8 @@ public sealed class ObsVramFootprintTests
         Assert.NotNull(report);
         Assert.NotNull(report.Encoder);
         Assert.Null(report.RestOfStack);
-        Assert.Contains("OBS-processen avslutades aldrig", report.Message, StringComparison.Ordinal);
-        Assert.Contains("omätt i kväll", report.Message, StringComparison.Ordinal);
+        Assert.Contains("OBS-processen har inte avslutats", report.Message, StringComparison.Ordinal);
+        Assert.Contains("omätt än så länge", report.Message, StringComparison.Ordinal);
     }
 
     /// <summary>An evening where OBS ran to the end has no step to read and says nothing.</summary>

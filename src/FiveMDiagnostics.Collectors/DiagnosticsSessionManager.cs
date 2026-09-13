@@ -1,4 +1,5 @@
-﻿using System.Threading.Channels;
+﻿using System.Diagnostics;
+using System.Threading.Channels;
 
 namespace FiveMDiagnostics.Collectors;
 
@@ -66,6 +67,10 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     private IncidentMaterializer? _incidentMaterializer;
     private Task? _pumpTask;
     private Task? _finalizeTask;
+
+    /// <summary>The stop in progress, so a second caller joins it instead of tearing down twice.</summary>
+    private Task? _stopping;
+    private readonly object _stopSync = new();
     private Task[] _collectorTasks = [];
     private volatile bool _isSessionActive;
     private AutoIncidentDetector? _autoDetector;
@@ -548,6 +553,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             Report(StatusLevel.Info, "SessionStart.Age", ages);
         }
 
+        ReportNewCrashDumps();
+
         // At the start rather than in the summary, because it is the one finding of this investigation
         // that is fixed before playing rather than analysed afterwards.
         if (RefreshRateMismatch.Describe(Environment?.Displays) is { } mismatch)
@@ -648,7 +655,24 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         OnStateChanged();
     }
 
-    public async Task StopSessionAsync()
+    /// <remarks>
+    /// Windows shutting down and the tray's Exit can both stop the session while the automation is
+    /// stopping it too, so a stop already under way is joined rather than run a second time.
+    /// </remarks>
+    public Task StopSessionAsync()
+    {
+        lock (_stopSync)
+        {
+            if (_stopping is { IsCompleted: false } running)
+            {
+                return running;
+            }
+
+            return _stopping = StopSessionCoreAsync();
+        }
+    }
+
+    private async Task StopSessionCoreAsync()
     {
         if (!IsSessionActive)
         {
@@ -658,6 +682,24 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         var cancellationTokenSource = _sessionCts;
         var writer = _channel?.Writer;
         cancellationTokenSource?.Cancel();
+
+        if (_finalizeTask is not null)
+        {
+            try
+            {
+                await _finalizeTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        // Before anything slow. The collectors, the analysis queue and the WPR teardown below take
+        // seconds, and the app gives the whole stop two seconds on its way out — so the summaries, written
+        // only at the very end, were lost whenever the app was closed rather than stopped. The finalize
+        // loop has stopped, so no other pass writes summaries at the same time; the pump is still folding
+        // telemetry into the monitors, exactly as it is during every quarter-hour pass.
+        WriteSessionSummaries(final: false);
 
         try
         {
@@ -674,17 +716,6 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             try
             {
                 await _pumpTask.ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-            }
-        }
-
-        if (_finalizeTask is not null)
-        {
-            try
-            {
-                await _finalizeTask.ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -1247,51 +1278,50 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// cause rather than reading as an evening that went well.
     /// </summary>
     /// <remarks>
-    /// Only at the end, and only when there were any: the frames are already in the hitch figures every
-    /// other line quotes, and this exists to reconcile two numbers a reader would otherwise compare
-    /// against last week's.
+    /// Only when there were any: the frames are already in the hitch figures every other line quotes,
+    /// and this exists to reconcile two numbers a reader would otherwise compare against last week's.
+    /// On the quarter-hour as well as at the end, because the evening of 2026-09-12 never reached its end.
     /// </remarks>
     private void FinalizeAutoIncidentFloor(bool final)
     {
-        if (!final)
-        {
-            return;
-        }
-
         var floorMs = _settings.AutoDetect.IncidentFloorMs;
         if (_autoDetector is { HitchesBelowFloor: > 0 } detector && floorMs > 0)
         {
-            Report(
-                StatusLevel.Info,
-                "Incident.Floor",
-                $"{detector.HitchesBelowFloor} frames över {_settings.AutoDetect.SpikeMultiplier:0.#}× baslinje "
-                    + $"men under {floorMs:F0} ms räknades som hitches utan incident.");
+            var message = $"{detector.HitchesBelowFloor} frames över {_settings.AutoDetect.SpikeMultiplier:0.#}× baslinje "
+                + $"men under {floorMs:F0} ms räknades som hitches utan incident.";
+
+            if (ShouldWriteSummary("Incident.Floor", message))
+            {
+                Report(StatusLevel.Info, "Incident.Floor", message);
+            }
         }
 
-        _autoDetector = null;
+        if (final)
+        {
+            _autoDetector = null;
+        }
     }
 
     /// <summary>
-    /// Writes the session's half-hour table, once, at the end.
+    /// Writes the session's half-hour table so far.
     /// </summary>
     /// <remarks>
-    /// Reprinting every bucket on the quarter-hour cadence the other summaries use would mean the whole
-    /// table so far, again, every fifteen minutes — the interesting form of this is the finished shape,
-    /// not its partial state five minutes after the session began.
+    /// It used to wait for the finished shape at the end, and the evening of 2026-09-12 ended with the
+    /// app gone four seconds after the game: nine half hours of the best evening in the series, and no
+    /// table. The whole table is repeated each quarter of an hour; the last one written is the one that
+    /// counts.
     /// </remarks>
     private void FinalizeHalfHourBreakdown(bool final)
     {
-        if (!final)
-        {
-            return;
-        }
-
-        if (_halfHourBreakdown?.Summary() is { } report)
+        if (_halfHourBreakdown?.Summary() is { } report && ShouldWriteSummary("Session.HalfHours", report.Message))
         {
             Report(StatusLevel.Info, "Session.HalfHours", report.Message);
         }
 
-        _halfHourBreakdown = null;
+        if (final)
+        {
+            _halfHourBreakdown = null;
+        }
     }
 
     /// <summary>
@@ -1410,15 +1440,22 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     }
 
     /// <summary>Whether this summary says anything its own last line did not.</summary>
+    /// <remarks>
+    /// Locked because the pump writes the OBS footprint the moment a step completes, while the finalize
+    /// loop writes the rest.
+    /// </remarks>
     private bool ShouldWriteSummary(string source, string message)
     {
-        if (_lastSummaryLine.TryGetValue(source, out var previous) && string.Equals(previous, message, StringComparison.Ordinal))
+        lock (_lastSummaryLine)
         {
-            return false;
-        }
+            if (_lastSummaryLine.TryGetValue(source, out var previous) && string.Equals(previous, message, StringComparison.Ordinal))
+            {
+                return false;
+            }
 
-        _lastSummaryLine[source] = message;
-        return true;
+            _lastSummaryLine[source] = message;
+            return true;
+        }
     }
 
     /// <summary>
@@ -1667,10 +1704,16 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// </remarks>
     private void DiscardReplacedCapture(CaptureReplacement replaced, double frameTimeMs)
     {
+        var options = _settings.DeepCapture;
+        var why = replaced.FromReserve
+            ? $" ur reserven: de sista {options.ReservedSevereCaptures} av {options.MaxAutoCapturesPerSession} "
+                + "captures hålls för värre frames, och en tagen capture byts där bara mot en frame som är mer än "
+                + $"{AutoDeepCaptureBudget.ReserveReplacementRatio:0.#} gånger så lång."
+            : $": taket på {options.MaxAutoCapturesPerSession} captures står kvar, och den minst allvarliga får ge "
+                + "plats för den värre.";
+
         var message = $"Deep capture för en {frameTimeMs:F0} ms hitch tog platsen från capturen för "
-            + $"{replaced.FrameTimeMs:F0} ms kl. {replaced.At.ToLocalTime():HH:mm:ss}: taket på "
-            + $"{_settings.DeepCapture.MaxAutoCapturesPerSession} captures står kvar, och den minst "
-            + "allvarliga får ge plats för den värre.";
+            + $"{replaced.FrameTimeMs:F0} ms kl. {replaced.At.ToLocalTime():HH:mm:ss}{why}";
 
         if (replaced.Path is { } path)
         {
@@ -2345,7 +2388,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                     _vramBudget?.Observe(gpuSample);
                     _vramPressure?.Observe(gpuSample);
                     _postGameVram?.Observe(gpuSample);
-                    _obsVram?.Observe(gpuSample);
+                    if (_obsVram?.Observe(gpuSample) == true)
+                    {
+                        FinalizeObsVramFootprint(final: false);
+                    }
+
                     if (gpuSample.VramUsagePercent is { } vramPercent)
                     {
                         _halfHourBreakdown?.ObserveVram(gpuSample.Timestamp, vramPercent);
@@ -2600,6 +2647,10 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 }
 
                 _lastTargetProcessId = target.ProcessId;
+                ReportSteam(target.ProcessId);
+
+                // A crash inside a running session is followed by a relaunch as often as by an exit.
+                ReportNewCrashDumps();
             }
 
             _targetProcessSeen = true;
@@ -2615,6 +2666,9 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         }
 
         _reportedTargetProcessExit = true;
+
+        // Ahead of the exit line, so a crash reads as the reason the game closed.
+        ReportNewCrashDumps();
 
         var exitedAt = DateTimeOffset.UtcNow;
         _postGameVram?.NoteGameExit(exitedAt);
@@ -2636,6 +2690,55 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             + " Sammanfattningarna nedan gäller det som hann mätas.");
 
         WriteSessionSummaries(final: false);
+    }
+
+    /// <summary>
+    /// Says whether Steam was running when the session saw this game process, the way the OBS collector
+    /// says whether OBS was.
+    /// </summary>
+    /// <remarks>
+    /// The crash of 2026-09-12 had Steam's client loaded in the game, and closing Steam is the evening's
+    /// one change. Asked when the game appears rather than once at session start: the session outlives a
+    /// relaunch, and it is the state at launch that decides what FiveM loads.
+    /// </remarks>
+    private void ReportSteam(int gameProcessId)
+    {
+        var steam = Process.GetProcessesByName("steam");
+        var running = steam.Length > 0;
+        foreach (var process in steam)
+        {
+            process.Dispose();
+        }
+
+        if (running)
+        {
+            Report(
+                StatusLevel.Warning,
+                "Steam",
+                $"Steam körs: steam.exe fanns när spelet (PID {gameProcessId}) hittades. FiveM laddar då in Steams "
+                + "klient, och det är den kombination som hör till den kända kraschen i citizen-devtools.dll "
+                + "efter ungefär 20 minuter.");
+            return;
+        }
+
+        Report(StatusLevel.Info, "Steam", $"Steam körs inte: ingen steam.exe när spelet (PID {gameProcessId}) hittades.");
+    }
+
+    /// <summary>
+    /// Writes one line per FiveM crash dump no session has reported yet, including crashes that happened
+    /// while this app was not running.
+    /// </summary>
+    private void ReportNewCrashDumps()
+    {
+        if (FiveMCrashDumpLog.DefaultCrashDirectory is not { } directory)
+        {
+            return;
+        }
+
+        foreach (var dump in FiveMCrashDumpLog.TakeNew(directory, _settings.WorkingDirectory, DateTimeOffset.UtcNow))
+        {
+            Report(StatusLevel.Warning, "FiveM.Crash", dump.Describe(DateTimeOffset.Now));
+        }
     }
 
     private void CheckGameSettings(DateTimeOffset now)

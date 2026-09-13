@@ -175,4 +175,7 @@ public static class Strings
     public static string UpdateStatusInstalling => ResourceManager.GetString("UpdateStatusInstalling", Culture) ?? "Installing the update…";
     public static string UpdateStatusRestarting => ResourceManager.GetString("UpdateStatusRestarting", Culture) ?? "Starting FiveM Diagnostics again…";
     public static string TrayCheckForUpdates => ResourceManager.GetString("TrayCheckForUpdates", Culture) ?? "Check for updates…";
+    public static string StartWithWindows => ResourceManager.GetString("StartWithWindows", Culture) ?? "Start with Windows (in the tray)";
+    public static string StartWithWindowsFailedFormat => ResourceManager.GetString("StartWithWindowsFailedFormat", Culture) ?? "Starting with Windows could not be changed: {0}";
+    public static string StartWithWindowsNotElevated => ResourceManager.GetString("StartWithWindowsNotElevated", Culture) ?? "Start with Windows is on, but the app is not running as administrator right now. Windows will then start it without administrator rights, and deep capture will not work. Turn the option off and on again while the app runs as administrator.";
 }

@@ -94,11 +94,16 @@ public sealed class ObsVramFootprintMonitor
     private ObsVramStep? _restOfStackStep;
 
     /// <summary>Folds one adapter reading in.</summary>
-    public void Observe(GpuTelemetrySample sample)
+    /// <returns>
+    /// True on the reading that completes a step. The line is written then rather than on the next
+    /// quarter-hour: on 2026-09-12 both steps were measured, 100 seconds apart, and the app was gone
+    /// before any summary came due.
+    /// </returns>
+    public bool Observe(GpuTelemetrySample sample)
     {
         if (!sample.IsAvailable || sample.VramUsagePercent is not { } percent)
         {
-            return;
+            return false;
         }
 
         lock (_sync)
@@ -112,8 +117,11 @@ public sealed class ObsVramFootprintMonitor
             }
 
             // Each step is worked out once, as soon as the readings that describe it have all arrived.
+            var hadEncoder = _encoderStep is not null;
+            var hadRestOfStack = _restOfStackStep is not null;
             _encoderStep ??= CompletedStep(_streamStoppedAt, sample.Timestamp);
             _restOfStackStep ??= CompletedStep(_processStoppedAt, sample.Timestamp);
+            var completed = (!hadEncoder && _encoderStep is not null) || (!hadRestOfStack && _restOfStackStep is not null);
 
             var cutoff = sample.Timestamp - History;
             var stale = 0;
@@ -126,6 +134,8 @@ public sealed class ObsVramFootprintMonitor
             {
                 _readings.RemoveRange(0, stale);
             }
+
+            return completed;
         }
     }
 
@@ -271,8 +281,10 @@ public sealed record ObsVramFootprintReport(
             // measurement that was only given half its evidence.
             var missing = (Encoder, RestOfStack) switch
             {
-                (not null, null) => " OBS-processen avslutades aldrig under sessionen, så resten av "
-                    + "stacken — kanvas, game capture och webbkällor — är omätt i kväll. Den delen "
+                // Worded to hold both when written the moment the encoder step completes and at the end
+                // of an evening where OBS kept running.
+                (not null, null) => " OBS-processen har inte avslutats under mätningen, så resten av "
+                    + "stacken — kanvas, game capture och webbkällor — är omätt än så länge. Den delen "
                     + "kräver att processen stängs medan mätningen fortfarande rullar.",
                 (null, not null) => " Strömmen stoppades aldrig separat, så encoderns egen andel är omätt "
                     + "i kväll; siffran ovan är hela stacken i ett steg.",

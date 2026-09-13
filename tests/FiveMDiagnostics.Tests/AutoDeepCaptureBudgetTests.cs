@@ -682,6 +682,7 @@ public sealed class AutoDeepCaptureBudgetTests
 
         // The file it wrote, so the ceiling on captures stays a ceiling on files.
         Assert.Equal("deep_1.etl", replaced.Path);
+        Assert.False(replaced.FromReserve);
 
         // And the ceiling itself does not move.
         Assert.Equal(6, budget.Spent);
@@ -753,6 +754,33 @@ public sealed class AutoDeepCaptureBudgetTests
         // The 255 ms capture gives up its slot, and the file named is the one that capture wrote.
         Assert.Equal(255, replaced!.FrameTimeMs);
         Assert.Equal("deep_1.etl", replaced.Path);
+    }
+
+    /// <summary>
+    /// 2026-09-12 01:30: a 162 ms frame deleted the trace of a 159 ms one with two of six slots still
+    /// free. Inside the reserve a replacement has to be clearly worse, and says it came from the reserve.
+    /// </summary>
+    [Fact]
+    public void InsideTheReserveOnlyAClearlyWorseFrameReplacesATrace()
+    {
+        var budget = new AutoDeepCaptureBudget(Options(item => item.MaxAutoCapturesPerWindow = 100));
+        var frameTimes = new[] { 172d, 224, 159, 200 };
+
+        for (var index = 0; index < frameTimes.Length; index++)
+        {
+            var at = Start.AddHours(index);
+            Assert.True(budget.TryReserve(at, frameTimes[index], out _));
+            budget.NoteCaptureWritten(at.AddSeconds(30), $"deep_{index}.etl");
+        }
+
+        Assert.False(budget.TryReserve(Start.AddHours(5), frameTimeMs: 162, out var refusal, out var replaced));
+        Assert.Null(replaced);
+        Assert.Contains("reserverade", refusal!, StringComparison.Ordinal);
+
+        Assert.True(budget.TryReserve(Start.AddHours(6), frameTimeMs: 240, out _, out replaced));
+        Assert.Equal(159, replaced!.FrameTimeMs);
+        Assert.True(replaced.FromReserve);
+        Assert.Equal(4, budget.Spent);
     }
 
     /// <summary>
