@@ -128,8 +128,20 @@ public sealed class SettingsStore
         settings.Obs.Normalize();
         settings.MaxRetainedIncidents = Math.Clamp(settings.MaxRetainedIncidents, 1, 1000);
 
-        Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
-        await using var stream = File.Create(SettingsPath);
-        await JsonSerializer.SerializeAsync(stream, settings, JsonOptions, cancellationToken).ConfigureAwait(false);
+        // One writer at a time: the pre-launch tick boxes save on every change, and two overlapping
+        // File.Create calls on the same path fail with the file in use.
+        await _saveLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
+            await using var stream = File.Create(SettingsPath);
+            await JsonSerializer.SerializeAsync(stream, settings, JsonOptions, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _saveLock.Release();
+        }
     }
+
+    private readonly SemaphoreSlim _saveLock = new(1, 1);
 }

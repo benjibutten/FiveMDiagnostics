@@ -142,6 +142,39 @@
                                 <Button Content="{x:Static props:Strings.StopSession}" Command="{Binding StopSessionCommand}" Background="#C97164" BorderBrush="#C97164" />
                             </WrapPanel>
 
+                            <TextBlock Text="{x:Static props:Strings.PreLaunchGroup}" Style="{StaticResource SubHeaderStyle}" />
+                            <TextBlock Text="{x:Static props:Strings.PreLaunchHint}" Style="{StaticResource FieldHintStyle}" Margin="0,0,0,6" />
+                            <ItemsControl ItemsSource="{Binding PreLaunchApps}">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate>
+                                        <UniformGrid Columns="2" />
+                                    </ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <CheckBox IsChecked="{Binding IsChecked}" Margin="0,2,0,2">
+                                            <StackPanel Orientation="Horizontal">
+                                                <TextBlock Text="{Binding Name}" />
+                                                <TextBlock Text="{x:Static props:Strings.PreLaunchRunning}" Foreground="{StaticResource AccentMutedBrush}"
+                                                           FontSize="11" Margin="6,1,0,0">
+                                                    <TextBlock.Style>
+                                                        <Style TargetType="TextBlock">
+                                                            <Setter Property="Visibility" Value="Collapsed" />
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding IsRunning}" Value="True">
+                                                                    <Setter Property="Visibility" Value="Visible" />
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </TextBlock.Style>
+                                                </TextBlock>
+                                            </StackPanel>
+                                        </CheckBox>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                            <Button Content="{x:Static props:Strings.PreLaunchButton}" Command="{Binding CloseAppsAndLaunchCommand}" HorizontalAlignment="Left" Margin="0,8,0,0" />
+
                             <TextBlock Text="{x:Static props:Strings.IncidentActionsGroup}" Style="{StaticResource SubHeaderStyle}" />
                             <WrapPanel>
                                 <Button Content="{x:Static props:Strings.MarkStutter}" Command="{Binding MarkStutterCommand}" Background="#6E9FA5" BorderBrush="#6E9FA5" />

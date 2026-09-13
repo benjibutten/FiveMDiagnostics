@@ -1135,6 +1135,12 @@ public sealed record DiagnosticsSettings
     /// </summary>
     public bool AutoSession { get; set; } = true;
 
+    /// <summary>
+    /// The apps ticked for closing before FiveM is launched, by name. Null until the list is first
+    /// touched, so the app's own defaults apply rather than an empty choice nobody made.
+    /// </summary>
+    public List<string>? PreLaunchClose { get; set; }
+
     public string Language { get; set; } = "en";
 
     public static DiagnosticsSettings CreateDefault()

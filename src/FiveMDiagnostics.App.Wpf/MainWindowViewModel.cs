@@ -1,5 +1,6 @@
 ﻿using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
+using System.IO;
 using System.Windows;
 using System.Windows.Threading;
 
@@ -21,6 +22,8 @@ public sealed class MainWindowViewModel : ObservableObject
     private const string AutoSessionSource = "Session.Auto";
 
     private const string AutostartSource = "App.Autostart";
+
+    private const string PreLaunchSource = "App.PreLaunch";
 
     private readonly DiagnosticsSessionManager _sessionManager;
     private readonly SettingsStore _settingsStore;
@@ -62,6 +65,14 @@ public sealed class MainWindowViewModel : ObservableObject
     private DateTimeOffset _lastAutoSessionCheckUtc = DateTimeOffset.MinValue;
     private bool _autoSessionEnabled;
     private bool _startWithWindows = WindowsAutostart.IsEnabled();
+
+    /// <summary>
+    /// What the pre-launch button did, held for the journal of the session the launch starts. The
+    /// button runs before the game and so before the session, and the journal only exists once it has.
+    /// </summary>
+    private DiagnosticStatusEntry? _pendingPreLaunchReport;
+    private DateTimeOffset _lastPreLaunchRefreshUtc = DateTimeOffset.MinValue;
+    private bool _fiveMRunning;
 
     private IncidentRecord? _selectedIncident;
     private bool _isSessionActive;
@@ -133,6 +144,15 @@ public sealed class MainWindowViewModel : ObservableObject
         SimulateObsScenarioCommand = new RelayCommand(() => AddScenario(FakeScenarioKind.ObsGpuContention));
         SimulateResourceScenarioCommand = new RelayCommand(() => AddScenario(FakeScenarioKind.FiveMResourceSpike));
         SimulateNetworkScenarioCommand = new RelayCommand(() => AddScenario(FakeScenarioKind.NetworkIssue));
+        CloseAppsAndLaunchCommand = new AsyncRelayCommand(CloseAppsAndLaunchAsync, () => !_fiveMRunning && _sessionManager.ActiveProcess is null);
+
+        PreLaunchApps = PreLaunch.Apps
+            .Select(app => new PreLaunchAppViewModel(
+                app,
+                settings.PreLaunchClose?.Contains(app.Name, StringComparer.OrdinalIgnoreCase) ?? app.ClosedByDefault,
+                SavePreLaunchChoice))
+            .ToArray();
+        RefreshPreLaunchRunning();
 
         _sessionManager.StateChanged += OnSessionStateChanged;
         _sessionManager.StatusReported += OnStatusReported;
@@ -205,6 +225,10 @@ public sealed class MainWindowViewModel : ObservableObject
     public RelayCommand SimulateResourceScenarioCommand { get; }
 
     public RelayCommand SimulateNetworkScenarioCommand { get; }
+
+    public AsyncRelayCommand CloseAppsAndLaunchCommand { get; }
+
+    public IReadOnlyList<PreLaunchAppViewModel> PreLaunchApps { get; }
 
     public bool IsSessionActive
     {
@@ -590,6 +614,104 @@ public sealed class MainWindowViewModel : ObservableObject
 
         await _dispatcher.InvokeAsync(RefreshState, DispatcherPriority.Background);
         CaptureFeedbackText = Strings.CaptureFeedbackSessionStarted;
+
+        if (_pendingPreLaunchReport is { } report)
+        {
+            _pendingPreLaunchReport = null;
+            _sessionManager.Report(report.Level, report.Source, report.Message);
+        }
+    }
+
+    private async Task CloseAppsAndLaunchAsync()
+    {
+        // The flag behind the button can be five seconds old.
+        RefreshPreLaunchRunning();
+        if (_fiveMRunning)
+        {
+            return;
+        }
+
+        string shortcut;
+        try
+        {
+            shortcut = PreLaunch.PrepareFiveMShortcut();
+        }
+        catch (Exception ex)
+        {
+            _sessionManager.Report(StatusLevel.Error, PreLaunchSource, string.Format(Strings.PreLaunchLaunchFailedFormat, ex.Message));
+            return;
+        }
+
+        var apps = PreLaunchApps.Where(row => row.IsChecked).Select(row => row.App).ToArray();
+        var result = await Task.Run(() => PreLaunch.Close(apps)).ConfigureAwait(true);
+
+        var message = string.Format(
+            Strings.PreLaunchClosedFormat,
+            DateTimeOffset.Now.ToString("HH:mm"),
+            result.Closed.Count > 0 ? string.Join(", ", result.Closed) : Strings.PreLaunchNothingClosed);
+        if (result.Failed.Count > 0)
+        {
+            message += " " + string.Format(Strings.PreLaunchFailedFormat, string.Join(", ", result.Failed));
+        }
+
+        var level = result.Failed.Count > 0 ? StatusLevel.Warning : StatusLevel.Info;
+
+        try
+        {
+            PreLaunch.StartFiveM(shortcut);
+        }
+        catch (Exception ex)
+        {
+            _sessionManager.Report(level, PreLaunchSource, message);
+            _sessionManager.Report(StatusLevel.Error, PreLaunchSource, string.Format(Strings.PreLaunchLaunchFailedFormat, ex.Message));
+            RefreshPreLaunchRunning();
+            return;
+        }
+
+        if (IsSessionActive)
+        {
+            _sessionManager.Report(level, PreLaunchSource, message);
+        }
+        else
+        {
+            _pendingPreLaunchReport = new DiagnosticStatusEntry(DateTimeOffset.Now, level, PreLaunchSource, message);
+        }
+
+        // Explorer starts FiveM a moment after it is asked to, and until the launcher exists nothing
+        // stops a second click from starting a second instance. The command stays busy until then.
+        for (var attempt = 0; attempt < 30 && !PreLaunch.IsFiveMRunning(await Task.Run(PreLaunch.RunningProcessNames).ConfigureAwait(true)); attempt++)
+        {
+            await Task.Delay(500).ConfigureAwait(true);
+        }
+
+        RefreshPreLaunchRunning();
+    }
+
+    private async void SavePreLaunchChoice()
+    {
+        Settings.PreLaunchClose = PreLaunchApps.Where(row => row.IsChecked).Select(row => row.Name).ToList();
+        try
+        {
+            await _settingsStore.SaveAsync(Settings).ConfigureAwait(true);
+        }
+        catch (IOException ex)
+        {
+            _sessionManager.Report(StatusLevel.Warning, PreLaunchSource, ex.Message);
+        }
+    }
+
+    private void RefreshPreLaunchRunning()
+    {
+        _lastPreLaunchRefreshUtc = DateTimeOffset.UtcNow;
+        var running = PreLaunch.RunningProcessNames();
+        foreach (var row in PreLaunchApps)
+        {
+            row.IsRunning = PreLaunch.IsRunning(row.App, running);
+        }
+
+        _fiveMRunning = PreLaunch.IsFiveMRunning(running);
+
+        CloseAppsAndLaunchCommand.RaiseCanExecuteChanged();
     }
 
     /// <summary>
@@ -1038,6 +1160,7 @@ public sealed class MainWindowViewModel : ObservableObject
         MarkStutterCommand.RaiseCanExecuteChanged();
         MarkSevereStutterCommand.RaiseCanExecuteChanged();
         ExportSelectedIncidentCommand.RaiseCanExecuteChanged();
+        CloseAppsAndLaunchCommand.RaiseCanExecuteChanged();
     }
 
     private void ResetPacing()
@@ -1064,6 +1187,15 @@ public sealed class MainWindowViewModel : ObservableObject
     {
         FlushPendingStatusEntries();
         CheckAutoSession();
+
+        // Only while no game is being measured. During play, a full process scan every few seconds would
+        // be the app adding to the load it is measuring; in the post-game tail the button has to notice
+        // that FiveM has gone.
+        if ((!IsSessionActive || _autoSession.InPostGameTail)
+            && DateTimeOffset.UtcNow - _lastPreLaunchRefreshUtc >= TimeSpan.FromSeconds(5))
+        {
+            RefreshPreLaunchRunning();
+        }
 
         if (!_stateRefreshPending && (!_sessionManager.IsSessionActive || DateTimeOffset.UtcNow - _lastStateRefreshUtc < TimeSpan.FromSeconds(1)))
         {

@@ -73,6 +73,14 @@
   <data name="SessionGroup" xml:space="preserve"><value>Quick start</value></data>
   <data name="StartSession" xml:space="preserve"><value>Start session</value></data>
   <data name="StopSession" xml:space="preserve"><value>Stop Session</value></data>
+  <data name="PreLaunchGroup" xml:space="preserve"><value>Before you play</value></data>
+  <data name="PreLaunchHint" xml:space="preserve"><value>Ticked apps are closed, then FiveM starts. The choice is remembered.</value></data>
+  <data name="PreLaunchRunning" xml:space="preserve"><value>running</value></data>
+  <data name="PreLaunchButton" xml:space="preserve"><value>Close ticked and start FiveM</value></data>
+  <data name="PreLaunchClosedFormat" xml:space="preserve"><value>Before launch {0}: closed {1}.</value></data>
+  <data name="PreLaunchNothingClosed" xml:space="preserve"><value>nothing, none of the ticked apps were running</value></data>
+  <data name="PreLaunchFailedFormat" xml:space="preserve"><value>Could not close: {0}.</value></data>
+  <data name="PreLaunchLaunchFailedFormat" xml:space="preserve"><value>FiveM could not be started: {0}</value></data>
   <data name="IncidentActionsGroup" xml:space="preserve"><value>During gameplay</value></data>
   <data name="MarkStutter" xml:space="preserve"><value>Mark Stutter</value></data>
   <data name="MarkSevere" xml:space="preserve"><value>Mark severe stutter</value></data>

@@ -55,6 +55,14 @@ public static class Strings
     public static string SessionGroup => ResourceManager.GetString("SessionGroup", Culture) ?? "Quick start";
     public static string StartSession => ResourceManager.GetString("StartSession", Culture) ?? "Start session";
     public static string StopSession => ResourceManager.GetString("StopSession", Culture) ?? "Stop Session";
+    public static string PreLaunchGroup => ResourceManager.GetString("PreLaunchGroup", Culture) ?? "Before you play";
+    public static string PreLaunchHint => ResourceManager.GetString("PreLaunchHint", Culture) ?? "Ticked apps are closed, then FiveM starts. The choice is remembered.";
+    public static string PreLaunchRunning => ResourceManager.GetString("PreLaunchRunning", Culture) ?? "running";
+    public static string PreLaunchButton => ResourceManager.GetString("PreLaunchButton", Culture) ?? "Close ticked and start FiveM";
+    public static string PreLaunchClosedFormat => ResourceManager.GetString("PreLaunchClosedFormat", Culture) ?? "Before launch {0}: closed {1}.";
+    public static string PreLaunchNothingClosed => ResourceManager.GetString("PreLaunchNothingClosed", Culture) ?? "nothing, none of the ticked apps were running";
+    public static string PreLaunchFailedFormat => ResourceManager.GetString("PreLaunchFailedFormat", Culture) ?? "Could not close: {0}.";
+    public static string PreLaunchLaunchFailedFormat => ResourceManager.GetString("PreLaunchLaunchFailedFormat", Culture) ?? "FiveM could not be started: {0}";
     public static string IncidentActionsGroup => ResourceManager.GetString("IncidentActionsGroup", Culture) ?? "During gameplay";
     public static string MarkStutter => ResourceManager.GetString("MarkStutter", Culture) ?? "Mark Stutter";
     public static string MarkSevere => ResourceManager.GetString("MarkSevere", Culture) ?? "Mark severe stutter";
