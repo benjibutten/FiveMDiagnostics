@@ -77,6 +77,21 @@ public sealed class InProcessRenderStallTests
     }
 
     /// <summary>
+    /// 2026-09-13 01:23: the window touched 90 %, the driver's busiest second read 0.46 cores with the
+    /// card at 86 %, and the trace itself wrote "det här var inte minnestryck". The verdict was VRAM
+    /// pressure at 95 %. Without the reading the cores still count as eviction.
+    /// </summary>
+    [Fact]
+    public void DriverWorkBelowTheBandIsNotMeasuredEviction()
+    {
+        var belowBand = new FiveMCorrelationEngine().Analyze(Incident(vramPercent: 90, videoMemoryCores: 0.46, occupancyAtPeak: 86));
+        Assert.DoesNotContain(belowBand.Hypotheses, item => item.Category == RootCauseCategory.GpuVramPressure);
+
+        var unmeasured = new FiveMCorrelationEngine().Analyze(Incident(vramPercent: 90, videoMemoryCores: 0.46, withOccupancyAtPeak: false));
+        Assert.Contains(unmeasured.Hypotheses, item => item.Category == RootCauseCategory.GpuVramPressure);
+    }
+
+    /// <summary>
     /// A chain that leaves the process is exactly what the external verdict is for, and this rule has
     /// nothing to say about it.
     /// </summary>
@@ -153,7 +168,8 @@ public sealed class InProcessRenderStallTests
         bool withDriverModules = true,
         bool withVideoMemoryMetrics = true,
         bool withOccupancyAtPeak = true,
-        bool withAdapterSamples = true)
+        bool withAdapterSamples = true,
+        double? occupancyAtPeak = null)
     {
         var events = new List<TelemetryEvent>();
 
@@ -176,7 +192,8 @@ public sealed class InProcessRenderStallTests
             blockerIsGame,
             withDriverModules,
             withVideoMemoryMetrics,
-            withOccupancyAtPeak));
+            withOccupancyAtPeak,
+            occupancyAtPeak ?? vramPercent));
 
         // The neighbour the verdict used to name, with the load it actually had: 10.2 % of the machine
         // at its peak, on a machine that was nowhere near saturated.
@@ -227,7 +244,8 @@ public sealed class InProcessRenderStallTests
         bool blockerIsGame,
         bool withDriverModules = true,
         bool withVideoMemoryMetrics = true,
-        bool withOccupancyAtPeak = true)
+        bool withOccupancyAtPeak = true,
+        double? occupancyAtPeak = null)
     {
         var metrics = new Dictionary<string, double>
         {
@@ -265,7 +283,7 @@ public sealed class InProcessRenderStallTests
 
             if (withOccupancyAtPeak)
             {
-                metrics["videoMemoryAdapterPercentAtPeak"] = vramPercent;
+                metrics["videoMemoryAdapterPercentAtPeak"] = occupancyAtPeak ?? vramPercent;
             }
         }
 

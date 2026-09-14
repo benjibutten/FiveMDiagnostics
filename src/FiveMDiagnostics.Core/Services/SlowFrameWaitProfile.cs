@@ -8,10 +8,13 @@ namespace FiveMDiagnostics.Core;
 /// <para>
 /// The sharpest single observation of the 30 August review — "none of the 35 frames over 100 ms waited"
 /// — was worked out by hand from the exported CSV. It is free to compute: <c>MsCPUWait</c> travels with
-/// every frame PresentMon v2 produces, and a frame that lost 300 ms while waiting 0.2 ms of it cannot
-/// have been waiting on anything. That one line separates the class of evening where a thread is
-/// blocked from the class where the machine is simply working flat out, and the app has never printed
-/// it.
+/// every frame PresentMon v2 produces.
+/// </para>
+/// <para>
+/// What it does not show is a blocked thread. <c>MsCPUWait</c> is the slack between the app's frames,
+/// and a thread blocked inside the frame before present is counted as busy. On 2026-09-13 all four
+/// traces of frames over 300 ms had the main thread in <c>Wait/UserRequest</c> for 316–585 ms while
+/// this line said none of them waited. The trace's wait chain is what decides.
 /// </para>
 /// <para>
 /// A hundred milliseconds rather than a multiple of the cadence. This measures the frames somebody will
@@ -123,10 +126,7 @@ public sealed record SlowFrameWaitReport(
     /// <summary>Slow frames the column was actually present for, which is what the counts are of.</summary>
     public int Measured => SlowFrames - WithoutColumn;
 
-    /// <summary>
-    /// True when effectively none of the large frames waited, which rules out a blocked thread as the
-    /// explanation for them however tempting the trace looks.
-    /// </summary>
+    /// <summary>True when none of the measured large frames had CPU slack left.</summary>
     public bool NoneWaited => Measured > 0 && Waited == 0;
 
     public string Message
@@ -147,8 +147,9 @@ public sealed record SlowFrameWaitReport(
                 : string.Empty;
 
             var verdict = NoneWaited
-                ? " Ingen av dem väntade, så en blockerad tråd förklarar dem inte: tiden gick till "
-                    + "exekvering eller GPU."
+                ? " Ingen av dem hade marginal kvar. Det utesluter inte en blockerad tråd: PresentMon räknar "
+                    + "tid som en tråd står blockerad före present som CPU-tid, så det är väntkedjan i "
+                    + "deep capture-spåret som avgör."
                 : string.Empty;
 
             return $"MsCPUWait: {Waited} av {Measured} frames över {SlowFrameWaitProfile.SlowFrameMs:F0} ms "

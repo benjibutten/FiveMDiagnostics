@@ -235,7 +235,7 @@ public sealed class SessionSummaryMeasurementTests
         Assert.Equal(0, report.Waited);
         Assert.True(report.NoneWaited);
         Assert.Contains("0 av 5 frames över 100 ms", report.Message, StringComparison.Ordinal);
-        Assert.Contains("blockerad tråd förklarar dem inte", report.Message, StringComparison.Ordinal);
+        Assert.Contains("utesluter inte en blockerad tråd", report.Message, StringComparison.Ordinal);
     }
 
     /// <summary>

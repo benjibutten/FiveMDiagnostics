@@ -45,6 +45,9 @@ internal sealed class ThreadWaitAttribution
     /// </remarks>
     private const double ChainOverlapShare = 0.5;
 
+    /// <summary>FiveM's browser process for server UI, as the kernel names it.</summary>
+    private const string NuiProcessName = "FiveM_ChromeBrowser";
+
     private readonly Dictionary<int, SwitchOut> _switchOutByThread = [];
     private readonly List<ThreadWait> _longWaits = [];
 
@@ -275,6 +278,11 @@ internal sealed class ThreadWaitAttribution
             : cpu.ModulesForThread(blocker.ThreadId, take: int.MaxValue, anchor.Start, anchor.End);
         var blockerStacksDuringWait = blocker is null ? [] : stacks.TopChains(blocker.ThreadId, take: 4);
 
+        // On 2026-09-13 FiveM's NUI process had a burst of CPU inside seven freezes of seven, and seeing it
+        // took a timeline per trace by hand. Numbers only: the bursts came with the freezes, not before them.
+        var nuiDuringWait = cpu.CoresForProcess(NuiProcessName, anchor.Start, anchor.End);
+        var nuiAcrossWindow = cpu.CoresForProcess(NuiProcessName);
+
         return new ThreadWaitSummary(
             candidates.ThreadId,
             selectedWaits
@@ -291,7 +299,9 @@ internal sealed class ThreadWaitAttribution
             blockerModules,
             blockerModulesDuringWait.Take(4).ToArray(),
             blockerModulesDuringWait.Sum(module => module.Cores),
-            blockerStacksDuringWait);
+            blockerStacksDuringWait,
+            nuiDuringWait,
+            nuiAcrossWindow);
     }
 
     /// <summary>
@@ -490,7 +500,9 @@ internal sealed record ThreadWaitSummary(
     IReadOnlyList<ModuleShare> BlockerModules,
     IReadOnlyList<ModuleShare> BlockerModulesDuringWait,
     double BlockerCoresDuringWait,
-    IReadOnlyList<string> BlockerStacksDuringWait)
+    IReadOnlyList<string> BlockerStacksDuringWait,
+    double? NuiCoresDuringWait = null,
+    double? NuiCoresAcrossWindow = null)
 {
     public int LongWaitCount => Intervals.Count;
     public double MaxWaitMs => Intervals.Select(wait => wait.DurationMs).DefaultIfEmpty().Max();
@@ -511,7 +523,16 @@ internal sealed record ThreadWaitSummary(
         return $"Schemaläggning: aktiv GTA-tråd tid {ThreadId} låg sammanhängande av CPU:n upp till "
             + $"{MaxWaitMs:F1} ms ({LongWaitCount} väntor ≥100 ms; {UserRequestWaitCount} Wait/UserRequest)."
             + reasons
-            + DescribeChain();
+            + DescribeChain()
+            + DescribeNui();
+    }
+
+    private string DescribeNui()
+    {
+        return NuiCoresDuringWait is { } during && NuiCoresAcrossWindow is { } window
+            ? $" FiveM:s NUI-process (FiveM_ChromeBrowser) höll {during:F2} kärnor under väntan, mot {window:F2} "
+                + "över hela fönstret."
+            : string.Empty;
     }
 
     /// <summary>

@@ -963,7 +963,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// </remarks>
     private void FinalizeCaptureCost(bool final)
     {
-        if (_captureCost?.Summary() is { } report && ShouldWriteSummary("DeepCapture.Cost", report.Message))
+        var report = _captureCost?.Summary() is { } summary
+            ? summary with { Replacements = _autoCaptureBudget?.Replacements ?? 0 }
+            : null;
+
+        if (report is not null && ShouldWriteSummary("DeepCapture.Cost", report.Message))
         {
             Report(StatusLevel.Info, "DeepCapture.Cost", report.Message);
         }
@@ -1641,14 +1645,14 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// Asks the session's capture budget for this hitch, reporting the reason when it refuses for a
     /// reason the user would otherwise have to guess at.
     /// </summary>
-    private bool TryReserveAutoCapture(DateTimeOffset timestamp, double frameTimeMs)
+    private bool TryReserveAutoCapture(DateTimeOffset timestamp, double frameTimeMs, bool inFocus)
     {
         if (_autoCaptureBudget is not { } budget)
         {
             return false;
         }
 
-        var reserved = budget.TryReserve(timestamp, frameTimeMs, out var refusal, out var replaced);
+        var reserved = budget.TryReserve(timestamp, frameTimeMs, out var refusal, out var replaced, inFocus);
         if (replaced is not null)
         {
             DiscardReplacedCapture(replaced, frameTimeMs);
@@ -1809,7 +1813,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
         return trigger.Kind == AutoIncidentKind.DroppedFrameRun
             ? ReportRefusal(budget.TryReserveForDroppedFrameRun(timestamp, out var refusal), refusal)
-            : TryReserveAutoCapture(timestamp, trigger.FrameTimeMs);
+            : TryReserveAutoCapture(timestamp, trigger.FrameTimeMs, inFocus: true);
     }
 
     /// <summary>As above, for a frame rate that has stopped recovering rather than one bad frame.</summary>
@@ -2378,7 +2382,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                     // this path had a cadence of its own that started in the same second and wrote the
                     // same sentence a second later, all evening.
                     _systemMemory?.Observe(systemSample);
-                    _diskLatency?.Observe(systemSample.WorstDiskInstance, systemSample.DiskAverageLatencyMs);
+                    _diskLatency?.Observe(systemSample.Timestamp, systemSample.WorstDiskInstance, systemSample.DiskAverageLatencyMs);
                     SystemTelemetryUpdated?.Invoke(this, systemSample);
                 }
                 else if (telemetryEvent is GpuTelemetrySample gpuSample)
@@ -2556,7 +2560,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
         _lastOutOfFocusStallAt = frameSample.Timestamp;
 
-        var captureThis = TryReserveAutoCapture(frameSample.Timestamp, frameSample.FrameTimeMs);
+        var captureThis = TryReserveAutoCapture(frameSample.Timestamp, frameSample.FrameTimeMs, inFocus: false);
         CreateMarker(frameSample.Timestamp, IncidentSeverity.Severe, label, allowDeepCapture: captureThis, frameSample.FrameTimeMs);
     }
 

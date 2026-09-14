@@ -784,6 +784,22 @@ public sealed class AutoDeepCaptureBudgetTests
     }
 
     /// <summary>
+    /// 2026-09-14 02:17: a 6 167 ms frame with OBS in front took the slot of the 214 ms trace from 01:23,
+    /// the evening's only VRAM trace, for a frame the evening's figures exclude.
+    /// </summary>
+    [Fact]
+    public void AFrameOutOfFocusNeverTakesAnotherCapturesSlot()
+    {
+        var budget = SpentSession();
+
+        Assert.False(budget.TryReserve(Start.AddHours(4), frameTimeMs: 6167, out var refusal, out var replaced, inFocus: false));
+
+        Assert.Null(replaced);
+        Assert.Contains("ur fokus", refusal!, StringComparison.Ordinal);
+        Assert.Equal(6, budget.Spent);
+    }
+
+    /// <summary>
     /// Six captures across three hours, each one having reported the file it wrote. The weakest of them
     /// is the 255 ms one, half an hour in.
     /// </summary>

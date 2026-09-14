@@ -63,8 +63,14 @@ public sealed class DiskLatencyMonitor
     private readonly object _sync = new();
     private readonly Dictionary<string, List<double>> _byVolume = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// When each volume's worst reading came. On 2026-09-13 <c>F:</c> answered in 2 234 ms and the line
+    /// said so 23 times without a time, so the event log could only be searched across thirteen minutes.
+    /// </summary>
+    private readonly Dictionary<string, (double Ms, DateTimeOffset At)> _worst = new(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>Folds in one polling sample's slowest volume and what it answered in.</summary>
-    public void Observe(string? volume, double? latencyMs)
+    public void Observe(DateTimeOffset at, string? volume, double? latencyMs)
     {
         if (string.IsNullOrWhiteSpace(volume) || latencyMs is not { } latency || latency < IgnoreBelowMs)
         {
@@ -80,6 +86,11 @@ public sealed class DiskLatencyMonitor
             }
 
             readings.Add(latency);
+
+            if (!_worst.TryGetValue(volume, out var worst) || latency > worst.Ms)
+            {
+                _worst[volume] = (latency, at);
+            }
         }
     }
 
@@ -101,7 +112,8 @@ public sealed class DiskLatencyMonitor
                         entry.Key,
                         sorted.Length,
                         sorted[sorted.Length / 2],
-                        sorted[^1]);
+                        sorted[^1],
+                        _worst[entry.Key].At);
                 })
                 .OrderByDescending(volume => volume.WorstMs)
                 .ToArray();
@@ -127,7 +139,7 @@ public sealed class DiskLatencyMonitor
 /// poll runs every 750 ms, so this is roughly how much of the session the volume spent as the slowest
 /// disk.
 /// </param>
-public sealed record DiskVolumeLatency(string Volume, int Readings, double MedianMs, double WorstMs);
+public sealed record DiskVolumeLatency(string Volume, int Readings, double MedianMs, double WorstMs, DateTimeOffset WorstAt);
 
 /// <param name="Outliers">Volumes whose worst reading stands far outside their own behaviour.</param>
 public sealed record DiskLatencyReport(
@@ -150,7 +162,8 @@ public sealed record DiskLatencyReport(
                 ? " " + string.Join(
                     " ",
                     Outliers.Select(volume =>
-                        $"{volume.Volume} svarade på {volume.WorstMs:F0} ms, vilket är långt utanför vad "
+                        $"{volume.Volume} svarade på {volume.WorstMs:F0} ms kl. {volume.WorstAt.ToLocalTime():HH:mm:ss}, "
+                        + "vilket är långt utanför vad "
                         + "den annars gör. En volym som legat oanvänd kan kosta så mycket på första "
                         + "åtkomsten medan en mekanisk disk varvar upp — det är den vanligaste "
                         + "förklaringen och den är ofarlig. Men det är också vad en enhet som håller på "

@@ -119,6 +119,38 @@ public sealed class BudgetApproachAndQuietLinesTests
         Assert.DoesNotContain("DeepCapture.MaxCapturesPerWindow", report.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// 2026-09-13: nine captures under a ceiling of six, three of them replacements. Lowering the ceiling
+    /// to six is not advice when it already is six.
+    /// </summary>
+    [Fact]
+    public void CapturesBeyondASensibleCeilingAreCalledReplacements()
+    {
+        var monitor = new CaptureCostMonitor(new HitchThreshold(59));
+        Play(monitor, captures: 9);
+
+        var report = monitor.Summary()! with { Replacements = 3 };
+
+        Assert.DoesNotContain("hade räckt", report.Message, StringComparison.Ordinal);
+        Assert.Contains("varav 3 var byten", report.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Manual markers capture outside the automatic budget, so nine captures with no replacement are
+    /// nine files on disk, and calling any of them a replacement would be false.
+    /// </summary>
+    [Fact]
+    public void CapturesWithoutReplacementsAreNotCalledReplacements()
+    {
+        var monitor = new CaptureCostMonitor(new HitchThreshold(59));
+        Play(monitor, captures: 9);
+
+        var report = monitor.Summary()!;
+
+        Assert.DoesNotContain("byten", report.Message, StringComparison.Ordinal);
+        Assert.Contains("fler än analysen behöver", report.Message, StringComparison.Ordinal);
+    }
+
     /// <summary>An evening that stayed within the budget gets the cost line without the advice.</summary>
     [Fact]
     public void ASensibleNumberOfCapturesGetsNoAdvice()

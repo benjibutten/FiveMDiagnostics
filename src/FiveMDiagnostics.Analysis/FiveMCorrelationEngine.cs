@@ -3493,14 +3493,23 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
     /// <param name="SubjectCoresAtPeak">What the game held during that second.</param>
     /// <param name="SubjectBaselineCores">What the game held in the median second.</param>
     /// <param name="SubjectWentQuiet">Whether the game used materially less CPU while the driver worked.</param>
+    /// <param name="AdapterPercentAtPeak">The card's occupancy in the driver's busiest second, when the trace had it.</param>
     private sealed record TraceVideoMemoryPressure(
         double PeakCores,
         double BaselineCores,
         double? SubjectCoresAtPeak,
         double? SubjectBaselineCores,
-        bool SubjectWentQuiet)
+        bool SubjectWentQuiet,
+        double? AdapterPercentAtPeak)
     {
-        public bool IsPressured => PeakCores >= VideoMemoryManagerPressuredCores;
+        /// <remarks>
+        /// The occupancy has to agree, as the parser's own sentence already requires. On 2026-09-13 01:23
+        /// the trace read 0.46 cores at 86 % and wrote "det här var inte minnestryck", and this ranked the
+        /// same incident VRAM pressure at 95 % off the cores alone. A trace without the reading keeps the
+        /// cores' verdict: an unmeasured card is not a calm one.
+        /// </remarks>
+        public bool IsPressured => PeakCores >= VideoMemoryManagerPressuredCores
+            && (AdapterPercentAtPeak is null || AdapterPercentAtPeak >= VramPressureBandMonitor.BandPercent);
     }
 
     /// <summary>
@@ -3543,7 +3552,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             trace.Metrics.GetValueOrDefault("videoMemoryManagerBaselineCores"),
             hasSubject ? trace.Metrics.GetValueOrDefault("videoMemorySubjectCoresAtPeak") : null,
             hasSubject ? trace.Metrics.GetValueOrDefault("videoMemorySubjectBaselineCores") : null,
-            trace.Metrics.GetValueOrDefault("videoMemorySubjectWentQuiet") >= 0.5);
+            trace.Metrics.GetValueOrDefault("videoMemorySubjectWentQuiet") >= 0.5,
+            trace.Metrics.TryGetValue("videoMemoryAdapterPercentAtPeak", out var atPeak) ? atPeak : null);
     }
 
     /// <summary>

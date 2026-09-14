@@ -50,6 +50,33 @@ public sealed class ObsVramFootprintTests
     }
 
     /// <summary>
+    /// 2026-09-13 02:21: the card dropped 521 MB at 02:21:12, OBS was seen gone at 02:21:16, and the game
+    /// refilled six seconds after the drop. Read around the moment OBS was seen gone, that came out at
+    /// −109 MB.
+    /// </summary>
+    [Fact]
+    public void MemoryReleasedBeforeTheProcessIsSeenGoneIsStillTheStep()
+    {
+        var monitor = new ObsVramFootprintMonitor();
+
+        Play(monitor, from: 0, seconds: 30, vramPercent: 83.4, streaming: true, running: true);
+        Play(monitor, from: 30, seconds: 60, vramPercent: 81.0, streaming: false, running: true);
+
+        // OBS lets go of its memory while shutting down, and is seen gone four seconds later.
+        Play(monitor, from: 90, seconds: 4, vramPercent: 76.0, streaming: false, running: true);
+        Play(monitor, from: 94, seconds: 3, vramPercent: 76.0, streaming: false, running: false);
+
+        // The game takes the space back.
+        Play(monitor, from: 97, seconds: 60, vramPercent: 78.6, streaming: false, running: false);
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report?.RestOfStack);
+        Assert.Equal(5.0, report.RestOfStack.PercentagePoints, 1);
+        Assert.Equal(2.4, report.Encoder!.PercentagePoints, 1);
+    }
+
+    /// <summary>
     /// The tail after the stack came off was eleven minutes of nobody really playing, and the line has to
     /// say that before somebody reads a hitch rate off it.
     /// </summary>

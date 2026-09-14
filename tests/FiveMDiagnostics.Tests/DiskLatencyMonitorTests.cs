@@ -20,6 +20,9 @@ using FiveMDiagnostics.Core;
 /// </remarks>
 public sealed class DiskLatencyMonitorTests
 {
+    private static readonly DateTimeOffset Start = new(2026, 9, 10, 0, 0, 0, TimeSpan.Zero);
+    private static readonly DateTimeOffset DriveWokeAt = new(2026, 9, 10, 0, 38, 58, TimeSpan.Zero);
+
     [Fact]
     public void TheVolumeThatAnsweredOnceAndBadlyIsNamed()
     {
@@ -28,10 +31,10 @@ public sealed class DiskLatencyMonitorTests
         // The evening as measured: F: slowest in forty-seven polling samples, never above 15.8 ms.
         for (var reading = 0; reading < 47; reading++)
         {
-            monitor.Observe("2 F:", 12.4 + (reading % 7) * 0.5);
+            monitor.Observe(Start.AddSeconds(reading), "2 F:", 12.4 + (reading % 7) * 0.5);
         }
 
-        monitor.Observe("0 D:", 815.9);
+        monitor.Observe(DriveWokeAt, "0 D:", 815.9);
 
         var report = monitor.Summary();
 
@@ -39,6 +42,9 @@ public sealed class DiskLatencyMonitorTests
         Assert.True(report.HasOutlier);
         Assert.Equal("0 D:", Assert.Single(report.Outliers).Volume);
         Assert.Contains("815,9 ms", report.Message, StringComparison.Ordinal);
+
+        // The time, so the event log can be read at the second rather than across the evening.
+        Assert.Contains($"816 ms kl. {DriveWokeAt.ToLocalTime():HH:mm:ss}", report.Message, StringComparison.Ordinal);
         Assert.Contains("47 mätpunkter", report.Message, StringComparison.Ordinal);
 
         // Spin-up is the likelier reading and is offered as such; the event log is what settles it.
@@ -57,7 +63,7 @@ public sealed class DiskLatencyMonitorTests
 
         foreach (var latency in new[] { 13.2, 13.6, 13.8, 15.0, 15.2, 15.8, 12.9, 14.1 })
         {
-            monitor.Observe("2 F:", latency);
+            monitor.Observe(Start, "2 F:", latency);
         }
 
         var report = monitor.Summary();
@@ -79,7 +85,7 @@ public sealed class DiskLatencyMonitorTests
 
         foreach (var latency in new[] { 0.04, 0.05, 0.11, 0.21, 6.0 })
         {
-            monitor.Observe("1 E: C:", latency);
+            monitor.Observe(Start, "1 E: C:", latency);
         }
 
         var report = monitor.Summary();
@@ -93,8 +99,8 @@ public sealed class DiskLatencyMonitorTests
     {
         var monitor = new DiskLatencyMonitor();
 
-        monitor.Observe(volume: null, 815.9);
-        monitor.Observe("0 D:", latencyMs: null);
+        monitor.Observe(Start, volume: null, 815.9);
+        monitor.Observe(Start, "0 D:", latencyMs: null);
 
         Assert.Null(monitor.Summary());
     }

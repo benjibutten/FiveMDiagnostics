@@ -47,6 +47,18 @@ public sealed class ObsVramFootprintMonitor
     private static readonly TimeSpan After = TimeSpan.FromSeconds(10);
 
     /// <summary>
+    /// How long before a transition is noticed the memory may already have been released.
+    /// </summary>
+    /// <remarks>
+    /// OBS frees its video memory while it shuts down, before the process is gone. On 2026-09-13 the card
+    /// dropped 521 MB at 02:21:12 and OBS was seen gone at 02:21:16, so the "before" window already held
+    /// the drop, the "after" window held the game's refill six seconds later, and the step came out at
+    /// −109 MB. The "before" window ends this long ahead of the transition, and the "after" level is the
+    /// lowest reading from there on: the release lands somewhere inside, and the refill can only raise it.
+    /// </remarks>
+    private static readonly TimeSpan ReleaseLead = TimeSpan.FromSeconds(6);
+
+    /// <summary>
     /// How long the period without OBS has to run before it is offered as a comparison of anything but
     /// video memory.
     /// </summary>
@@ -64,10 +76,10 @@ public sealed class ObsVramFootprintMonitor
     /// <remarks>
     /// On 2026-09-11 the two were four seconds apart, and the encoder's step was measured at 692 MB
     /// against roughly 235 MB on three other evenings where the routine — stop the stream, wait, then
-    /// quit — was followed. <see cref="Before"/> and <see cref="After"/> put roughly eighteen seconds of
-    /// reading around each transition; closer than that and the "before" window of the second step is
-    /// already inside the "after" window of the first, so each step's drop partly counts the other one's.
-    /// Twenty seconds clears both windows with margin.
+    /// quit — was followed. The windows may overlap at this distance; what may not happen is one step's
+    /// release landing inside the other's reading. The encoder's "after" minimum runs to twelve seconds
+    /// past the stream stopping, and OBS can release up to <see cref="ReleaseLead"/> before it is seen gone,
+    /// so its drop reaches that minimum at eighteen seconds apart. Twenty clears it.
     /// </remarks>
     private static readonly TimeSpan MinimumStepSeparation = TimeSpan.FromSeconds(20);
 
@@ -79,7 +91,7 @@ public sealed class ObsVramFootprintMonitor
     /// worked out and stored the moment its after-window closes, so nothing here has to survive the
     /// evening. A session's worth of readings would be a couple of megabytes and never read again.
     /// </remarks>
-    private static readonly TimeSpan History = Before + Settle + After + TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan History = ReleaseLead + Before + Settle + After + TimeSpan.FromSeconds(10);
 
     private readonly object _sync = new();
     private readonly List<(DateTimeOffset At, double Percent)> _readings = [];
@@ -198,26 +210,34 @@ public sealed class ObsVramFootprintMonitor
             return null;
         }
 
-        var before = Median(moment - Before, moment);
-        var after = Median(moment + Settle, moment + Settle + After);
+        var before = Median(Window(moment - ReleaseLead - Before, moment - ReleaseLead));
+        var after = Window(moment - ReleaseLead, moment + Settle + After);
 
-        return before is { } from && after is { } to ? new ObsVramStep(moment, from, to) : null;
+        return before is { } from && after.Length > 0 ? new ObsVramStep(moment, from, after.Min()) : null;
     }
 
-    private double? Median(DateTimeOffset from, DateTimeOffset to)
+    private double[] Window(DateTimeOffset from, DateTimeOffset to)
     {
-        var window = _readings
-            .Where(item => item.At >= from && item.At <= to)
+        return _readings
+            .Where(item => item.At > from && item.At <= to)
             .Select(item => item.Percent)
-            .OrderBy(percent => percent)
             .ToArray();
+    }
 
-        return window.Length == 0 ? null : window[window.Length / 2];
+    private static double? Median(double[] window)
+    {
+        if (window.Length == 0)
+        {
+            return null;
+        }
+
+        Array.Sort(window);
+        return window[window.Length / 2];
     }
 }
 
-/// <param name="PercentBefore">Median occupancy in the seconds before the transition.</param>
-/// <param name="PercentAfter">Median occupancy in the seconds after it, before the game refills.</param>
+/// <param name="PercentBefore">Median occupancy in the seconds before the release.</param>
+/// <param name="PercentAfter">Lowest occupancy across the release, before the game refills.</param>
 public sealed record ObsVramStep(DateTimeOffset At, double PercentBefore, double PercentAfter)
 {
     public double PercentagePoints => PercentBefore - PercentAfter;

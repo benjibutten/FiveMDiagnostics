@@ -104,6 +104,32 @@ public sealed class ThreadWaitStackTests
     }
 
     /// <summary>
+    /// 2026-09-13 00:55: FiveM's NUI process held 1.62 cores inside the 585 ms wait and 0.43 across the
+    /// trace. The line carries both, so the burst can be seen without a timeline by hand.
+    /// </summary>
+    [Fact]
+    public void TheNuiProcessIsMeasuredInsideTheWaitAndAcrossTheWindow()
+    {
+        var cpu = new CpuSampleAttribution();
+        cpu.RecordProcessName(200, "FiveM_ChromeBrowser");
+
+        cpu.RecordSample(threadId: 7, processId: 200, instructionPointer: 0x1000, Start);
+        for (var ms = 0; ms < 1000; ms++)
+        {
+            cpu.RecordSample(threadId: 7, processId: 200, instructionPointer: 0x1000, Start.AddSeconds(10).AddMilliseconds(ms));
+        }
+
+        cpu.RecordSample(threadId: 7, processId: 200, instructionPointer: 0x1000, Start.AddSeconds(20));
+
+        Assert.Equal(1.0, cpu.CoresForProcess("FiveM_ChromeBrowser", Start.AddSeconds(10), Start.AddSeconds(11))!.Value, 2);
+        Assert.Equal(0.05, cpu.CoresForProcess("FiveM_ChromeBrowser")!.Value, 2);
+        Assert.Null(cpu.CoresForProcess("Voicemod"));
+
+        var line = (Summary(Link(recorded: true)) with { NuiCoresDuringWait = 1.62, NuiCoresAcrossWindow = 0.43 }).Describe();
+        Assert.Contains($"höll {1.62:F2} kärnor under väntan, mot {0.43:F2}", line, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// The chain is read caller to callee, user side then kernel side, so that a lock and a driver call
     /// look different at a glance.
     /// </summary>

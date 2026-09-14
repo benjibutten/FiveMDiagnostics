@@ -258,6 +258,18 @@ public sealed class AutoDeepCaptureBudget
         }
     }
 
+    /// <summary>How many times a worse frame has taken an already-spent capture's slot this session.</summary>
+    public int Replacements
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _replacementCount;
+            }
+        }
+    }
+
     /// <summary>Captures still available, for the UI to show rather than leaving the user to guess.</summary>
     public int Remaining => Math.Max(0, _options.MaxAutoCapturesPerSession - Spent);
 
@@ -445,7 +457,17 @@ public sealed class AutoDeepCaptureBudget
     /// The capture this one took the place of, when the ceiling was already spent and this frame was
     /// worse than the least severe capture in it. The caller owns what happens to the file it names.
     /// </param>
-    public bool TryReserve(DateTimeOffset timestamp, double frameTimeMs, out string? refusal, out CaptureReplacement? replaced)
+    /// <param name="inFocus">
+    /// False for a frame the game presented from behind another window. It may take a free slot but
+    /// never another capture's: on 2026-09-13 a 6 167 ms frame with OBS in front deleted the evening's
+    /// only VRAM trace, of a 214 ms frame in the game, for an event the evening's figures exclude.
+    /// </param>
+    public bool TryReserve(
+        DateTimeOffset timestamp,
+        double frameTimeMs,
+        out string? refusal,
+        out CaptureReplacement? replaced,
+        bool inFocus = true)
     {
         if (frameTimeMs < EffectiveFrameTimeMs)
         {
@@ -465,7 +487,8 @@ public sealed class AutoDeepCaptureBudget
             maySpendReserve: frameTimeMs >= EffectiveExtremeFrameTimeMs,
             frameTimeMs,
             out refusal,
-            out replaced);
+            out replaced,
+            inFocus);
     }
 
     /// <summary>
@@ -578,7 +601,8 @@ public sealed class AutoDeepCaptureBudget
         bool maySpendReserve,
         double frameTimeMs,
         out string? refusal,
-        out CaptureReplacement? replaced)
+        out CaptureReplacement? replaced,
+        bool inFocus = true)
     {
         replaced = null;
         _lastRefusalReason = CaptureRefusalReason.None;
@@ -595,13 +619,16 @@ public sealed class AutoDeepCaptureBudget
         // worse than the least severe capture already taken takes that capture's slot instead, so the
         // ceiling still holds at six and the six it holds are the six worst.
         var atCeiling = Spent >= _options.MaxAutoCapturesPerSession;
-        var displaced = atCeiling ? WeakestCaptureBelow(frameTimeMs) : null;
+        var displaced = atCeiling ? WeakestCaptureBelow(frameTimeMs, inFocus) : null;
         if (atCeiling && displaced is null)
         {
             _lastRefusalReason = CaptureRefusalReason.SessionBudgetSpent;
+            var bar = inFocus
+                ? DescribeReplacementBar()
+                : ", och en frame med spelet ur fokus tar aldrig platsen från en annan capture";
             refusal = $"Deep capture hoppades över för {description}: sessionens budget på "
                 + $"{_options.MaxAutoCapturesPerSession} automatiska captures är förbrukad"
-                + $"{DescribeReplacementBar()}. Höj DeepCapture.MaxAutoCapturesPerSession om fler behövs.";
+                + $"{bar}. Höj DeepCapture.MaxAutoCapturesPerSession om fler behövs.";
             return false;
         }
 
@@ -640,7 +667,7 @@ public sealed class AutoDeepCaptureBudget
         var fromReserve = false;
         if (displaced is null && !maySpendReserve && Spent >= _options.MaxAutoCapturesPerSession - _options.ReservedSevereCaptures)
         {
-            displaced = WeakestCaptureBelow(frameTimeMs / ReserveReplacementRatio);
+            displaced = WeakestCaptureBelow(frameTimeMs / ReserveReplacementRatio, inFocus);
             fromReserve = true;
             if (displaced is null)
             {
@@ -800,10 +827,15 @@ public sealed class AutoDeepCaptureBudget
     /// run of dropped frames is not comparable with a hitch and may not displace one. Each replacement
     /// raises the bar the next one has to clear, which is what keeps a degrading evening from replacing
     /// its way through the disk.
+    /// <para>
+    /// A frame out of focus displaces nothing. It is excluded from every figure the evening is judged on,
+    /// so it may not cost an in-game trace. The rule only ever refuses: letting in-game frames displace
+    /// out-of-focus captures first would buy extra flushes during play, which is the cost this budget is for.
+    /// </para>
     /// </remarks>
-    private SpentCapture? WeakestCaptureBelow(double frameTimeMs)
+    private SpentCapture? WeakestCaptureBelow(double frameTimeMs, bool inFocus)
     {
-        if (frameTimeMs <= 0)
+        if (frameTimeMs <= 0 || !inFocus)
         {
             return null;
         }

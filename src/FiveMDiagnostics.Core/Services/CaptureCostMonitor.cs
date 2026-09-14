@@ -289,6 +289,10 @@ public sealed class CaptureCostMonitor
 /// <summary>What the session's own captures coincided with.</summary>
 /// <param name="HitchesWhileLoading">Hitches set aside because the game was still loading.</param>
 /// <param name="LoadingTime">How much of the measured window those minutes came to.</param>
+/// <param name="Replacements">
+/// Captures written because a worse frame took a weaker capture's slot, whose file was then deleted.
+/// Lowering the ceiling does not remove those, so they are not counted towards the advice to lower it.
+/// </param>
 public sealed record CaptureCostReport(
     int CaptureCount,
     int Hitches,
@@ -297,7 +301,8 @@ public sealed record CaptureCostReport(
     double ElsewhereHitchesPerHour,
     double HitchThresholdMs,
     int HitchesWhileLoading = 0,
-    TimeSpan LoadingTime = default)
+    TimeSpan LoadingTime = default,
+    int Replacements = 0)
 {
     /// <summary>
     /// Captures beyond which an evening is paying for traces the review will not open.
@@ -326,13 +331,19 @@ public sealed record CaptureCostReport(
             // have searched the configuration for it and found nothing. The ceiling on an evening is
             // MaxAutoCapturesPerSession; MaxAutoCapturesPerWindow governs how many may be taken in a
             // burst and is the wrong lever for "twelve over five hours".
-            var advice = CaptureCount > SufficientCaptures
-                ? $" {CaptureCount} captures på en kväll är fler än analysen behöver — {SufficientCaptures} hade "
-                    + "räckt, och resten är betald diskskrivning under pågående spel. Sänk "
-                    + "DeepCapture.MaxAutoCapturesPerSession om nästa session inte ska betala för traces "
-                    + "ingen läser; DeepCapture.MaxAutoCapturesPerWindow styr i stället hur många som får "
-                    + "tas i följd."
-                : string.Empty;
+            // On 2026-09-13 this said "6 hade räckt" about nine captures under a ceiling of six: three were
+            // replacements, and the advice pointed at a setting already where it recommended.
+            var advice = CaptureCount <= SufficientCaptures
+                ? string.Empty
+                : Replacements > 0 && CaptureCount - Replacements <= SufficientCaptures
+                    ? $" {CaptureCount} captures skrevs, varav {Replacements} var byten där en värre frame tog en "
+                        + "svagare captures plats och den svagare filen togs bort. Varje byte är ändå en "
+                        + "diskskrivning under pågående spel."
+                    : $" {CaptureCount} captures på en kväll är fler än analysen behöver — {SufficientCaptures} hade "
+                        + "räckt, och resten är betald diskskrivning under pågående spel. Sänk "
+                        + "DeepCapture.MaxAutoCapturesPerSession om nästa session inte ska betala för traces "
+                        + "ingen läser; DeepCapture.MaxAutoCapturesPerWindow styr i stället hur många som får "
+                        + "tas i följd.";
 
             // Loading is excluded from both sides, and said so. Without the sentence the counts do not
             // add up against the session's other lines, and a reader checking them assumes a bug.

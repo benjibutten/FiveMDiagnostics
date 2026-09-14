@@ -192,6 +192,38 @@ internal sealed class CpuSampleAttribution
             .ToArray();
     }
 
+    /// <summary>
+    /// Cores held by the processes whose name contains <paramref name="nameFragment"/>, inside an interval
+    /// or across the whole retained window. Null when no such process is in the trace.
+    /// </summary>
+    public double? CoresForProcess(string nameFragment, DateTime? from = null, DateTime? to = null)
+    {
+        var processIds = _processNames
+            .Where(entry => entry.Value.Contains(nameFragment, StringComparison.OrdinalIgnoreCase))
+            .Select(entry => entry.Key)
+            .ToHashSet();
+
+        if (processIds.Count == 0 || _firstSample is not { } first)
+        {
+            return null;
+        }
+
+        var fromMs = from is { } start ? (start - first).TotalMilliseconds : 0;
+        var toMs = to is { } end ? (end - first).TotalMilliseconds : double.MaxValue;
+        var seconds = from is { } windowStart && to is { } windowEnd ? (windowEnd - windowStart).TotalSeconds : SampledSeconds;
+        if (seconds <= 0)
+        {
+            return null;
+        }
+
+        var samples = _samples.LongCount(sample =>
+            sample.OffsetMs >= fromMs
+            && sample.OffsetMs <= toMs
+            && processIds.Contains(_processByThread.GetValueOrDefault(sample.ThreadId, -1)));
+
+        return samples / seconds / (10_000_000d / Math.Max(_intervalIn100Ns, 1));
+    }
+
     public bool IsGameThread(int threadId)
     {
         return _processByThread.TryGetValue(threadId, out var processId) && IsGameProcess(Name(processId));
@@ -277,9 +309,15 @@ internal sealed class CpuSampleAttribution
 
     public void OnProcess(ProcessTraceData data)
     {
-        if (data.ProcessID >= 0 && !string.IsNullOrEmpty(data.ImageFileName))
+        RecordProcessName(data.ProcessID, data.ImageFileName);
+    }
+
+    /// <summary>The body of <see cref="OnProcess"/>, for the same reason as <see cref="RecordSample"/>.</summary>
+    internal void RecordProcessName(int processId, string? imageFileName)
+    {
+        if (processId >= 0 && !string.IsNullOrEmpty(imageFileName))
         {
-            _processNames[data.ProcessID] = data.ImageFileName;
+            _processNames[processId] = imageFileName;
         }
     }
 
