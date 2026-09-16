@@ -25,6 +25,8 @@ public sealed class MainWindowViewModel : ObservableObject
 
     private const string PreLaunchSource = "App.PreLaunch";
 
+    private const string CacheSource = "App.Cache";
+
     private readonly DiagnosticsSessionManager _sessionManager;
     private readonly SettingsStore _settingsStore;
     private readonly IUserDialogService _dialogService;
@@ -67,10 +69,14 @@ public sealed class MainWindowViewModel : ObservableObject
     private bool _startWithWindows = WindowsAutostart.IsEnabled();
 
     /// <summary>
-    /// What the pre-launch button did, held for the journal of the session the launch starts. The
-    /// button runs before the game and so before the session, and the journal only exists once it has.
+    /// What the buttons that run before the game did, held for the journal of the session that follows.
+    /// They run before the game and so before the session, and the journal only exists once it has.
     /// </summary>
-    private DiagnosticStatusEntry? _pendingPreLaunchReport;
+    /// <remarks>
+    /// A list rather than one slot: clearing the cache and then launching through the pre-launch button
+    /// is the ordinary order of an evening, and the second line would otherwise drop the first.
+    /// </remarks>
+    private readonly List<DiagnosticStatusEntry> _pendingPreSessionReports = [];
     private DateTimeOffset _lastPreLaunchRefreshUtc = DateTimeOffset.MinValue;
     private bool _fiveMRunning;
 
@@ -84,6 +90,7 @@ public sealed class MainWindowViewModel : ObservableObject
     private string _exportDirectory = string.Empty;
     private string _workingDirectory = string.Empty;
     private string _artifactDirectory = string.Empty;
+    private string _sessionRetentionDays = string.Empty;
     private bool _includeSensitiveFields;
     private bool _includeAttachedArtifacts;
     private bool _autoDetectEnabled;
@@ -127,6 +134,7 @@ public sealed class MainWindowViewModel : ObservableObject
         _exportDirectory = settings.ExportDirectory;
         _workingDirectory = settings.WorkingDirectory;
         _artifactDirectory = settings.ArtifactDirectory;
+        _sessionRetentionDays = settings.SessionRetentionDays.ToString();
         _includeSensitiveFields = settings.Privacy.IncludeSensitiveFieldsInExport;
         _includeAttachedArtifacts = settings.Privacy.IncludeAttachedArtifactsInExport;
         _autoDetectEnabled = settings.AutoDetect.Enabled;
@@ -145,6 +153,7 @@ public sealed class MainWindowViewModel : ObservableObject
         SimulateResourceScenarioCommand = new RelayCommand(() => AddScenario(FakeScenarioKind.FiveMResourceSpike));
         SimulateNetworkScenarioCommand = new RelayCommand(() => AddScenario(FakeScenarioKind.NetworkIssue));
         CloseAppsAndLaunchCommand = new AsyncRelayCommand(CloseAppsAndLaunchAsync, () => !_fiveMRunning && _sessionManager.ActiveProcess is null);
+        ClearFiveMCacheCommand = new AsyncRelayCommand(ClearFiveMCacheAsync, () => !_fiveMRunning && _sessionManager.ActiveProcess is null);
 
         PreLaunchApps = PreLaunch.Apps
             .Select(app => new PreLaunchAppViewModel(
@@ -227,6 +236,8 @@ public sealed class MainWindowViewModel : ObservableObject
     public RelayCommand SimulateNetworkScenarioCommand { get; }
 
     public AsyncRelayCommand CloseAppsAndLaunchCommand { get; }
+
+    public AsyncRelayCommand ClearFiveMCacheCommand { get; }
 
     public IReadOnlyList<PreLaunchAppViewModel> PreLaunchApps { get; }
 
@@ -440,6 +451,22 @@ public sealed class MainWindowViewModel : ObservableObject
         }
     }
 
+    /// <summary>
+    /// Bound to a text box, so it is a string: a half-typed number is not an int, and an int property
+    /// would reject the keystroke and leave the box holding a value the settings never got.
+    /// </summary>
+    public string SessionRetentionDays
+    {
+        get => _sessionRetentionDays;
+        set
+        {
+            if (SetProperty(ref _sessionRetentionDays, value) && int.TryParse(value, out var days))
+            {
+                Settings.SessionRetentionDays = days;
+            }
+        }
+    }
+
     public bool IncludeSensitiveFields
     {
         get => _includeSensitiveFields;
@@ -615,11 +642,12 @@ public sealed class MainWindowViewModel : ObservableObject
         await _dispatcher.InvokeAsync(RefreshState, DispatcherPriority.Background);
         CaptureFeedbackText = Strings.CaptureFeedbackSessionStarted;
 
-        if (_pendingPreLaunchReport is { } report)
+        foreach (var report in _pendingPreSessionReports)
         {
-            _pendingPreLaunchReport = null;
-            _sessionManager.Report(report.Level, report.Source, report.Message);
+            _sessionManager.WriteToJournal(report);
         }
+
+        _pendingPreSessionReports.Clear();
     }
 
     private async Task CloseAppsAndLaunchAsync()
@@ -668,14 +696,7 @@ public sealed class MainWindowViewModel : ObservableObject
             return;
         }
 
-        if (IsSessionActive)
-        {
-            _sessionManager.Report(level, PreLaunchSource, message);
-        }
-        else
-        {
-            _pendingPreLaunchReport = new DiagnosticStatusEntry(DateTimeOffset.Now, level, PreLaunchSource, message);
-        }
+        ReportBeforeSession(level, PreLaunchSource, message);
 
         // Explorer starts FiveM a moment after it is asked to, and until the launcher exists nothing
         // stops a second click from starting a second instance. The command stays busy until then.
@@ -686,6 +707,65 @@ public sealed class MainWindowViewModel : ObservableObject
 
         RefreshPreLaunchRunning();
     }
+
+    /// <summary>
+    /// Writes a line that belongs to the evening, whether or not the session exists yet.
+    /// </summary>
+    private void ReportBeforeSession(StatusLevel level, string source, string message)
+    {
+        if (IsSessionActive)
+        {
+            _sessionManager.Report(level, source, message);
+            return;
+        }
+
+        // Shown now so the button is not silent, and kept for the journal alone once there is one — the
+        // status list already has it and keeps it across the session start.
+        _sessionManager.Report(level, source, message);
+        _pendingPreSessionReports.Add(new DiagnosticStatusEntry(DateTimeOffset.Now, level, source, message));
+    }
+
+    private async Task ClearFiveMCacheAsync()
+    {
+        // The flag behind the button can be five seconds old, and clearing under a running game would
+        // delete files it has open.
+        RefreshPreLaunchRunning();
+        if (_fiveMRunning)
+        {
+            _sessionManager.Report(StatusLevel.Warning, CacheSource, Strings.CacheClearGameRunning);
+            return;
+        }
+
+        var folders = await Task.Run(() => FiveMCache.Folders()).ConfigureAwait(true);
+        var totalBytes = folders.Sum(folder => folder.Bytes);
+        var totalFiles = folders.Sum(folder => folder.Files);
+        if (totalFiles == 0)
+        {
+            _sessionManager.Report(StatusLevel.Info, CacheSource, Strings.CacheClearNothing);
+            return;
+        }
+
+        var breakdown = string.Join(
+            Environment.NewLine,
+            folders.Select(folder => $"    {folder.Name}  —  {Megabytes(folder.Bytes)} ({folder.Files})"));
+        var question = string.Format(Strings.CacheClearConfirmFormat, breakdown, Megabytes(totalBytes));
+
+        if (!_dialogService.Confirm(Strings.CacheClearTitle, question))
+        {
+            return;
+        }
+
+        var result = await Task.Run(() => FiveMCache.Clear()).ConfigureAwait(true);
+        var message = string.Format(Strings.CacheClearedFormat, result.FilesDeleted, Megabytes(result.BytesFreed));
+        if (result.AnythingFailed)
+        {
+            message += " " + string.Format(Strings.CacheClearFailedFormat, result.Failures.Count, result.Failures[0]);
+        }
+
+        ReportBeforeSession(result.AnythingFailed ? StatusLevel.Warning : StatusLevel.Info, CacheSource, message);
+    }
+
+    private static string Megabytes(long bytes) => $"{bytes / 1024d / 1024d:N0} MB";
 
     private async void SavePreLaunchChoice()
     {
@@ -712,6 +792,7 @@ public sealed class MainWindowViewModel : ObservableObject
         _fiveMRunning = PreLaunch.IsFiveMRunning(running);
 
         CloseAppsAndLaunchCommand.RaiseCanExecuteChanged();
+        ClearFiveMCacheCommand.RaiseCanExecuteChanged();
     }
 
     /// <summary>
@@ -1161,6 +1242,7 @@ public sealed class MainWindowViewModel : ObservableObject
         MarkSevereStutterCommand.RaiseCanExecuteChanged();
         ExportSelectedIncidentCommand.RaiseCanExecuteChanged();
         CloseAppsAndLaunchCommand.RaiseCanExecuteChanged();
+        ClearFiveMCacheCommand.RaiseCanExecuteChanged();
     }
 
     private void ResetPacing()

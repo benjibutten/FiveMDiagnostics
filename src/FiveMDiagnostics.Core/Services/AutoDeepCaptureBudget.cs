@@ -190,6 +190,18 @@ public sealed class AutoDeepCaptureBudget
     private double _lastCaptureFrameTimeMs;
     private DateTimeOffset? _firstFrameAt;
     private DateTimeOffset? _lastFrameAt;
+
+    /// <summary>
+    /// When the session last produced a frame large enough to spend the reserve, or null when it never
+    /// has. What <see cref="ReservedRightNow"/> counts from.
+    /// </summary>
+    /// <remarks>
+    /// Compared against the configured threshold rather than <see cref="EffectiveExtremeFrameTimeMs"/>,
+    /// which adapts and would cost an adaptation on every presented frame. Adaptation only ever raises
+    /// the bar, so the constant resets this clock at least as often as the adaptive one would and the
+    /// reserve is therefore held at least as long. That is the safe direction for a release rule.
+    /// </remarks>
+    private DateTimeOffset? _lastExtremeFrameAt;
     private CaptureRefusalReason _lastRefusalReason = CaptureRefusalReason.None;
 
     public AutoDeepCaptureBudget(DeepCaptureOptions options)
@@ -388,6 +400,56 @@ public sealed class AutoDeepCaptureBudget
         Math.Max(_options.AutoCaptureOverrideFrameTimeMs, EffectiveOverrideFrameTimeMs);
 
     /// <summary>
+    /// How many of the reserved slots are still being withheld from ordinary hitches at this moment.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The reserve used to be held for the whole session, and a session that never produced the frame it
+    /// was waiting for simply ended with those slots unspent. Both 14 and 15 September did: four of six
+    /// captures written, two slots reserved to the end, and an ordinary hitch refused outright in the
+    /// meantime — 161 ms at 02:34 on the 15th, 138 ms at 01:39 on the 16th — while the evening's own
+    /// freezes went untraced. Holding a slot costs evidence; it only buys anything while a worse frame is
+    /// still plausibly coming.
+    /// </para>
+    /// <para>
+    /// So one slot is released for every <see cref="DeepCaptureOptions.CaptureBudgetWindow"/> that passes
+    /// without an extreme frame, counted from the last one or from the session's first frame when there
+    /// has been none. An evening that keeps producing them keeps its reserve — which is the 5 September
+    /// case the reserve was introduced for, where six captures were spent by 00:19 and a 1 133 ms frame
+    /// at 02:45 found nothing left. There the clock restarts on every extreme frame and never runs out.
+    /// </para>
+    /// </remarks>
+    private int ReservedRightNow(DateTimeOffset timestamp)
+    {
+        var reserved = _options.ReservedSevereCaptures;
+        if (reserved <= 0)
+        {
+            return 0;
+        }
+
+        // Before the first frame there is no session to measure, so the reserve stands whole.
+        if ((_lastExtremeFrameAt ?? _firstFrameAt) is not { } waitingSince)
+        {
+            return reserved;
+        }
+
+        var window = _options.CaptureBudgetWindow;
+        if (window <= TimeSpan.Zero)
+        {
+            return reserved;
+        }
+
+        var elapsed = timestamp - waitingSince;
+        if (elapsed <= TimeSpan.Zero)
+        {
+            return reserved;
+        }
+
+        var released = elapsed.Ticks / window.Ticks;
+        return (int)Math.Max(0, reserved - Math.Min(released, reserved));
+    }
+
+    /// <summary>
     /// How far above the ordinary threshold the configuration puts the exception. Zero when the override
     /// is configured off, which <see cref="DeepCaptureOptions.Normalize"/> produces from any value below
     /// the ordinary one.
@@ -419,6 +481,14 @@ public sealed class AutoDeepCaptureBudget
         if (_lastFrameAt is not { } last || timestamp > last)
         {
             _lastFrameAt = timestamp;
+        }
+
+        // The same re-anchoring guard as above. A re-anchored batch moving this clock backwards would
+        // lengthen the quiet time ReservedRightNow measures and release the reserve early.
+        if (frameTimeMs >= _options.AutoCaptureOverrideFrameTimeMs
+            && (_lastExtremeFrameAt is not { } lastExtreme || timestamp > lastExtreme))
+        {
+            _lastExtremeFrameAt = timestamp;
         }
 
         var capacity = AdaptiveSampleCapacity;
@@ -665,7 +735,9 @@ public sealed class AutoDeepCaptureBudget
         // slot already spent — see ReserveReplacementRatio — may take it here as well; anything else is
         // left to the reserve.
         var fromReserve = false;
-        if (displaced is null && !maySpendReserve && Spent >= _options.MaxAutoCapturesPerSession - _options.ReservedSevereCaptures)
+        var reservedNow = ReservedRightNow(timestamp);
+        if (displaced is null && !maySpendReserve && reservedNow > 0
+            && Spent >= _options.MaxAutoCapturesPerSession - reservedNow)
         {
             displaced = WeakestCaptureBelow(frameTimeMs / ReserveReplacementRatio, inFocus);
             fromReserve = true;
@@ -673,10 +745,10 @@ public sealed class AutoDeepCaptureBudget
             {
                 _lastRefusalReason = CaptureRefusalReason.ReservedForSevereFrames;
                 refusal = $"Deep capture hoppades över för {description}: {Spent} av sessionens budget på "
-                    + $"{_options.MaxAutoCapturesPerSession} automatiska captures är tagna, och de sista "
-                    + $"{_options.ReservedSevereCaptures} är reserverade för frames över "
-                    + $"{EffectiveExtremeFrameTimeMs:F0} ms — så kvällens värsta hitch kan spåras även när den "
-                    + "kommer sist.";
+                    + $"{_options.MaxAutoCapturesPerSession} automatiska captures är tagna, och {reservedNow} "
+                    + $"är fortfarande reserverade för frames över {EffectiveExtremeFrameTimeMs:F0} ms — så "
+                    + "kvällens värsta hitch kan spåras även när den kommer sist. En reservplats släpps för "
+                    + $"varje {_options.CaptureBudgetWindow.TotalMinutes:F0} min som går utan en sådan frame.";
                 return false;
             }
         }

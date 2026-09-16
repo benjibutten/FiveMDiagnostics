@@ -1141,6 +1141,17 @@ public sealed record DiagnosticsSettings
     /// </summary>
     public List<string>? PreLaunchClose { get; set; }
 
+    /// <summary>
+    /// Days of this app's own session output to keep in <see cref="WorkingDirectory"/>. Zero keeps
+    /// everything, which is what every version before this one did.
+    /// </summary>
+    /// <remarks>
+    /// Three days because the evening's files are copied to FindTheproblem the morning after, so the
+    /// originals have served their purpose by the second day — and because a session leaves several
+    /// gigabytes of deep captures behind, which is what makes the folder grow at all.
+    /// </remarks>
+    public int SessionRetentionDays { get; set; } = 3;
+
     public string Language { get; set; } = "en";
 
     public static DiagnosticsSettings CreateDefault()

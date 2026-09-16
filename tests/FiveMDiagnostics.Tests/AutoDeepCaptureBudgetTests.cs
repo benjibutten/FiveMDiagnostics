@@ -377,6 +377,126 @@ public sealed class AutoDeepCaptureBudgetTests
     }
 
     /// <summary>
+    /// Options with the adaptive thresholds pinned, for the tests that feed frames through
+    /// <see cref="AutoDeepCaptureBudget.Observe"/> and need the two bars to stay where the defaults put
+    /// them. Adaptation is a different subject with its own tests, and letting it move underneath these
+    /// would turn a reserve test into a silent threshold test.
+    /// </summary>
+    private static DeepCaptureOptions FixedThresholdOptions()
+    {
+        return Options(item =>
+        {
+            item.MaxAutoCapturesPerWindow = 100;
+            item.AdaptiveThresholdFramesPerHour = 0;
+            item.AdaptiveOverrideFramesPerHour = 0;
+        });
+    }
+
+    /// <summary>
+    /// A reserve nobody spends is evidence nobody collected.
+    /// </summary>
+    /// <remarks>
+    /// Both 14 and 15 September ended with four of six captures written and two slots still reserved, and
+    /// refused an ordinary hitch on the way there — 161 ms at 00:34 on the 14th, 138 ms at 23:39 on the
+    /// 15th. Neither evening produced another frame past the extreme threshold after its first hours, so
+    /// the slots were held for something that was not coming while the win32k freezes went untraced.
+    /// </remarks>
+    [Fact]
+    public void TheReserveIsReleasedWhenTheEveningStopsProducingExtremeFrames()
+    {
+        var budget = new AutoDeepCaptureBudget(FixedThresholdOptions());
+
+        // The evening's one extreme frame, early, as the 1 173 ms frame at 21:52 on 14 September.
+        budget.Observe(Start, 1173);
+        Assert.True(budget.TryReserve(Start, frameTimeMs: 1173, out _));
+
+        var timestamp = Start;
+        for (var i = 0; i < 3; i++)
+        {
+            timestamp = timestamp.AddMinutes(11);
+            budget.Observe(timestamp, 180);
+            Assert.True(budget.TryReserve(timestamp, frameTimeMs: 180, out _));
+        }
+
+        Assert.Equal(4, budget.Spent);
+
+        // Still inside the first hour after that frame, so the reserve is whole and refuses.
+        timestamp = Start.AddMinutes(44);
+        budget.Observe(timestamp, 161);
+        Assert.False(budget.TryReserve(timestamp, frameTimeMs: 161, out var refusal));
+        Assert.Contains("2 är fortfarande reserverade", refusal!, StringComparison.Ordinal);
+
+        // An hour of play without one, and the first slot comes back.
+        timestamp = Start.AddHours(1).AddMinutes(1);
+        budget.Observe(timestamp, 161);
+        Assert.True(budget.TryReserve(timestamp, frameTimeMs: 161, out _));
+        Assert.Equal(5, budget.Spent);
+
+        // An hour after that, the second — the slot both evenings took home unspent.
+        timestamp = Start.AddHours(2).AddMinutes(1);
+        budget.Observe(timestamp, 161);
+        Assert.True(budget.TryReserve(timestamp, frameTimeMs: 161, out _));
+        Assert.Equal(0, budget.Remaining);
+    }
+
+    /// <summary>
+    /// PresentMon timestamps can step backwards when its anchor converges, and the reserve's clock must
+    /// not follow them: an older timestamp would make the quiet stretch look longer than it was.
+    /// </summary>
+    [Fact]
+    public void AnExtremeFrameStampedEarlierDoesNotRewindTheReserveClock()
+    {
+        var budget = new AutoDeepCaptureBudget(FixedThresholdOptions());
+
+        budget.Observe(Start, 180);
+        for (var i = 0; i < 4; i++)
+        {
+            Assert.True(budget.TryReserve(Start.AddMinutes(11 * i), frameTimeMs: 180, out _));
+        }
+
+        budget.Observe(Start.AddMinutes(59), 400);
+
+        // Far larger than a real re-anchoring step, so that following it would cross the hour.
+        budget.Observe(Start, 400);
+
+        // Eleven minutes after the latest extreme frame, so the reserve is still whole. Counted from the
+        // rewound stamp it would be seventy, and one slot would already have been released.
+        var timestamp = Start.AddMinutes(70);
+        budget.Observe(timestamp, 180);
+        Assert.False(budget.TryReserve(timestamp, frameTimeMs: 180, out var refusal));
+        Assert.Contains("2 är fortfarande reserverade", refusal!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The release must not reopen the hole the reserve was introduced to close.
+    /// </summary>
+    /// <remarks>
+    /// On an evening that keeps producing extreme frames, every one of them restarts the clock, so the
+    /// reserve is never released and the 1 133 ms frame at 02:45 on 5 September still finds a slot.
+    /// </remarks>
+    [Fact]
+    public void AnEveningThatKeepsProducingExtremeFramesKeepsItsReserve()
+    {
+        var budget = new AutoDeepCaptureBudget(FixedThresholdOptions());
+        var timestamp = Start;
+
+        for (var i = 0; i < 4; i++)
+        {
+            budget.Observe(timestamp, 400);
+            Assert.True(budget.TryReserve(timestamp, frameTimeMs: 180, out _));
+            timestamp = timestamp.AddMinutes(30);
+        }
+
+        // Two hours in, but never a full hour without an extreme frame.
+        budget.Observe(timestamp, 400);
+        Assert.Equal(4, budget.Spent);
+        Assert.False(budget.TryReserve(timestamp, frameTimeMs: 180, out var refusal));
+        Assert.Contains("2 är fortfarande reserverade", refusal!, StringComparison.Ordinal);
+
+        Assert.True(budget.TryReserve(timestamp, frameTimeMs: 1133, out _));
+    }
+
+    /// <summary>
     /// The reserve may never be the whole budget. An ordinary frame has to stay able to reach a capture
     /// however the setting is hand-edited.
     /// </summary>

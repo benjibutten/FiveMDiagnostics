@@ -115,6 +115,14 @@ public sealed class SettingsStore
             changed = true;
         }
 
+        // Zero is the off switch and stays; a negative day count is a typo, not a request to delete
+        // everything, so it lands on off as well.
+        if (settings.SessionRetentionDays is < 0 or > 365)
+        {
+            settings.SessionRetentionDays = Math.Clamp(settings.SessionRetentionDays, 0, 365);
+            changed = true;
+        }
+
         return changed;
     }
 
@@ -127,6 +135,7 @@ public sealed class SettingsStore
         settings.Gpu.Normalize();
         settings.Obs.Normalize();
         settings.MaxRetainedIncidents = Math.Clamp(settings.MaxRetainedIncidents, 1, 1000);
+        settings.SessionRetentionDays = Math.Clamp(settings.SessionRetentionDays, 0, 365);
 
         // One writer at a time: the pre-launch tick boxes save on every change, and two overlapping
         // File.Create calls on the same path fail with the file in use.

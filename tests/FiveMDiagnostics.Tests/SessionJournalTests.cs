@@ -243,6 +243,53 @@ public sealed class SessionJournalTests : IDisposable
     }
 
     /// <summary>
+    /// The cache and pre-launch buttons act before the session exists. Their line is shown at the click
+    /// and belongs in the journal once there is one — and replaying it through Report put it in the
+    /// status list a second time at session start.
+    /// </summary>
+    [Fact]
+    public async Task SessionManager_JournalsALineFromBeforeTheSessionWithoutShowingItAgain()
+    {
+        var clickedAt = new DateTimeOffset(2026, 9, 16, 18, 45, 12, TimeSpan.Zero);
+        const string message = "FiveM-cachen rensad: 2 574 filer, 1 696 MB frigjort.";
+        var shown = 0;
+
+        await using (var manager = CreateManager(CreateSettings()))
+        {
+            manager.StatusReported += (_, entry) =>
+            {
+                if (entry.Message == message)
+                {
+                    Interlocked.Increment(ref shown);
+                }
+            };
+
+            manager.Report(StatusLevel.Info, "App.Cache", message);
+            await manager.StartSessionAsync();
+            manager.WriteToJournal(new DiagnosticStatusEntry(clickedAt, StatusLevel.Info, "App.Cache", message));
+            await manager.StopSessionAsync();
+        }
+
+        Assert.Equal(1, shown);
+
+        var line = Assert.Single(ReadJournalLines(), line => line.GetProperty("payload").TryGetProperty("message", out var text)
+            && text.GetString() == message);
+
+        // When the cache was cleared, not when the session got round to recording it.
+        Assert.Equal(clickedAt, line.GetProperty("timestamp").GetDateTimeOffset());
+    }
+
+    [Fact]
+    public async Task SessionManager_WriteToJournalWithoutASessionDoesNothing()
+    {
+        await using var manager = CreateManager(CreateSettings());
+
+        manager.WriteToJournal(new DiagnosticStatusEntry(DateTimeOffset.Now, StatusLevel.Info, "App.Cache", "före sessionen"));
+
+        Assert.False(Directory.Exists(_workingDirectory));
+    }
+
+    /// <summary>
     /// Importing an artifact re-runs the analysis of the most recent incident, and that conclusion —
     /// the one drawn with the evidence the user went and fetched — is usually the one worth keeping.
     /// </summary>

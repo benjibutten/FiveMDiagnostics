@@ -118,9 +118,38 @@ public partial class App : System.Windows.Application
 			mainWindow.Show();
 		}
 
+		// Before the evening rather than after it: a prune that ran at shutdown would compete with the
+		// session still writing its last files, and the app is often killed with Windows instead. Off the
+		// UI thread, because the first start after an update may have weeks of deep captures to delete.
+		await Task.Run(() => PruneOldSessionFiles(sessionManager, settings)).ConfigureAwait(true);
+
 		// Silent unless there is something to install, and at most one request per
 		// 12 hours no matter how often the app is started.
 		await UpdateCoordinator.CheckAsync(mainWindow, manual: false).ConfigureAwait(true);
+	}
+
+	/// <summary>
+	/// Deletes this app's own session output once it is older than the retention setting.
+	/// </summary>
+	/// <remarks>
+	/// Silent when it deletes nothing, so an ordinary start says nothing about housekeeping. The line it
+	/// does write goes to the status list rather than a journal — there is no session yet — which is the
+	/// same place the user reads everything else the app did before the game.
+	/// </remarks>
+	private static void PruneOldSessionFiles(DiagnosticsSessionManager sessionManager, DiagnosticsSettings settings)
+	{
+		var result = SessionArtifacts.Prune(settings.WorkingDirectory, settings.SessionRetentionDays, DateTimeOffset.Now);
+		if (result.FilesDeleted == 0)
+		{
+			return;
+		}
+
+		var message = string.Format(
+			Strings.SessionPrunedFormat,
+			result.FilesDeleted,
+			settings.SessionRetentionDays,
+			$"{result.BytesFreed / 1024d / 1024d:N0} MB");
+		sessionManager.Report(result.AnythingFailed ? StatusLevel.Warning : StatusLevel.Info, "App.Housekeeping", message);
 	}
 
 	/// <remarks>

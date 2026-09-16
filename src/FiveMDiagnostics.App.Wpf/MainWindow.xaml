@@ -175,6 +175,10 @@
                             </ItemsControl>
                             <Button Content="{x:Static props:Strings.PreLaunchButton}" Command="{Binding CloseAppsAndLaunchCommand}" HorizontalAlignment="Left" Margin="0,8,0,0" />
 
+                            <TextBlock Text="{x:Static props:Strings.CacheClearHint}" Style="{StaticResource FieldHintStyle}" Margin="0,10,0,0" />
+                            <Button Content="{x:Static props:Strings.CacheClearButton}" Command="{Binding ClearFiveMCacheCommand}"
+                                    Background="#C97164" BorderBrush="#C97164" HorizontalAlignment="Left" Margin="0,6,0,0" />
+
                             <TextBlock Text="{x:Static props:Strings.IncidentActionsGroup}" Style="{StaticResource SubHeaderStyle}" />
                             <WrapPanel>
                                 <Button Content="{x:Static props:Strings.MarkStutter}" Command="{Binding MarkStutterCommand}" Background="#6E9FA5" BorderBrush="#6E9FA5" />
@@ -290,6 +294,9 @@
                                     <TextBox Text="{Binding ExportDirectory, UpdateSourceTrigger=PropertyChanged}" />
                                     <TextBlock Text="{x:Static props:Strings.ArtifactDirectory}" Foreground="{StaticResource TextMutedBrush}" />
                                     <TextBox Text="{Binding ArtifactDirectory, UpdateSourceTrigger=PropertyChanged}" />
+                                    <TextBlock Text="{x:Static props:Strings.SessionRetentionLabel}" Foreground="{StaticResource TextMutedBrush}" Margin="0,8,0,0" />
+                                    <TextBox Text="{Binding SessionRetentionDays, UpdateSourceTrigger=PropertyChanged}" Width="80" HorizontalAlignment="Left" />
+                                    <TextBlock Text="{x:Static props:Strings.SessionRetentionHint}" Style="{StaticResource FieldHintStyle}" />
                                 </StackPanel>
                             </Expander>
 

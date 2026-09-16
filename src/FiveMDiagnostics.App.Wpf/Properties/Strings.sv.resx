@@ -80,6 +80,23 @@
   <data name="PreLaunchClosedFormat" xml:space="preserve"><value>Före start {0}: stängde {1}.</value></data>
   <data name="PreLaunchNothingClosed" xml:space="preserve"><value>inget, ingen av de ikryssade apparna körde</value></data>
   <data name="PreLaunchFailedFormat" xml:space="preserve"><value>Kunde inte stänga: {0}.</value></data>
+  <data name="CacheClearButton" xml:space="preserve"><value>Rensa FiveM-cachen</value></data>
+  <data name="CacheClearHint" xml:space="preserve"><value>Tömmer de mappar FiveM laddar ned igen av sig själv. Inloggningar och UI-inställningar i spelet rörs inte.</value></data>
+  <data name="CacheClearTitle" xml:space="preserve"><value>Rensa FiveM-cachen</value></data>
+  <data name="CacheClearConfirmFormat" xml:space="preserve"><value>Det här tar bort:
+
+{0}
+
+Frigör ungefär {1}. Servern laddar ned sina resurser igen nästa gång du ansluter, så första anslutningen tar längre tid. Inget annat rörs.
+
+Rensa?</value></data>
+  <data name="CacheClearedFormat" xml:space="preserve"><value>FiveM-cachen rensad: {0} filer, {1} frigjort.</value></data>
+  <data name="CacheClearFailedFormat" xml:space="preserve"><value>{0} fil(er) gick inte att ta bort, den första är {1}</value></data>
+  <data name="CacheClearNothing" xml:space="preserve"><value>FiveM-cachen är redan tom — inget att rensa.</value></data>
+  <data name="CacheClearGameRunning" xml:space="preserve"><value>Cachen kan inte rensas medan FiveM kör. Stäng spelet först.</value></data>
+  <data name="SessionRetentionLabel" xml:space="preserve"><value>Spara sessionsfiler i (dagar)</value></data>
+  <data name="SessionRetentionHint" xml:space="preserve"><value>Äldre journaler, CSV-filer och deep captures tas bort vid start. En kväll lämnar flera GB efter sig. 0 sparar allt.</value></data>
+  <data name="SessionPrunedFormat" xml:space="preserve"><value>Städning: {0} sessionsfil(er) äldre än {1} dagar borttagna, {2} frigjort.</value></data>
   <data name="PreLaunchLaunchFailedFormat" xml:space="preserve"><value>FiveM kunde inte startas: {0}</value></data>
   <data name="IncidentActionsGroup" xml:space="preserve"><value>Under spel</value></data>
   <data name="MarkStutter" xml:space="preserve"><value>Markera stutter</value></data>

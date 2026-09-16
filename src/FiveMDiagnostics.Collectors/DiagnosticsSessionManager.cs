@@ -2052,6 +2052,30 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         }
     }
 
+    /// <summary>
+    /// Writes an entry already reported before this session began into its journal, without adding it
+    /// to the status list or raising <see cref="StatusReported"/> a second time. Does nothing when no
+    /// session is running.
+    /// </summary>
+    /// <remarks>
+    /// The entry keeps its own timestamp, so the journal says when the thing happened rather than when
+    /// the session got round to recording it.
+    /// </remarks>
+    public void WriteToJournal(DiagnosticStatusEntry entry)
+    {
+        var journal = _journal;
+        if (journal is null)
+        {
+            return;
+        }
+
+        journal.WriteStatus(entry);
+        if (journal.TryTakeFailure(out var failure))
+        {
+            Report(StatusLevel.Warning, nameof(SessionJournal), failure);
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         await StopSessionAsync().ConfigureAwait(false);

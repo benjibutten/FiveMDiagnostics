@@ -62,6 +62,17 @@ public static class Strings
     public static string PreLaunchClosedFormat => ResourceManager.GetString("PreLaunchClosedFormat", Culture) ?? "Before launch {0}: closed {1}.";
     public static string PreLaunchNothingClosed => ResourceManager.GetString("PreLaunchNothingClosed", Culture) ?? "nothing, none of the ticked apps were running";
     public static string PreLaunchFailedFormat => ResourceManager.GetString("PreLaunchFailedFormat", Culture) ?? "Could not close: {0}.";
+    public static string CacheClearButton => ResourceManager.GetString("CacheClearButton", Culture) ?? "Clear FiveM cache";
+    public static string CacheClearHint => ResourceManager.GetString("CacheClearHint", Culture) ?? "Empties the folders FiveM downloads again by itself. Logins and in-game UI settings are left alone.";
+    public static string CacheClearTitle => ResourceManager.GetString("CacheClearTitle", Culture) ?? "Clear FiveM cache";
+    public static string CacheClearConfirmFormat => ResourceManager.GetString("CacheClearConfirmFormat", Culture) ?? "This deletes:\n\n{0}\n\nFreeing about {1}. The server downloads its resources again the next time you connect, so the first connection takes longer. Nothing else is touched.\n\nClear it?";
+    public static string CacheClearedFormat => ResourceManager.GetString("CacheClearedFormat", Culture) ?? "FiveM cache cleared: {0} files, {1} freed.";
+    public static string CacheClearFailedFormat => ResourceManager.GetString("CacheClearFailedFormat", Culture) ?? "{0} file(s) would not go, the first being {1}";
+    public static string CacheClearNothing => ResourceManager.GetString("CacheClearNothing", Culture) ?? "FiveM cache is already empty — nothing to clear.";
+    public static string CacheClearGameRunning => ResourceManager.GetString("CacheClearGameRunning", Culture) ?? "The cache cannot be cleared while FiveM is running. Close the game first.";
+    public static string SessionRetentionLabel => ResourceManager.GetString("SessionRetentionLabel", Culture) ?? "Keep session files for (days)";
+    public static string SessionRetentionHint => ResourceManager.GetString("SessionRetentionHint", Culture) ?? "Older journals, CSVs and deep captures are deleted at startup. A session leaves several GB behind. 0 keeps everything.";
+    public static string SessionPrunedFormat => ResourceManager.GetString("SessionPrunedFormat", Culture) ?? "Housekeeping: {0} session file(s) older than {1} days deleted, {2} freed.";
     public static string PreLaunchLaunchFailedFormat => ResourceManager.GetString("PreLaunchLaunchFailedFormat", Culture) ?? "FiveM could not be started: {0}";
     public static string IncidentActionsGroup => ResourceManager.GetString("IncidentActionsGroup", Culture) ?? "During gameplay";
     public static string MarkStutter => ResourceManager.GetString("MarkStutter", Culture) ?? "Mark Stutter";

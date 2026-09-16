@@ -80,6 +80,23 @@
   <data name="PreLaunchClosedFormat" xml:space="preserve"><value>Before launch {0}: closed {1}.</value></data>
   <data name="PreLaunchNothingClosed" xml:space="preserve"><value>nothing, none of the ticked apps were running</value></data>
   <data name="PreLaunchFailedFormat" xml:space="preserve"><value>Could not close: {0}.</value></data>
+  <data name="CacheClearButton" xml:space="preserve"><value>Clear FiveM cache</value></data>
+  <data name="CacheClearHint" xml:space="preserve"><value>Empties the folders FiveM downloads again by itself. Logins and in-game UI settings are left alone.</value></data>
+  <data name="CacheClearTitle" xml:space="preserve"><value>Clear FiveM cache</value></data>
+  <data name="CacheClearConfirmFormat" xml:space="preserve"><value>This deletes:
+
+{0}
+
+Freeing about {1}. The server downloads its resources again the next time you connect, so the first connection takes longer. Nothing else is touched.
+
+Clear it?</value></data>
+  <data name="CacheClearedFormat" xml:space="preserve"><value>FiveM cache cleared: {0} files, {1} freed.</value></data>
+  <data name="CacheClearFailedFormat" xml:space="preserve"><value>{0} file(s) would not go, the first being {1}</value></data>
+  <data name="CacheClearNothing" xml:space="preserve"><value>FiveM cache is already empty — nothing to clear.</value></data>
+  <data name="CacheClearGameRunning" xml:space="preserve"><value>The cache cannot be cleared while FiveM is running. Close the game first.</value></data>
+  <data name="SessionRetentionLabel" xml:space="preserve"><value>Keep session files for (days)</value></data>
+  <data name="SessionRetentionHint" xml:space="preserve"><value>Older journals, CSVs and deep captures are deleted at startup. A session leaves several GB behind. 0 keeps everything.</value></data>
+  <data name="SessionPrunedFormat" xml:space="preserve"><value>Housekeeping: {0} session file(s) older than {1} days deleted, {2} freed.</value></data>
   <data name="PreLaunchLaunchFailedFormat" xml:space="preserve"><value>FiveM could not be started: {0}</value></data>
   <data name="IncidentActionsGroup" xml:space="preserve"><value>During gameplay</value></data>
   <data name="MarkStutter" xml:space="preserve"><value>Mark Stutter</value></data>
