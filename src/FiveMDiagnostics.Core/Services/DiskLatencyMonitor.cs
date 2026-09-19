@@ -167,8 +167,8 @@ public sealed record DiskLatencyReport(
                         + "den annars gör. En volym som legat oanvänd kan kosta så mycket på första "
                         + "åtkomsten medan en mekanisk disk varvar upp — det är den vanligaste "
                         + "förklaringen och den är ofarlig. Men det är också vad en enhet som håller på "
-                        + "att tappa kontakten ser ut som, så en blick i Windows händelselogg kring den "
-                        + "tidpunkten avgör vilket."))
+                        + "att tappa kontakten ser ut som, och vilket av dem det var står i "
+                        + "Disk.EventLog-raden för samma tidpunkt."))
                 : string.Empty;
 
             return $"Disklatens per volym: {tally}.{warning}";

@@ -78,24 +78,75 @@ public sealed record GameGraphicsSettings(
                 + string.Join("; ", olderCandidates.Select(item => $"{item.Path} ({Local(item.LastWriteTimeUtc)})"))
                 + ". Den nyaste är den som lästes.";
 
-        var stale = IsStale(sessionStartUtc)
-            ? $" VARNING: filen är {DescribeAge(sessionStartUtc)} gammal och beskriver därför inte den här "
-                + "sessionen. Värdena ovan ska inte användas som facit i någon jämförelse — läs av "
-                + "inställningarna i spelets meny i stället."
-            : string.Empty;
-
-        return $"Spelets grafikinställningar ({Path}, {written}): {Summary}.{WindowModeNote}{stale}{others}";
+        return $"Spelets grafikinställningar ({Path}, {written}): {Summary}.{WindowModeNote}"
+            + $"{Provenance(sessionStartUtc, olderCandidates)}{others}";
     }
 
     /// <summary>
-    /// Age beyond which the file is describing some other evening entirely.
+    /// What the write time is worth, which depends on which copy was read rather than on its age.
     /// </summary>
     /// <remarks>
-    /// A file written before the session but during the same week is the ordinary case — the settings
-    /// were changed and the game has not been restarted since. A week is where that stops being the
-    /// explanation. On 1 September the only copy on the machine was written 2025-06-04, fifteen months
-    /// earlier, and the app reported its values as this session's settings; three consecutive reviews
-    /// compared evenings against a file from the summer before.
+    /// This used to warn on any file older than a week and tell the reader to go look in the in-game
+    /// menu instead. That was right for the failure it was written for — a Rockstar file from June 2025
+    /// being reported as the evening's settings — and wrong for every reading since the reader learned
+    /// where FiveM keeps its own copy. FiveM writes <c>gta5_settings.xml</c> when the settings change,
+    /// not on every launch: the file stood at 2026-09-10 20:25 through the evenings of 09-13, 09-14,
+    /// 09-15 and 09-18, including one where the game was restarted mid-session. An old FiveM copy is
+    /// therefore evidence that nothing was changed, which is the opposite of what the warning said, and
+    /// six review notes carried a "read the menu instead" action that never needed doing.
+    /// </remarks>
+    private string Provenance(DateTimeOffset? sessionStartUtc, IReadOnlyList<GameSettingsCandidate> olderCandidates)
+    {
+        if (IsFiveMCopy)
+        {
+            return " FiveM skriver om filen när inställningarna ändras, inte vid varje start — "
+                + "skrivtiden är alltså när de senast ändrades, och värdena gäller tills dess.";
+        }
+
+        if (!IsStale(sessionStartUtc))
+        {
+            return string.Empty;
+        }
+
+        // The client's own copy, if one of the files passed over happens to be it. Telling the reader to
+        // go and look under %appdata%\CitizenFX would be asking for a path already in hand.
+        var clientCopy = olderCandidates.FirstOrDefault(candidate => IsClientPath(candidate.Path));
+
+        return $" VARNING: det här är inte FiveM:s egen kopia, och den är {DescribeAge(sessionStartUtc)} "
+            + "gammal. "
+            + (clientCopy is null
+                ? "Klienten håller sina inställningar under %appdata%\\CitizenFX — hittas ingen fil där "
+                    + "beskriver värdena ovan någon annan installation än den som kördes."
+                : $"Klientens egen kopia finns ({clientCopy.Path}, "
+                    + $"{Local(clientCopy.LastWriteTimeUtc)}) men är äldre, och det är den här filen som "
+                    + "lästes. Är det FiveM som kördes beskriver värdena ovan fel installation.");
+    }
+
+    /// <summary>
+    /// Whether the file read is the client's own copy, which is the one the running game writes.
+    /// </summary>
+    /// <remarks>
+    /// Whole directory names, not a substring of the path. "Contains FiveM" is true of
+    /// <c>…\FiveMDiagnostics\…</c> and of every temp directory this app's own tests create, so the
+    /// check would have called a Rockstar file from 2025 the client's own copy as soon as it sat
+    /// anywhere under a folder whose name happens to start the same way.
+    /// </remarks>
+    private bool IsFiveMCopy => IsClientPath(Path);
+
+    /// <summary>Whether a path sits under one of the client's own directories.</summary>
+    private static bool IsClientPath(string path) =>
+        path.Split(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar)
+            .Any(segment => segment.Equals("CitizenFX", StringComparison.OrdinalIgnoreCase)
+                || segment.Equals("FiveM", StringComparison.OrdinalIgnoreCase)
+                || segment.Equals("FiveM.app", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// Age beyond which a non-FiveM copy is describing some other installation entirely.
+    /// </summary>
+    /// <remarks>
+    /// On 1 September the only copy on the machine was written 2025-06-04, fifteen months earlier, and
+    /// the app reported its values as this session's settings; three consecutive reviews compared
+    /// evenings against a file from the summer before. That is the case this threshold still guards.
     /// </remarks>
     public static readonly TimeSpan StaleAfter = TimeSpan.FromDays(7);
 

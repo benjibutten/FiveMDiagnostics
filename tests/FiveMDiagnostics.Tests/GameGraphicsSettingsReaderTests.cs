@@ -141,7 +141,7 @@ public sealed class GameGraphicsSettingsReaderTests
         Assert.NotNull(described);
         Assert.Contains("VARNING", described!, StringComparison.Ordinal);
         Assert.Contains("15 månader gammal", described, StringComparison.Ordinal);
-        Assert.Contains("ska inte användas som facit", described, StringComparison.Ordinal);
+        Assert.Contains("inte FiveM:s egen kopia", described, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -161,6 +161,59 @@ public sealed class GameGraphicsSettingsReaderTests
         Assert.NotNull(described);
         Assert.Contains("alltså före den här sessionen", described!, StringComparison.Ordinal);
         Assert.DoesNotContain("VARNING", described, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The client's own copy is never warned about for its age, however old it is.
+    /// </summary>
+    /// <remarks>
+    /// FiveM writes <c>gta5_settings.xml</c> when the settings change and not on every launch: the file
+    /// on the machine under review stood at 2026-09-10 through the evenings of 09-13, 09-14, 09-15 and
+    /// 09-18. The warning therefore fired on an accurate file and told six review notes to go and read
+    /// the in-game menu instead, which is the one place the values are harder to read off than here.
+    /// </remarks>
+    [Fact]
+    public void TheClientsOwnCopyIsNotWarnedAboutForItsAge()
+    {
+        using var install = new FakeInstall(Fixture(windowed: "2"), layout: FakeInstallLayout.FiveM);
+        install.SetWritten(new DateTime(2026, 9, 10, 18, 25, 0, DateTimeKind.Utc));
+
+        var described = GameGraphicsSettingsReader.Describe(
+            [install.FilePath],
+            sessionStartUtc: new DateTimeOffset(2026, 9, 18, 18, 1, 0, TimeSpan.Zero));
+
+        Assert.NotNull(described);
+        Assert.DoesNotContain("VARNING", described!, StringComparison.Ordinal);
+        Assert.Contains("när inställningarna ändras", described, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// When a newer non-client file wins, the warning names the client copy it passed over instead of
+    /// telling the reader to go and find it.
+    /// </summary>
+    /// <remarks>
+    /// The path is already in hand — it is in <c>olderCandidates</c>, printed on the same line. A
+    /// warning that says "look under %appdata%\CitizenFX" there is asking for something the app just
+    /// read, which is the same failure this whole reader was written to stop repeating.
+    /// </remarks>
+    [Fact]
+    public void TheWarningNamesTheClientCopyItPassedOver()
+    {
+        using var rockstar = new FakeInstall(Fixture(windowed: "0"), name: "rockstar");
+        using var client = new FakeInstall(Fixture(windowed: "2"), name: "client", layout: FakeInstallLayout.FiveM);
+
+        rockstar.SetWritten(new DateTime(2026, 9, 1, 12, 0, 0, DateTimeKind.Utc));
+        client.SetWritten(new DateTime(2026, 8, 20, 12, 0, 0, DateTimeKind.Utc));
+
+        var described = GameGraphicsSettingsReader.Describe(
+            [rockstar.FilePath, client.FilePath],
+            sessionStartUtc: new DateTimeOffset(2026, 9, 19, 18, 1, 0, TimeSpan.Zero));
+
+        Assert.NotNull(described);
+        Assert.Contains("VARNING", described!, StringComparison.Ordinal);
+        Assert.Contains("Klientens egen kopia finns", described, StringComparison.Ordinal);
+        Assert.Contains(client.FilePath, described, StringComparison.Ordinal);
+        Assert.DoesNotContain("hittas ingen fil där", described, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -228,19 +281,24 @@ public sealed class GameGraphicsSettingsReaderTests
         private readonly string _root;
         private readonly string? _path;
 
-        public FakeInstall(string? contents, string name = "install")
+        public FakeInstall(string? contents, string name = "install", FakeInstallLayout layout = FakeInstallLayout.Rockstar)
         {
             _root = Path.Combine(Path.GetTempPath(), $"fivemdiag-{name}-" + Guid.NewGuid().ToString("N"));
 
+            var (folders, fileName) = layout == FakeInstallLayout.FiveM
+                ? (new[] { "CitizenFX" }, "gta5_settings.xml")
+                : (new[] { "Rockstar Games", "GTA V" }, "settings.xml");
+
+            var directory = Path.Combine([_root, .. folders]);
+
             if (contents is null)
             {
-                _path = Path.Combine(_root, "Rockstar Games", "GTA V", "settings.xml");
+                _path = Path.Combine(directory, fileName);
                 return;
             }
 
-            var directory = Path.Combine(_root, "Rockstar Games", "GTA V");
             Directory.CreateDirectory(directory);
-            _path = Path.Combine(directory, "settings.xml");
+            _path = Path.Combine(directory, fileName);
             File.WriteAllText(_path, contents);
         }
 
@@ -270,4 +328,15 @@ public sealed class GameGraphicsSettingsReaderTests
             }
         }
     }
+}
+
+/// <summary>Which of the two places a settings file can sit the fake install imitates.</summary>
+/// <remarks>
+/// The distinction decides whether the file's age is worth a warning: the client's own copy is written
+/// on change, a Rockstar copy on a machine running FiveM is not written at all.
+/// </remarks>
+internal enum FakeInstallLayout
+{
+    Rockstar,
+    FiveM,
 }

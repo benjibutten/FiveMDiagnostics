@@ -47,9 +47,10 @@ public sealed class DiskLatencyMonitorTests
         Assert.Contains($"816 ms kl. {DriveWokeAt.ToLocalTime():HH:mm:ss}", report.Message, StringComparison.Ordinal);
         Assert.Contains("47 mätpunkter", report.Message, StringComparison.Ordinal);
 
-        // Spin-up is the likelier reading and is offered as such; the event log is what settles it.
+        // Spin-up is the likelier reading and is offered as such; the event log is what settles it,
+        // and the session now reads it itself rather than asking the reader to.
         Assert.Contains("varvar upp", report.Message, StringComparison.Ordinal);
-        Assert.Contains("händelselogg", report.Message, StringComparison.Ordinal);
+        Assert.Contains("Disk.EventLog", report.Message, StringComparison.Ordinal);
     }
 
     /// <summary>

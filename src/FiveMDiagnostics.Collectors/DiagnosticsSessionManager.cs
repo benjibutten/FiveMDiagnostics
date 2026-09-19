@@ -156,6 +156,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// </remarks>
     private readonly Dictionary<string, string> _lastSummaryLine = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// The disk outliers already looked up in the Windows event log, so each is queried once.
+    /// </summary>
+    private readonly HashSet<string> _eventLogLookups = new(StringComparer.Ordinal);
+
     /// <summary>Wall clock of the most recent frame long enough to count as a stall in progress.</summary>
     /// <remarks>
     /// Received time rather than the frame's own timestamp: the question a deep capture's tail asks is
@@ -443,6 +448,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _previousSessionProcessNames = PreviousSessionProcessLog.TryLoad(_settings.WorkingDirectory);
 
             _lastSummaryLine.Clear();
+            _eventLogLookups.Clear();
             _lastStallFrameAtUtc = null;
             _lastOutOfFocusStallAt = null;
             _targetProcessSeen = false;
@@ -1412,14 +1418,65 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// </remarks>
     private void FinalizeDiskLatency(bool final)
     {
-        if (_diskLatency?.Summary() is { } report && ShouldWriteSummary("Disk.Latency", report.Message))
+        if (_diskLatency?.Summary() is { } report)
         {
-            Report(report.HasOutlier ? StatusLevel.Warning : StatusLevel.Info, "Disk.Latency", report.Message);
+            if (ShouldWriteSummary("Disk.Latency", report.Message))
+            {
+                Report(report.HasOutlier ? StatusLevel.Warning : StatusLevel.Info, "Disk.Latency", report.Message);
+            }
+
+            foreach (var outlier in report.Outliers)
+            {
+                ReportEventLogAround(outlier);
+            }
         }
 
         if (final)
         {
             _diskLatency = null;
+        }
+    }
+
+    /// <summary>
+    /// Looks the outlier up in the Windows System log and writes what it found.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The disk line says a volume answered in two seconds and that the event log decides whether that
+    /// was a drive spinning up or a drive losing contact. Six notes carried that lookup as an action and
+    /// none of them did it. The app is on the machine and knows the second, so it answers its own
+    /// question — one query per outlier, not per summary, since the same outlier is re-reported every
+    /// time the summary is written.
+    /// </para>
+    /// <para>
+    /// The outlier is only struck off the list once its window has finished happening. A stall as the
+    /// game closes is looked up a second later, when the minutes after it do not exist yet; remembering
+    /// that lookup would settle the question against a log that had not been written. It is asked again
+    /// on the next pass instead, and only the answer covering the whole window is kept.
+    /// </para>
+    /// </remarks>
+    private void ReportEventLogAround(DiskVolumeLatency outlier)
+    {
+        var key = $"{outlier.Volume}@{outlier.WorstAt.UtcTicks}";
+        var complete = WindowsEventLogReader.WindowHasElapsed(outlier.WorstAt);
+        lock (_eventLogLookups)
+        {
+            if (_eventLogLookups.Contains(key))
+            {
+                return;
+            }
+
+            if (complete)
+            {
+                _eventLogLookups.Add(key);
+            }
+        }
+
+        var what = $"{outlier.Volume} på {outlier.WorstMs:F0} ms kl. {outlier.WorstAt.ToLocalTime():HH:mm:ss}";
+        var message = WindowsEventLogReader.Describe(what, outlier.WorstAt);
+        if (ShouldWriteSummary("Disk.EventLog", message))
+        {
+            Report(StatusLevel.Info, "Disk.EventLog", message);
         }
     }
 
