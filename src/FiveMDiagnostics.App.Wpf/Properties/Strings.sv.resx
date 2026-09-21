@@ -148,6 +148,7 @@ Rensa?</value></data>
   <data name="TraySessionStartingMessage" xml:space="preserve"><value>Session startar i bakgrunden.</value></data>
   <data name="TraySessionStoppedMessage" xml:space="preserve"><value>Session stoppad.</value></data>
   <data name="TrayAutoSessionStopped" xml:space="preserve"><value>Sessionen avslutades — kvällen är skriven till journalen.</value></data>
+  <data name="HotkeyNoSessionMessage" xml:space="preserve"><value>Snabbtangent tryckt, men ingen session kör — ingenting markerades.</value></data>
   <data name="TrayMarkStutterMessage" xml:space="preserve"><value>Stutter markerad.</value></data>
   <data name="TrayMarkSevereMessage" xml:space="preserve"><value>Allvarlig stutter markerad.</value></data>
   <data name="TrayExportStartingMessage" xml:space="preserve"><value>Exporterar senaste incidenten.</value></data>

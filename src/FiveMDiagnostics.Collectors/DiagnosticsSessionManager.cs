@@ -201,6 +201,26 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// </remarks>
     private int? _lastTargetProcessId;
 
+    /// <summary>The name of that process, so the event-log lookup after an exit can ask about it by name.</summary>
+    private string? _lastTargetProcessName;
+
+    /// <summary>The resource list the previous session's client log carried, for the diff.</summary>
+    private IReadOnlySet<string> _previousSessionResources = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The resource list this session has seen, kept for the next one.</summary>
+    private IReadOnlyList<string> _resourcesThisSession = [];
+
+    /// <summary>
+    /// The game exit whose event-log lookup is still owed, if any.
+    /// </summary>
+    /// <remarks>
+    /// Held rather than answered on the spot. The lookup is worth making the moment the game goes, so
+    /// the session says something while the reader is still watching, but Windows files its error
+    /// report a few seconds after the process dies and FiveM writes its dump later still — so the
+    /// question is asked again from the summaries until the whole window has been written.
+    /// </remarks>
+    private (string ProcessName, int ProcessId, DateTimeOffset At)? _pendingGameExit;
+
     /// <summary>How often the graphics settings file is compared against what the session started with.</summary>
     private static readonly TimeSpan GameSettingsCheckInterval = TimeSpan.FromMinutes(5);
 
@@ -446,6 +466,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _halfHourBreakdown = new HalfHourBreakdownMonitor(_hitchThreshold);
             _processNamesThisSession = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             _previousSessionProcessNames = PreviousSessionProcessLog.TryLoad(_settings.WorkingDirectory);
+            _previousSessionResources = PreviousSessionResourceLog.TryLoad(_settings.WorkingDirectory);
+            _resourcesThisSession = [];
 
             _lastSummaryLine.Clear();
             _eventLogLookups.Clear();
@@ -455,6 +477,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _reportedTargetProcessExit = false;
             _targetProcessId = null;
             _lastTargetProcessId = null;
+            _lastTargetProcessName = null;
+            _pendingGameExit = null;
 
             // Half the capture threshold: a frame that large is unambiguously part of a stall, while an
             // ordinary two-refresh hitch is not, and holding a trace open for those would keep every
@@ -1277,6 +1301,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         FinalizeObsVramFootprint(final);
         FinalizeSystemMemory(final);
         FinalizeDiskLatency(final);
+        ReportEventLogAroundGameExit();
+        FinalizeClientLog(final);
         FinalizeVerdicts(final);
         FinalizeBackgroundProcesses(final);
         FinalizeHalfHourBreakdown(final);
@@ -1481,6 +1507,118 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     }
 
     /// <summary>
+    /// Asks the event logs and the crash-dump folder why the game process went away, and writes what
+    /// they said.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// On 20 September the game vanished twenty minutes into the evening, FiveM wrote no dump, and the
+    /// session recorded four lines saying the process was not there any more — none of which said why.
+    /// Three things could have answered it and all three sat on the same machine: the Application log,
+    /// which holds Windows' own report of a fault it caught; the System log, in case the volume the
+    /// game reads from had dropped off its bus again; and the crash folder, which FiveM writes to a few
+    /// seconds after the process dies.
+    /// </para>
+    /// <para>
+    /// The crash folder is re-read here for that last reason. It was already read at the exit itself,
+    /// which is a second too early for a dump that is still being written, and otherwise not again
+    /// until the game comes back or the next session starts — so an evening that ended on the crash
+    /// reported it the following day.
+    /// </para>
+    /// <para>
+    /// The exit is only struck off once its window has finished happening, the same way a disk outlier
+    /// is: asked immediately so the line is there while the reader is looking, then asked again until
+    /// the minutes after the exit have actually been written.
+    /// </para>
+    /// </remarks>
+    private void ReportEventLogAroundGameExit()
+    {
+        if (_pendingGameExit is not { } exit)
+        {
+            return;
+        }
+
+        if (WindowsEventLogReader.WindowHasElapsed(exit.At))
+        {
+            _pendingGameExit = null;
+
+            // A dump for this crash may have landed after the exit line was written.
+            ReportNewCrashDumps();
+        }
+
+        var message = WindowsEventLogReader.DescribeProcessExit(exit.ProcessName, exit.ProcessId, exit.At);
+        if (ShouldWriteSummary("Spelprocess.EventLog", message))
+        {
+            Report(StatusLevel.Info, "Spelprocess.EventLog", message);
+        }
+    }
+
+    /// <summary>
+    /// Reads FiveM's own log and writes what it says about the server's resources and about anything the
+    /// client failed to get hold of.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The last artifact on this machine the app was not reading. On 20 September a texture budget was
+    /// raised to fix MLOs that would not load, it did not fix them, and nothing measurable could say
+    /// why — while the client had been writing the answer to a file in its own directory the whole
+    /// time. A download that timed out and a streaming pool that ran dry look identical from the
+    /// outside and have different levers, and only this file tells them apart.
+    /// </para>
+    /// <para>
+    /// Re-read on every summary rather than once, because the failures accumulate during the evening:
+    /// the interesting lines are written when the game asks for something in a place it has not been
+    /// yet. <see cref="ShouldWriteSummary"/> keeps an unchanged line from being repeated every quarter
+    /// of an hour.
+    /// </para>
+    /// </remarks>
+    private void FinalizeClientLog(bool final)
+    {
+        if (FiveMClientLogReader.Read() is not { } log)
+        {
+            return;
+        }
+
+        if (log.Resources.Count > 0)
+        {
+            _resourcesThisSession = log.Resources;
+        }
+
+        var resources = log.DescribeResources(_previousSessionResources);
+        if (ShouldWriteSummary("FiveM.Resources", resources))
+        {
+            Report(StatusLevel.Info, "FiveM.Resources", resources);
+        }
+
+        var streaming = log.DescribeStreaming();
+        if (ShouldWriteSummary("FiveM.Streaming", streaming))
+        {
+            Report(
+                log.StreamingFailures.Count > 0 ? StatusLevel.Warning : StatusLevel.Info,
+                "FiveM.Streaming",
+                streaming);
+        }
+
+        if (log.DescribeErrors() is { } errors && ShouldWriteSummary("FiveM.Errors", errors))
+        {
+            Report(StatusLevel.Info, "FiveM.Errors", errors);
+        }
+
+        if (!final)
+        {
+            return;
+        }
+
+        // Kept with the evening's other artifacts, and only at the end, when the file is complete.
+        if (FiveMClientLogReader.CopyBeside(log, _settings.WorkingDirectory) is { } copy)
+        {
+            Report(StatusLevel.Info, "FiveM.ClientLog", $"FiveM:s klientlogg sparad till {copy}.");
+        }
+
+        PreviousSessionResourceLog.Save(_settings.WorkingDirectory, _resourcesThisSession);
+    }
+
+    /// <summary>
     /// Writes how little RAM the machine had.
     /// </summary>
     /// <remarks>
@@ -1540,7 +1678,16 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         journal.Dispose();
     }
 
-    public IncidentMarker? MarkIncident(IncidentSeverity severity)
+    /// <summary>
+    /// Marks an incident the person watching the screen asked for.
+    /// </summary>
+    /// <param name="label">
+    /// What to call it, or null for the default. The one thing worth distinguishing is where the mark
+    /// came from: a mark pressed on a stream deck while the game stutters is the only reading in the
+    /// whole investigation that measures what was <em>experienced</em> rather than what the frame times
+    /// did, and it is worthless if it cannot be told apart from a click in the app afterwards.
+    /// </param>
+    public IncidentMarker? MarkIncident(IncidentSeverity severity, string? label = null)
     {
         if (!IsSessionActive || _incidentMaterializer is null)
         {
@@ -1550,7 +1697,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
         // severityGated: a manual Normal marker only captures when the user has opted in, which is the
         // historical behaviour and the reason CaptureNormalManualIncidents exists.
-        return CreateMarker(DateTimeOffset.UtcNow, severity, label: null, allowDeepCapture: true, severityGated: true);
+        return CreateMarker(DateTimeOffset.UtcNow, severity, label, allowDeepCapture: true, severityGated: true);
     }
 
     /// <summary>
@@ -2732,6 +2879,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 }
 
                 _lastTargetProcessId = target.ProcessId;
+                _lastTargetProcessName = target.ProcessName;
                 ReportSteam(target.ProcessId);
 
                 // A crash inside a running session is followed by a relaunch as often as by an exit.
@@ -2756,6 +2904,11 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         ReportNewCrashDumps();
 
         var exitedAt = DateTimeOffset.UtcNow;
+        if (_lastTargetProcessName is { } goneName && _lastTargetProcessId is { } goneId)
+        {
+            _pendingGameExit = (goneName, goneId, exitedAt);
+        }
+
         _postGameVram?.NoteGameExit(exitedAt);
 
         // The same exit, told to the band monitor for the opposite reason: the ten minutes the card is

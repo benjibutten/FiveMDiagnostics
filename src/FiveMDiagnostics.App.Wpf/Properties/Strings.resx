@@ -148,6 +148,7 @@ Clear it?</value></data>
   <data name="TraySessionStartingMessage" xml:space="preserve"><value>Session starting in the background.</value></data>
   <data name="TraySessionStoppedMessage" xml:space="preserve"><value>Session stopped.</value></data>
   <data name="TrayAutoSessionStopped" xml:space="preserve"><value>Session ended — the evening is written to the journal.</value></data>
+  <data name="HotkeyNoSessionMessage" xml:space="preserve"><value>Hotkey pressed, but no session is running — nothing was marked.</value></data>
   <data name="TrayMarkStutterMessage" xml:space="preserve"><value>Stutter marked.</value></data>
   <data name="TrayMarkSevereMessage" xml:space="preserve"><value>Severe stutter marked.</value></data>
   <data name="TrayExportStartingMessage" xml:space="preserve"><value>Exporting the latest incident.</value></data>

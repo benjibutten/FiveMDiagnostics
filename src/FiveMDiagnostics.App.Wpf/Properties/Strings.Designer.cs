@@ -126,6 +126,7 @@ public static class Strings
     public static string TrayMarkStutterMessage => ResourceManager.GetString("TrayMarkStutterMessage", Culture) ?? "Stutter marked.";
     public static string TrayMarkSevereMessage => ResourceManager.GetString("TrayMarkSevereMessage", Culture) ?? "Severe stutter marked.";
     public static string TrayExportStartingMessage => ResourceManager.GetString("TrayExportStartingMessage", Culture) ?? "Exporting the latest incident.";
+    public static string HotkeyNoSessionMessage => ResourceManager.GetString("HotkeyNoSessionMessage", Culture) ?? "Hotkey pressed, but no session is running — nothing was marked.";
 
     public static string FakeDataHeader => ResourceManager.GetString("FakeDataHeader", Culture) ?? "Testing tools";
     public static string FakeDataDescription => ResourceManager.GetString("FakeDataDescription", Culture) ?? "";

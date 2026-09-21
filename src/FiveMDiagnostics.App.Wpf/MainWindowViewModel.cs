@@ -863,9 +863,27 @@ public sealed class MainWindowViewModel : ObservableObject
         CaptureFeedbackText = Strings.CaptureFeedbackSyntheticReady;
     }
 
-    private void MarkIncident(IncidentSeverity severity)
+    /// <summary>
+    /// Marks a stutter the person playing pressed a key for, labelled so it can be told apart later.
+    /// </summary>
+    /// <remarks>
+    /// The label is the whole point of having a separate entry. Every other reading in the session says
+    /// what the machine did; this one says that somebody saw it, at that second, while it was
+    /// happening — and a review can only weigh it against the frame times if it knows which marks are
+    /// which. A mark clicked in the app half a minute afterwards is a different kind of evidence.
+    /// </remarks>
+    public void MarkStutterFromHotkey(IncidentSeverity severity)
     {
-        var marker = _sessionManager.MarkIncident(severity);
+        MarkIncident(
+            severity,
+            severity == IncidentSeverity.Severe
+                ? "Upplevd: kraftig lagg (snabbtangent)"
+                : "Upplevd: lagg (snabbtangent)");
+    }
+
+    private void MarkIncident(IncidentSeverity severity, string? label = null)
+    {
+        var marker = _sessionManager.MarkIncident(severity, label);
         if (marker is null)
         {
             return;

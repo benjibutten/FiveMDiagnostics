@@ -114,7 +114,48 @@ public sealed class VramBudgetMonitor
 
     private bool _budgetApproachReported;
     private bool _budgetOverheadReported;
+
+    /// <summary>
+    /// Whether the game has been seen holding most of its streaming budget, and the budget line may
+    /// therefore recommend a value.
+    /// </summary>
+    /// <remarks>
+    /// On 20 September the first budget line was written four minutes into loading, while the game held
+    /// 0.1 GB and the desktop's row was mid-double-count, and it advised dropping Extended Texture
+    /// Budget from 10 to 3 — from half the slider to a seventh of it. The arithmetic was right and the
+    /// inputs were not: the overhead term is zero until the game has passed its budget, and "the game
+    /// needs 5.4 GB" against a card that has not yet given it any is a subtraction between two numbers
+    /// measured in different minutes. The readings are still written; only the advice waits.
+    /// </remarks>
+    private bool _gameFilledBudget;
+
+    /// <summary>
+    /// Whether a budget line has already been written with its recommendation held back.
+    /// </summary>
+    /// <remarks>
+    /// The budget line is written about twice an evening — once at the start, then on a stream stack
+    /// transition. Holding the recommendation on those two would leave an evening with no transition
+    /// after loading with no advice at all, so a held line earns one more once the game has filled its
+    /// budget.
+    /// </remarks>
+    private bool _heldRecommendation;
+
     private bool _streamStackPresent;
+
+    /// <summary>
+    /// Whether the stream stack's state has been observed at all, as opposed to whether a budget line
+    /// has been written.
+    /// </summary>
+    /// <remarks>
+    /// These were the same flag, and separating them is the whole of a defect. The first sample adopts
+    /// whatever it sees as the state without waiting for <see cref="StableSamplesForTransition"/>,
+    /// which is right exactly once — there is no previous state to flap against. Re-arming that branch
+    /// later hands one sample the authority the hysteresis exists to deny it, and one sample is what
+    /// produced eighteen "stream stack started/stopped" lines in sixteen minutes. The budget line's own
+    /// "said once" flag is now reset whenever the texture ceiling moves, so it can no longer be read as
+    /// "nothing has been observed yet".
+    /// </remarks>
+    private bool _streamStackEstablished;
 
     /// <summary>
     /// How long the residual has to hold still before a drifting game row is treated as an offset.
@@ -226,6 +267,12 @@ public sealed class VramBudgetMonitor
         {
             (null, null) => true,
             ({ } was, { } now) => was.TextureBudgetBytes == now.TextureBudgetBytes,
+
+            // The file stopped being readable, which says nothing about the ceiling. The reader returns
+            // null on an IOException as readily as on a missing file, and treating a transient read
+            // failure as a change would throw away the measured overhead and re-arm every line that
+            // depends on it — over a file the client rewrites while the game runs.
+            ({ }, null) => true,
             _ => false,
         };
 
@@ -237,6 +284,14 @@ public sealed class VramBudgetMonitor
         _budgetApproachReported = false;
         _budgetOverheadReported = false;
         _overheadBytes = 0;
+
+        // A new ceiling is a new question. The game may have filled the old budget and be nowhere near
+        // this one, so what was known about the old one does not license advice about this one — and
+        // the budget line, whose whole subject is the ceiling, is stale the moment it moves. Only a
+        // real change reaches here; a rewrite of the file with the same value returned above.
+        _gameFilledBudget = false;
+        _heldRecommendation = false;
+        _reported = false;
     }
 
     /// <summary>
@@ -448,9 +503,19 @@ public sealed class VramBudgetMonitor
             // has actually passed its streaming budget; before that it is zero because nothing has been
             // seen, not because there is none. An inflated row would raise this permanently — the field
             // only ever ratchets up — so it is the one figure that must never see an unusable sampling.
-            if (_clientConfig?.TextureBudgetBytes is { } budget && gameBytes > budget)
+            if (_clientConfig?.TextureBudgetBytes is { } budget && budget > 0)
             {
-                _overheadBytes = Math.Max(_overheadBytes, gameBytes - budget);
+                if (gameBytes > budget)
+                {
+                    _overheadBytes = Math.Max(_overheadBytes, gameBytes - budget);
+                }
+
+                // The same nine tenths the approach line uses, so the budget line starts advising at the
+                // moment the session already calls the budget as good as filled.
+                if (gameBytes >= budget * BudgetApproachShare)
+                {
+                    _gameFilledBudget = true;
+                }
             }
         }
 
@@ -517,7 +582,12 @@ public sealed class VramBudgetMonitor
         // the table started agreeing with the card again, so a session that refused once at 22:32 could
         // go five hours without another split even after the row it refused over had long since recovered
         // — see VramAccountingMonitor.ObserveDrift, which is what lifts the exclusion this now answers to.
-        if (_reported && transition is null && !resumed)
+        // A line that held its recommendation earns one more once the game has filled its budget.
+        // Without it, an evening whose stream stack never changes state would carry the "held back"
+        // sentence and nothing else.
+        var recommendationDue = _heldRecommendation && _gameFilledBudget;
+
+        if (_reported && transition is null && !resumed && !recommendationDue)
         {
             return null;
         }
@@ -565,7 +635,20 @@ public sealed class VramBudgetMonitor
         {
             message += $" {config.Describe()}";
 
-            if (config.DescribeAgainstCard(totalBytes, reservedBytes, VramPressureBandMonitor.BandPercent, _overheadBytes) is { } verdict)
+            _heldRecommendation = !_gameFilledBudget && config.TextureBudgetBytes > 0;
+
+            if (_heldRecommendation)
+            {
+                // Readings yes, advice no. Which of the two is being withheld has to be said, or the
+                // line reads as "the budget fits" — the opposite of what is actually known.
+                message += $" Rekommendationen om texturbudgeten hålls inne så länge: spelet håller "
+                    + $"{Gigabytes(gameBytes)} av sin streamingbudget på "
+                    + $"{Gigabytes(config.TextureBudgetBytes)} och har alltså inte fyllt den ännu. Det "
+                    + "som skulle jämföras — hur mycket spelet tar ovanpå budgeten — är inte mätt förrän "
+                    + "då, och ett råd räknat på en halvfylld inladdning pekar på ett reglageläge långt "
+                    + "under det rätta.";
+            }
+            else if (config.DescribeAgainstCard(totalBytes, reservedBytes, VramPressureBandMonitor.BandPercent, _overheadBytes) is { } verdict)
             {
                 message += $" {verdict}";
             }
@@ -616,13 +699,14 @@ public sealed class VramBudgetMonitor
         {
             // Hold. The state stands until something that can be measured disagrees with it.
             _candidateSamples = 0;
-            return _reported ? null : string.Empty;
+            return _streamStackEstablished ? null : string.Empty;
         }
 
-        if (!_reported)
+        if (!_streamStackEstablished)
         {
             // The first line states the budget rather than a change, so it is not held back: there is
             // no previous state for it to flap against.
+            _streamStackEstablished = true;
             _streamStackPresent = observed;
             _candidatePresent = observed;
             _candidateSamples = 1;

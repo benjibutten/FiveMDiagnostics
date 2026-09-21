@@ -1,16 +1,19 @@
 ﻿using System.ComponentModel;
 using System.Windows;
 using System.Windows.Input;
+using System.Windows.Interop;
 
 namespace FiveMDiagnostics.App.Wpf;
 
 using FiveMDiagnostics.App.Wpf.Properties;
+using FiveMDiagnostics.Core;
 using FiveMDiagnostics.App.Wpf.Services;
 using FiveMDiagnostics.App.Wpf.Updates;
 
 public partial class MainWindow : Window
 {
     private readonly TrayIconService _trayIconService = new();
+    private readonly GlobalHotkeyService _hotkeys = new();
     private readonly MainWindowViewModel _viewModel;
     private bool _allowClose;
 
@@ -24,6 +27,11 @@ public partial class MainWindow : Window
         Closing += OnClosing;
         Closed += OnClosed;
         StateChanged += OnStateChanged;
+
+        // After the handle exists, which is what SourceInitialized means. RegisterHotKey against a
+        // window that has none binds to the thread instead, and nothing in this process pumps that.
+        SourceInitialized += OnSourceInitialized;
+        _hotkeys.Pressed += OnHotkeyPressed;
 
         _trayIconService.ShowRequested += (_, _) => RestoreFromTray();
         _trayIconService.StartSessionRequested += (_, _) => ExecuteTrayCommand(_viewModel.StartSessionCommand, Strings.TraySessionStartingMessage);
@@ -46,7 +54,41 @@ public partial class MainWindow : Window
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
         UpdateTrayMenuState();
-        _trayIconService.ShowBalloon(Strings.AppTitle, Strings.TrayReadyMessage);
+
+        // The hotkey problem instead of the ready message, not after it. Both go to the same
+        // NotifyIcon, which shows one balloon at a time, and SourceInitialized runs before Loaded — so
+        // a warning shown where it was first written was replaced by "ready" a moment later and never
+        // seen. That is the silent failure the warning exists to prevent, arriving by a different
+        // route: a hotkey nobody knows is dead gives an evening with no marks, and no marks reads as
+        // "nothing was bad enough to mark". Nothing is lost by dropping the ready message in that
+        // case; it says less than the warning does.
+        _trayIconService.ShowBalloon(
+            Strings.AppTitle,
+            _hotkeys.RegistrationProblem ?? Strings.TrayReadyMessage);
+    }
+
+    private void OnSourceInitialized(object? sender, EventArgs e)
+    {
+        _hotkeys.Register(new WindowInteropHelper(this).Handle);
+    }
+
+    private void OnHotkeyPressed(object? sender, HotkeyMark mark)
+    {
+        var severity = mark == HotkeyMark.SevereStutter ? IncidentSeverity.Severe : IncidentSeverity.Normal;
+        var command = mark == HotkeyMark.SevereStutter ? _viewModel.MarkSevereStutterCommand : _viewModel.MarkStutterCommand;
+
+        if (!command.CanExecute(null))
+        {
+            // Pressed with no session running. Worth a word: the key is on a stream deck, out of sight
+            // of the app, and the only feedback that the press did nothing is this.
+            _trayIconService.ShowBalloon(Strings.AppTitle, Strings.HotkeyNoSessionMessage);
+            return;
+        }
+
+        _viewModel.MarkStutterFromHotkey(severity);
+        _trayIconService.ShowBalloon(
+            Strings.AppTitle,
+            mark == HotkeyMark.SevereStutter ? Strings.TrayMarkSevereMessage : Strings.TrayMarkStutterMessage);
     }
 
     private void OnStateChanged(object? sender, EventArgs e)
@@ -76,6 +118,8 @@ public partial class MainWindow : Window
         _viewModel.MarkStutterCommand.CanExecuteChanged -= OnCommandAvailabilityChanged;
         _viewModel.MarkSevereStutterCommand.CanExecuteChanged -= OnCommandAvailabilityChanged;
         _viewModel.ExportSelectedIncidentCommand.CanExecuteChanged -= OnCommandAvailabilityChanged;
+        _hotkeys.Pressed -= OnHotkeyPressed;
+        _hotkeys.Dispose();
         _trayIconService.Dispose();
     }
 
