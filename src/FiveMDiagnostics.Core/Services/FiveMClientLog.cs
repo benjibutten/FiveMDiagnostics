@@ -244,36 +244,96 @@ public sealed record FiveMClientLog(
             }
 
             var assets = of.Select(entry => entry.Asset).OfType<string>().Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-            parts.Add(assets.Length > 0
-                ? $"{of.Length} {what} ({Name(assets)})"
-                : $"{of.Length} {what} ({of[0].Describe()})");
+
+            // Files first, lines second, and only when they differ. The count used to be the line count
+            // alone: the 09-21 log's eleven timeouts on three models read as eleven missing files, next
+            // to a list of three names. Which number is the interesting one depends on the question, and
+            // one model failing seven times is not seven models failing once.
+            parts.Add((assets.Length, of.Length) switch
+            {
+                (0, _) => $"{of.Length} {what} ({of[0].Describe()})",
+                var (files, lines) when files == lines => $"{files} {what} ({Name(assets)})",
+                var (files, lines) => $"{files} {what}, på {lines} rader ({Name(assets)})",
+            });
         }
 
         var line = $"FiveM:s klientlogg: {string.Join("; ", parts)}.";
 
-        // Which of the two mechanisms was seen decides which lever is the right one, so the line says it
-        // rather than leaving the reader to infer it from the shape of the file names.
-        var downloads = failures.Any(entry => entry.Kind is FiveMClientLogKind.DownloadFailure or FiveMClientLogKind.ModelTimeout);
-        var pool = failures.Any(entry => entry.Kind is FiveMClientLogKind.PoolExhaustion);
-
-        if (downloads && !pool)
+        // One sentence per mechanism present, not one exclusive chain. The chain counted a model timeout
+        // as a download failure, so on 2026-09-21 — zero downloads missing, eleven models timing out —
+        // the line asserted nine times that "klienten fick aldrig filerna", which was false about the
+        // one question that decides where to look next. It also had no arm for mount failures at all, so
+        // a log carrying only those got no mechanism sentence.
+        foreach (var sentence in Mechanisms(failures))
         {
-            line += " Det är nedladdning, inte videominne: klienten fick aldrig filerna. Texturbudgeten "
-                + "styr vad som får ligga kvar i minnet och kan inte hålla kvar något som aldrig kom in. "
-                + "Ett .ytyp eller .ymap i listan är en MLO:s egen definition.";
-        }
-        else if (pool && !downloads)
-        {
-            line += " Det är strömningsminnet, inte nätet: filerna kom fram och fick inte plats. Där är "
-                + "Extended Texture Budget rätt reglage.";
-        }
-        else if (pool)
-        {
-            line += " Båda formerna finns i samma logg — både filer som aldrig kom fram och minne som "
-                + "tog slut — så de ska räknas var för sig innan något reglage rörs.";
+            line += " " + sentence;
         }
 
         return line;
+    }
+
+    /// <summary>
+    /// What each kind of streaming failure means, for the kinds this log actually carries.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A log can carry all four and they have four different levers, so each gets a sentence saying what
+    /// it <em>is</em>. None of those sentences rules anything out: that was the whole defect in the
+    /// exclusive chain this replaced, which let one kind's verdict stand for the whole file.
+    /// </para>
+    /// <para>
+    /// The one eliminative conclusion the investigation needs — a model that never became available with
+    /// nothing else in the log — is drawn once, at the end, and only when the log has nothing else in it
+    /// to explain the timeout. Written without that guard it claimed "kvar står cachen eller disken" on
+    /// the 2026-09-21 log, whose next sentence points at seven mount failures and the server.
+    /// </para>
+    /// </remarks>
+    private static IEnumerable<string> Mechanisms(IReadOnlyList<FiveMClientLogEntry> failures)
+    {
+        bool Any(FiveMClientLogKind kind) => failures.Any(entry => entry.Kind == kind);
+
+        var downloads = Any(FiveMClientLogKind.DownloadFailure);
+        var timeouts = Any(FiveMClientLogKind.ModelTimeout);
+        var mounts = Any(FiveMClientLogKind.MountFailure);
+        var pool = Any(FiveMClientLogKind.PoolExhaustion);
+
+        if (downloads)
+        {
+            yield return "Det är nedladdning, inte videominne: klienten fick aldrig de filerna. "
+                + "Texturbudgeten styr vad som får ligga kvar i minnet och kan inte hålla kvar något som "
+                + "aldrig kom in. Ett .ytyp eller .ymap i listan är en MLO:s egen definition.";
+        }
+
+        if (timeouts)
+        {
+            yield return "Modelltimeouterna säger att modellen begärdes och inte blev tillgänglig i tid. "
+                + "Raden i sig säger inte varför.";
+        }
+
+        if (mounts)
+        {
+            yield return "Monteringsfelen är resursens innehåll: filen kom fram men gick inte att läsa "
+                + "som det den utger sig för att vara, och det åtgärdas hos den som driver servern.";
+        }
+
+        if (pool)
+        {
+            yield return "Mättat strömningsminne är det enda i listan Extended Texture Budget styr: "
+                + "filerna kom fram och fick inte plats. Där är Extended Texture Budget rätt reglage.";
+        }
+
+        if (timeouts && !downloads && !mounts && !pool)
+        {
+            yield return "Och eftersom loggen varken har nedladdningsfel, monteringsfel eller rader om "
+                + "mättat strömningsminne, kom filerna fram och fick plats. Då står klientens egen "
+                + "strömningsväg kvar: cachen, eller disken spelet läses från.";
+        }
+        else if (timeouts)
+        {
+            yield return "Vad som orsakade timeouterna säger loggen inte, för den har fler former än en "
+                + "— och var och en av de andra raderna kan göra att en modell aldrig blir tillgänglig. "
+                + "De ska räknas var för sig innan något reglage rörs.";
+        }
     }
 
     /// <summary>Everything the client coloured red or yellow, grouped so one repeated line is one line.</summary>

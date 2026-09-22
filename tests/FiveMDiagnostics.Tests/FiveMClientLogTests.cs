@@ -226,6 +226,208 @@ public sealed class FiveMClientLogTests
         Assert.Single(log.StreamingFailures);
     }
 
+    /// <summary>
+    /// The evening of 21 September: eleven model timeouts, zero downloads missing — and the line said
+    /// the client never got the files.
+    /// </summary>
+    /// <remarks>
+    /// <c>downloads</c> was <c>DownloadFailure or ModelTimeout</c>, so a timeout alone asserted
+    /// "klienten fick aldrig filerna" nine times that evening about a log with no download failure in
+    /// it. That is the one sentence in the app that decides where to look next, and it pointed at the
+    /// network when the answer was the cache or the disk. The two 09-12/09-21 logs differ on exactly
+    /// this: five download failures then, none now, and the same <c>v_9_kitchen_unit</c> timing out both
+    /// times — three times then, seven now.
+    /// </remarks>
+    [Fact]
+    public void AModelThatTimedOutWithNoDownloadFailureIsNotCalledAMissingFile()
+    {
+        var log = Parse(
+            Banner,
+            "[   2182734] [b3407_GTAProce]             MainThrd/ ^1Requesting of a model timed out \"2003410943:v_9_kitchen_unit\"",
+            "[   8016016] [b3407_GTAProce]             MainThrd/ ^1Requesting of a model timed out \"1245315447:v_31_walltext016\"");
+
+        var streaming = log.DescribeStreaming();
+
+        Assert.Contains("2 begärdes men kom aldrig", streaming, StringComparison.Ordinal);
+
+        // The false claim, and the false lever that followed from it.
+        Assert.DoesNotContain("klienten fick aldrig", streaming, StringComparison.Ordinal);
+        Assert.DoesNotContain("Det är nedladdning", streaming, StringComparison.Ordinal);
+        Assert.DoesNotContain("Extended Texture Budget rätt reglage", streaming, StringComparison.Ordinal);
+
+        // What the log actually supports: the files arrived and the model still never became available.
+        // This log has nothing else in it, so here the elimination is sound.
+        Assert.Contains("varken har nedladdningsfel, monteringsfel eller rader om", streaming, StringComparison.Ordinal);
+        Assert.Contains("cachen", streaming, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The shape the evening of 21 September actually had: timeouts and mount failures, no downloads.
+    /// </summary>
+    /// <remarks>
+    /// The first rewrite of this method still named the cache categorically here, because the only guard
+    /// on the eliminative sentence was the download flag — and the very next sentence in the same line
+    /// said seven resources failed to mount and pointed at the server. Eleven timeouts and seven mount
+    /// failures is the real count from <c>CitizenFX_log_2026-09-21T184909.log</c>.
+    /// </remarks>
+    [Fact]
+    public void TimeoutsBesideMountFailuresDoNotEliminateTheMountFailures()
+    {
+        var log = Parse(
+            Banner,
+            "[   2182734] [b3407_GTAProce]             MainThrd/ ^1Requesting of a model timed out \"2003410943:v_9_kitchen_unit\"",
+            "[    816266] [b3407_GTAProce] ResourcePlacementThr/ ^3failed loading resources:/cfx-mxc-fib/[audio]/mxc_fib_game.dat in data file mounter^7");
+
+        var streaming = log.DescribeStreaming();
+
+        Assert.Contains("1 begärdes men kom aldrig", streaming, StringComparison.Ordinal);
+        Assert.Contains("1 kunde inte monteras", streaming, StringComparison.Ordinal);
+
+        // Both mechanisms keep their own sentence...
+        Assert.Contains("Modelltimeouterna säger", streaming, StringComparison.Ordinal);
+        Assert.Contains("som driver servern", streaming, StringComparison.Ordinal);
+
+        // ...and neither is eliminated by the other. The log carries something else that can make a
+        // model unavailable, so "what is left is the cache" is not a conclusion this file supports.
+        Assert.DoesNotContain("står klientens egen strömningsväg kvar", streaming, StringComparison.Ordinal);
+        Assert.Contains("räknas var för sig", streaming, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A log with files missing <em>and</em> a pool that ran dry must not print both exclusive verdicts.
+    /// </summary>
+    /// <remarks>
+    /// The old chain had a third arm for exactly this ("Båda formerna finns i samma logg … räknas var
+    /// för sig"). The first rewrite dropped it, and the two sentences then read "klienten fick aldrig de
+    /// filerna" immediately followed by "filerna kom fram och fick inte plats".
+    /// </remarks>
+    [Fact]
+    public void FilesMissingAndAPoolRunningDryDoNotContradictEachOther()
+    {
+        var log = Parse(
+            Banner,
+            "[   1226859] [b3407_GTAProce]                24180/ ^3ResourceCacheDevice reporting failure downloading k4mb1_post.ytyp: Failed to connect to 135.125.160.15 port 30120 after 21029 ms: Timeout was reached^7",
+            "[   1226860] [b3407_GTAProce]             MainThrd/ ^1Streaming memory ran out while loading module store^7");
+
+        var streaming = log.DescribeStreaming();
+
+        Assert.Contains("Det är nedladdning, inte videominne", streaming, StringComparison.Ordinal);
+        Assert.Contains("Extended Texture Budget rätt reglage", streaming, StringComparison.Ordinal);
+
+        // The sentence that used to sit next to "klienten fick aldrig de filerna" and deny it.
+        Assert.DoesNotContain("Det är strömningsminnet, inte nätet", streaming, StringComparison.Ordinal);
+        Assert.DoesNotContain("filerna kom fram och fick inte plats. Det", streaming, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A timeout beside an exhausted pool must not rule the texture budget out and name it in the next
+    /// breath.
+    /// </summary>
+    [Fact]
+    public void ATimeoutBesideAnExhaustedPoolDoesNotRuleOutTheBudgetItThenRecommends()
+    {
+        var log = Parse(
+            Banner,
+            "[   2182734] [b3407_GTAProce]             MainThrd/ ^1Requesting of a model timed out \"2003410943:v_9_kitchen_unit\"",
+            "[   1226860] [b3407_GTAProce]             MainThrd/ ^1Streaming memory ran out while loading module store^7");
+
+        var streaming = log.DescribeStreaming();
+
+        Assert.Contains("Extended Texture Budget rätt reglage", streaming, StringComparison.Ordinal);
+
+        // The elimination that contradicted it one sentence earlier.
+        Assert.DoesNotContain("varken nätet eller texturbudgeten", streaming, StringComparison.Ordinal);
+        Assert.DoesNotContain("står klientens egen strömningsväg kvar", streaming, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A log carrying only mount failures used to get no mechanism sentence at all.
+    /// </summary>
+    /// <remarks>
+    /// <c>MountFailure</c> was in neither <c>downloads</c> nor <c>pool</c>, so every arm of the chain
+    /// was skipped and the reader got a bare count. The same seven files have failed to mount on both
+    /// logs this investigation owns, nine days apart — it is the server's content, and nothing on this
+    /// machine fixes it.
+    /// </remarks>
+    [Fact]
+    public void AMountFailureGetsItsOwnMechanismRatherThanSilence()
+    {
+        var log = Parse(
+            Banner,
+            "[    816266] [b3407_GTAProce] ResourcePlacementThr/ ^3failed loading resources:/cfx-mxc-fib/[audio]/mxc_fib_game.dat in data file mounter^7");
+
+        var streaming = log.DescribeStreaming();
+
+        Assert.Contains("1 kunde inte monteras", streaming, StringComparison.Ordinal);
+        Assert.Contains("gick inte att läsa som", streaming, StringComparison.Ordinal);
+        Assert.Contains("som driver servern", streaming, StringComparison.Ordinal);
+
+        // A mount failure means the file *was* received, so the download sentence is wrong about it.
+        Assert.DoesNotContain("klienten fick aldrig", streaming, StringComparison.Ordinal);
+
+        // And it does not announce itself as "the third thing" when it is the only thing.
+        Assert.DoesNotContain("en tredje sak", streaming, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// All four kinds in one log each get their sentence, because they have four different levers.
+    /// </summary>
+    [Fact]
+    public void EveryMechanismPresentIsNamedRatherThanTheFirstOneWinning()
+    {
+        var log = Parse(
+            Banner,
+            "[   1226859] [b3407_GTAProce]                24180/ ^3ResourceCacheDevice reporting failure downloading k4mb1_post.ytyp: Failed to connect to 135.125.160.15 port 30120 after 21029 ms: Timeout was reached^7",
+            "[   2182734] [b3407_GTAProce]             MainThrd/ ^1Requesting of a model timed out \"2003410943:v_9_kitchen_unit\"",
+            "[    816266] [b3407_GTAProce] ResourcePlacementThr/ ^3failed loading resources:/cfx-mxc-fib/[audio]/mxc_fib_game.dat in data file mounter^7",
+            "[   1226860] [b3407_GTAProce]             MainThrd/ ^1Streaming memory ran out while loading module store^7");
+
+        var streaming = log.DescribeStreaming();
+
+        Assert.Contains("Det är nedladdning, inte videominne", streaming, StringComparison.Ordinal);
+        Assert.Contains("Modelltimeouterna säger", streaming, StringComparison.Ordinal);
+        Assert.Contains("gick inte att läsa som", streaming, StringComparison.Ordinal);
+        Assert.Contains("Extended Texture Budget rätt reglage", streaming, StringComparison.Ordinal);
+
+        // Four mechanisms in one file: nothing is eliminated, and the line says so rather than picking
+        // whichever arm happened to be first.
+        Assert.Contains("räknas var för sig", streaming, StringComparison.Ordinal);
+        Assert.DoesNotContain("står klientens egen strömningsväg kvar", streaming, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Repeated failures on one file are counted as lines and as files, not as files alone.
+    /// </summary>
+    /// <remarks>
+    /// The 09-21 log carried eleven timeouts on three models, and the line read "11 begärdes men kom
+    /// aldrig (v_9_kitchen_unit, v_31_walltext016, …)" — eleven, next to three names, which reads as
+    /// eleven missing files. The distinction matters for this log in particular: one model failing seven
+    /// times and seven models failing once are different problems.
+    /// </remarks>
+    [Fact]
+    public void RepeatedFailuresOnOneFileCountLinesAndFilesSeparately()
+    {
+        var log = Parse(
+            Banner,
+            "[   2182734] [b3407_GTAProce]             MainThrd/ ^1Requesting of a model timed out \"2003410943:v_9_kitchen_unit\"",
+            "[   4441047] [b3407_GTAProce]             MainThrd/ ^1Requesting of a model timed out \"2003410943:v_9_kitchen_unit\"",
+            "[   8016016] [b3407_GTAProce]             MainThrd/ ^1Requesting of a model timed out \"1245315447:v_31_walltext016\"");
+
+        var streaming = log.DescribeStreaming();
+
+        Assert.Contains("2 begärdes men kom aldrig, på 3 rader", streaming, StringComparison.Ordinal);
+        Assert.Contains("v_9_kitchen_unit", streaming, StringComparison.Ordinal);
+        Assert.Contains("v_31_walltext016", streaming, StringComparison.Ordinal);
+
+        // One line per file stays plain — the extra clause is only there when the counts disagree.
+        var once = Parse(
+            Banner,
+            "[   2182734] [b3407_GTAProce]             MainThrd/ ^1Requesting of a model timed out \"2003410943:v_9_kitchen_unit\"");
+
+        Assert.Contains("1 begärdes men kom aldrig (v_9_kitchen_unit)", once.DescribeStreaming(), StringComparison.Ordinal);
+        Assert.DoesNotContain("på 1 rader", once.DescribeStreaming(), StringComparison.Ordinal);
+    }
+
     private static FiveMClientLog Parse(params string[] lines) =>
         FiveMClientLog.Parse("CitizenFX_log_2026-09-12T210103.log", lines);
 }
