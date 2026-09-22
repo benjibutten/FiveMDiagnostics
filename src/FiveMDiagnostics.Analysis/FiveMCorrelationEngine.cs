@@ -1088,20 +1088,25 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         }
         else
         {
-            // The card was not full, so whatever the driver was doing it was not making room. On
-            // 10 September this verdict took an incident at 75% while its own trace text, reading the
-            // same second, said "the card was only at 86%, below the 88% where eviction begins — the
-            // driver moved memory for some other reason, and this was not memory pressure". Both
-            // sentences stood in the same incident. The observation is kept because a stopped card is
-            // worth seeing, but it is held under the classification floor so it cannot be the verdict:
-            // a stall with the card below the band is some other mechanism, and one of the other
-            // hypotheses should be allowed to name it. The cap is applied after every other signal has
-            // been added, below, so no later bonus can lift it back over the floor.
+            // The card was not full, so the occupancy does not corroborate eviction. It does not follow
+            // that nothing happened: this hypothesis only runs for an incident where the card stopped
+            // counting, so the stall is measured and it is the *explanation* that is unavailable. The
+            // observation is kept because a stopped card is worth seeing, but it is held under the
+            // classification floor so it cannot be the verdict: a stall with the card below the band is
+            // some other mechanism, and one of the other hypotheses should be allowed to name it. The
+            // cap is applied after every other signal has been added, below, so no later bonus can lift
+            // it back over the floor.
+            //
+            // The wording matches the null branch above and the ETL trace's own sentence
+            // (CpuSampleAttribution.Describe): all three now say the occupancy failed to corroborate,
+            // rather than that memory pressure was ruled out. They used to disagree inside one incident
+            // — the 10 September case this branch was written for — and saying "det här var inte
+            // minnestryck" about a card that demonstrably stalled is the half that was wrong.
             evidence.Add(
                 $"Men kortet låg bara på {peakVram:F1} % strax före framen, alltså under "
-                + $"{VramPressureBandMonitor.BandPercent:F0} % där eviction börjar. Drivrutinen flyttade "
-                + "minne av något annat skäl — en inladdning eller ett lägesbyte — och det här var inte "
-                + "minnestryck. Posten står kvar som observation men får inte bli dom.");
+                + $"{VramPressureBandMonitor.BandPercent:F0} % där eviction börjar. Fyllnadsgraden "
+                + "stöder alltså inte eviction som förklaring — vad som stoppade kortet svarar den här "
+                + "posten inte på. Den står kvar som observation men får inte bli dom.");
         }
 
         if (driverModules.Length > 0)

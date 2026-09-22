@@ -685,11 +685,11 @@ internal sealed record VideoMemoryPressure(
     /// The band above which the card's own occupancy corroborates an eviction reading.
     /// </summary>
     /// <remarks>
-    /// The same 88% three sessions of frame data put the edge at. Below it the driver's work is
-    /// something else — a resolution change, a mode switch, a level load handing over surfaces — and
-    /// saying "the card was full" about it is simply false.
+    /// Read from the band monitor rather than written here. It was a private 88 of its own until
+    /// 2026-09-22, which made two hardcoded copies of the same number in two projects that would have
+    /// drifted apart the first time either was tuned — and which read to a user as one threshold.
     /// </remarks>
-    private const double CorroboratingVramPercent = 88;
+    private static double CorroboratingVramPercent => Core.VramPressureBandMonitor.BandPercent;
 
     /// <param name="adapterVramPercent">
     /// How full the card was in <see cref="PeakAt"/>'s own second, when the session knows. The trace does
@@ -723,10 +723,26 @@ internal sealed record VideoMemoryPressure(
                 $" Kortet låg i den sekunden{second} på {percent:F0} %, så flyttningen är eviction: "
                 + "drivrutinen gjorde plats genom att skyffla ytor över PCIe.",
 
+            // Under the band, but the subject stopped computing while the driver moved memory. The
+            // measurement stands and only the occupancy fails to corroborate it, so the line says that
+            // and stops there. On 2026-09-21 the busiest second held 1.00 cores with the game down to
+            // 1.98 from 3.26 and the card at 87.1% — the peak within the two seconds either side, not an
+            // unlucky sample — and this sentence called it "not memory pressure" about the evening's
+            // second-worst frame.
+            // The quiet clause below already says the subject stopped counting, so this arm says only
+            // what the occupancy does and does not settle.
+            { } percent when SubjectWentQuiet =>
+                $" Kortet låg i den sekunden{second} på {percent:F0} %, alltså under "
+                + $"{CorroboratingVramPercent:F0} % där eviction annars börjar — så fyllnadsgraden "
+                + "förklarar inte flyttningen, och vad som utlöste den svarar spåret inte på.",
+
+            // The subject kept computing through it, so nothing waited and the occupancy agrees: this one
+            // really is housekeeping.
             { } percent =>
                 $" Men kortet låg i den sekunden{second} bara på {percent:F0} %, alltså under "
-                + $"{CorroboratingVramPercent:F0} % där eviction börjar. Drivrutinen flyttade minne av "
-                + "något annat skäl — en inladdning eller ett lägesbyte — och det här var inte minnestryck.",
+                + $"{CorroboratingVramPercent:F0} % där eviction börjar, och spelet fortsatte räkna under "
+                + "tiden. Drivrutinen flyttade minne av något annat skäl — en inladdning eller ett "
+                + "lägesbyte — och det här var inte minnestryck.",
 
             _ => " Så mycket flyttning brukar betyda att kortet är fullt och att drivrutinen evakuerar "
                 + "ytor över PCIe, men spåret innehåller ingen avläsning av kortets fyllnadsgrad — "

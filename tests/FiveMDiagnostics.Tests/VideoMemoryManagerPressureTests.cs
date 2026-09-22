@@ -1,5 +1,6 @@
 ﻿namespace FiveMDiagnostics.Tests;
 
+using FiveMDiagnostics.Core;
 using FiveMDiagnostics.Integrations.Etw;
 
 /// <summary>
@@ -138,6 +139,69 @@ public sealed class VideoMemoryManagerPressureTests
 
         // The sentence that stood underneath a correct verdict of GPU VRAM pressure on that frame.
         Assert.DoesNotContain("inte minnestryck", described, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The evening of 21 September: the driver's busiest second of the whole series, with the game
+    /// waiting through it, on a card that never reached the band.
+    /// </summary>
+    /// <remarks>
+    /// 1.00 cores in <c>dxgmms2.sys</c> at 23:25:08 with the game down to 1.98 from 3.26, GPU
+    /// utilisation at 3% and bandwidth at 1% — and 87.1% was the *peak* of the readings within two
+    /// seconds either side, not an unlucky sample. The line said "det här var inte minnestryck" about
+    /// the second-worst frame of the evening, which is a conclusion the trace does not support: what the
+    /// occupancy fails to do is corroborate eviction, not establish that nothing waited.
+    /// </remarks>
+    [Fact]
+    public void AGameThatStoppedComputingIsNotCalledUnaffectedJustBecauseTheCardWasBelowTheBand()
+    {
+        var pressure = new VideoMemoryPressure(
+            BaselineCores: 0.18,
+            PeakCores: 1.00,
+            SubjectProcess: "FiveM_b3407_GTAProcess.exe",
+            SubjectCoresAtPeak: 1.98,
+            SubjectBaselineCores: 3.26,
+            PeakAt: new DateTime(2026, 9, 21, 23, 25, 8, DateTimeKind.Local));
+
+        var described = pressure.Describe(adapterVramPercent: 87.1);
+
+        Assert.True(pressure.SubjectWentQuiet);
+        Assert.Contains("1,00 kärnor", described, StringComparison.Ordinal);
+        Assert.Contains("87 %", described, StringComparison.Ordinal);
+        Assert.Contains("vänta, inte till att räkna", described, StringComparison.Ordinal);
+        Assert.Contains("fyllnadsgraden förklarar inte flyttningen", described, StringComparison.Ordinal);
+
+        // The sentence this test exists to prevent. The game demonstrably stopped; saying the moment
+        // cost nothing contradicts the measurement in the same line.
+        Assert.DoesNotContain("inte minnestryck", described, StringComparison.Ordinal);
+
+        // And it still must not claim the thing the occupancy rules out.
+        Assert.DoesNotContain("flyttningen är eviction", described, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The band is the band monitor's, not a second copy of the number.
+    /// </summary>
+    /// <remarks>
+    /// It was a <c>private const double CorroboratingVramPercent = 88</c> in the ETL project until
+    /// 2026-09-22, with no reference to <see cref="VramPressureBandMonitor.BandPercent"/> — two
+    /// hardcoded 88s in two projects that read to a user as one threshold and would have drifted apart
+    /// the first time either was tuned.
+    /// </remarks>
+    [Fact]
+    public void TheEvictionBandIsTheOneTheRestOfTheAppUses()
+    {
+        var pressure = new VideoMemoryPressure(0.10, 0.90, "FiveM_b3407_GTAProcess.exe", 3.9, 3.9, null);
+
+        Assert.Contains(
+            $"{VramPressureBandMonitor.BandPercent:F0} % där eviction börjar",
+            pressure.Describe(adapterVramPercent: VramPressureBandMonitor.BandPercent - 1),
+            StringComparison.Ordinal);
+
+        Assert.Contains(
+            "flyttningen är eviction",
+            pressure.Describe(adapterVramPercent: VramPressureBandMonitor.BandPercent),
+            StringComparison.Ordinal);
     }
 
     /// <summary>Without the per-process series there is a rate and nothing to pair it with.</summary>

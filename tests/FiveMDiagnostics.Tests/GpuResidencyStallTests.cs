@@ -152,6 +152,12 @@ public sealed class GpuResidencyStallTests
     /// moved memory for some other reason, and this was not memory pressure". The verdict was
     /// nevertheless GPU residency at 75 %. Making room in VRAM is a claim about a full card, so below
     /// the band the observation is kept and the verdict is not.
+    ///
+    /// Revised 2026-09-22. Both sources used to settle the question with "det här var inte minnestryck",
+    /// which agreed but was wrong in the same way: this hypothesis only runs for an incident where the
+    /// card demonstrably stopped, so what the occupancy withholds is corroboration for eviction, not
+    /// evidence that nothing happened. Both now say the occupancy does not support eviction and leave
+    /// the cause open — still the same claim in both places, which is what this test guards.
     /// </remarks>
     [Fact]
     public void BelowTheBandTheStallIsObservedButNotTheVerdict()
@@ -163,11 +169,14 @@ public sealed class GpuResidencyStallTests
         Assert.True(residency.Confidence < 0.35, $"expected it under the classification floor, got {residency.Confidence:F2}");
         Assert.NotEqual(RootCauseCategory.GpuResidencyStall, analysis.Hypotheses[0].Category);
 
-        // The evidence still describes the stopped card, and now says why it is not memory pressure —
-        // in the same words the trace text uses, so the incident cannot contradict itself again.
+        // The evidence still describes the stopped card, and says what the occupancy does and does not
+        // settle — in the same terms the trace text uses, so the incident cannot contradict itself.
         Assert.Contains(residency.Evidence, item => item.Contains("minnesbandbredd 0 %", StringComparison.Ordinal));
-        Assert.Contains(residency.Evidence, item => item.Contains("inte minnestryck", StringComparison.Ordinal));
+        Assert.Contains(residency.Evidence, item => item.Contains("Fyllnadsgraden", StringComparison.Ordinal));
         Assert.Contains(residency.Evidence, item => item.Contains("får inte bli dom", StringComparison.Ordinal));
+
+        // The half that was wrong: the card stopped, so this must not be settled as "nothing happened".
+        Assert.DoesNotContain(residency.Evidence, item => item.Contains("inte minnestryck", StringComparison.Ordinal));
     }
 
     /// <summary>
