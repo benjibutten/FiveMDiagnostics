@@ -210,6 +210,13 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// <summary>The resource list this session has seen, kept for the next one.</summary>
     private IReadOnlyList<string> _resourcesThisSession = [];
 
+    /// <summary>Client logs already copied into the session folder, by source path.</summary>
+    /// <remarks>
+    /// The copy runs both at the game's exit and at session end, and on an evening without a relaunch
+    /// those are the same file — which reported itself saved twice.
+    /// </remarks>
+    private readonly HashSet<string> _copiedClientLogs = new(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>
     /// The game exit whose event-log lookup is still owed, if any.
     /// </summary>
@@ -468,6 +475,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _previousSessionProcessNames = PreviousSessionProcessLog.TryLoad(_settings.WorkingDirectory);
             _previousSessionResources = PreviousSessionResourceLog.TryLoad(_settings.WorkingDirectory);
             _resourcesThisSession = [];
+            _copiedClientLogs.Clear();
 
             _lastSummaryLine.Clear();
             _eventLogLookups.Clear();
@@ -1609,13 +1617,39 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             return;
         }
 
-        // Kept with the evening's other artifacts, and only at the end, when the file is complete.
-        if (FiveMClientLogReader.CopyBeside(log, _settings.WorkingDirectory) is { } copy)
+        // Kept with the evening's other artifacts, and only at the end, when the file is complete. The
+        // log already parsed above, rather than a second read: a 650 KB re-parse for a path, and a
+        // window in which the file described and the file copied could differ.
+        CopyClientLogAside(log);
+
+        PreviousSessionResourceLog.Save(_settings.WorkingDirectory, _resourcesThisSession);
+    }
+
+    /// <summary>
+    /// Copies a client log into the session folder, once per file.
+    /// </summary>
+    /// <remarks>
+    /// Called at session end and again whenever the game process exits, because those are two different
+    /// files on any evening the game was restarted, and the one worth having is the one that stopped.
+    /// On the ordinary evening they are the same file and the second call is a no-op: without the guard
+    /// the session log carried the same "klientlogg sparad till" line twice, which reads as two logs.
+    /// </remarks>
+    private void CopyClientLogAside(FiveMClientLog? log = null)
+    {
+        if ((log ?? FiveMClientLogReader.Read()) is not { } found)
+        {
+            return;
+        }
+
+        if (!_copiedClientLogs.Add(found.Path))
+        {
+            return;
+        }
+
+        if (FiveMClientLogReader.CopyBeside(found, _settings.WorkingDirectory) is { } copy)
         {
             Report(StatusLevel.Info, "FiveM.ClientLog", $"FiveM:s klientlogg sparad till {copy}.");
         }
-
-        PreviousSessionResourceLog.Save(_settings.WorkingDirectory, _resourcesThisSession);
     }
 
     /// <summary>
@@ -2914,6 +2948,12 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         // The same exit, told to the band monitor for the opposite reason: the ten minutes the card is
         // still measured are what the release is read from, and they are not minutes of the evening.
         _vramPressure?.NoteGameExit(exitedAt);
+
+        // Before the exit line, while the dead process's log is still the newest file on disk. A relaunch
+        // makes the client open a new one, and the end-of-session copy then takes that instead: on
+        // 2026-09-21 the game vanished at 20:48:57, restarted at 20:49:24, and the only client log kept
+        // was the successor's — losing exactly the file that could have said why the first one went.
+        CopyClientLogAside();
 
         var tailMinutes = PostGameWindow.Duration.TotalMinutes;
         Report(
