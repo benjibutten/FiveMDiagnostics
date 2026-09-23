@@ -266,6 +266,136 @@ public sealed class AutoIncidentDetectorTests
     }
 
     /// <summary>
+    /// A 50 ms frame every 21st frame, as between 22:42 and 22:58 on 22 September: no frame reaches the
+    /// floor, pacing averages 57–59 fps, and the minute is still the worst of the evening.
+    /// </summary>
+    [Fact]
+    public void TwentyHitchesInsideAMinuteAreAnIncident()
+    {
+        var detector = new AutoIncidentDetector(new AutoDetectOptions(), 60);
+
+        var triggers = FeedTrain(detector, hitches: AutoIncidentDetector.HitchSeriesPerMinute, framesBetween: 20);
+
+        var series = Assert.Single(triggers);
+        Assert.Equal(AutoIncidentKind.HitchSeries, series.Kind);
+        Assert.Equal(0, series.FrameTimeMs);
+        Assert.Contains("20 hitches på 7 s", series.Label, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void NineteenHitchesInsideAMinuteAreNot()
+    {
+        var detector = new AutoIncidentDetector(new AutoDetectOptions(), 60);
+
+        Assert.Empty(FeedTrain(detector, hitches: AutoIncidentDetector.HitchSeriesPerMinute - 1, framesBetween: 20));
+    }
+
+    /// <summary>Twenty hitches spread over more than a minute are an ordinary stretch of evening.</summary>
+    [Fact]
+    public void TwentyHitchesSpreadOverTwoMinutesAreNot()
+    {
+        var detector = new AutoIncidentDetector(new AutoDetectOptions(), 60);
+
+        // One every 6.3 s: 20 of them span two minutes, and no rolling minute holds more than ten.
+        Assert.Empty(FeedTrain(detector, hitches: AutoIncidentDetector.HitchSeriesPerMinute, framesBetween: 375));
+    }
+
+    /// <summary>
+    /// A series is one observation however long it runs, and a new one once the minute has cleared.
+    /// </summary>
+    [Fact]
+    public void ASeriesIsReportedOnceUntilTheMinuteClears()
+    {
+        var detector = new AutoIncidentDetector(new AutoDetectOptions(), 60);
+        var observations = new List<AutoIncidentObservation>();
+        var timestamp = Start;
+
+        FeedTrain(detector, hitches: 100, framesBetween: 20, observations, ref timestamp);
+        Assert.Single(observations, observation => observation.Trigger.Kind == AutoIncidentKind.HitchSeries);
+
+        // Two quiet minutes, then the same timer again.
+        for (var i = 0; i < 7200; i++)
+        {
+            detector.Observe(Frame(timestamp, 16.7));
+            timestamp = timestamp.AddMilliseconds(16.7);
+        }
+
+        FeedTrain(detector, hitches: 20, framesBetween: 20, observations, ref timestamp);
+        Assert.Equal(2, observations.Count(observation => observation.Trigger.Kind == AutoIncidentKind.HitchSeries));
+    }
+
+    /// <summary>A frame over the floor is an incident of its own and still one of the series' hitches.</summary>
+    [Fact]
+    public void AHitchOverTheFloorCountsTowardsTheSeries()
+    {
+        var detector = new AutoIncidentDetector(new AutoDetectOptions(), 60);
+        var observations = new List<AutoIncidentObservation>();
+        var timestamp = Start;
+
+        FeedTrain(detector, hitches: 1, framesBetween: 20, observations, ref timestamp, hitchMs: 150);
+        FeedTrain(detector, hitches: AutoIncidentDetector.HitchSeriesPerMinute - 1, framesBetween: 20, observations, ref timestamp);
+
+        Assert.Contains(observations, observation => observation.Trigger.Kind == AutoIncidentKind.HitchSeries);
+    }
+
+    /// <summary>
+    /// Settles the baseline, then feeds <paramref name="hitches"/> 50 ms frames with ordinary frames
+    /// between them, and returns every trigger the detector acted on.
+    /// </summary>
+    private static List<AutoIncidentTrigger> FeedTrain(AutoIncidentDetector detector, int hitches, int framesBetween)
+    {
+        var observations = new List<AutoIncidentObservation>();
+        var timestamp = Start;
+        FeedTrain(detector, hitches, framesBetween, observations, ref timestamp);
+
+        return observations.Where(observation => !observation.IsSuppressed).Select(observation => observation.Trigger).ToList();
+    }
+
+    /// <summary>
+    /// Settles the baseline on the first call, then feeds <paramref name="hitches"/> frames of
+    /// <paramref name="hitchMs"/> with ordinary frames between them, collecting every observation.
+    /// </summary>
+    private static void FeedTrain(
+        AutoIncidentDetector detector,
+        int hitches,
+        int framesBetween,
+        List<AutoIncidentObservation> observations,
+        ref DateTimeOffset timestamp,
+        double hitchMs = 50)
+    {
+        var at = timestamp;
+
+        void Present(double frameTimeMs)
+        {
+            if (detector.Observe(Frame(at, frameTimeMs)) is { } observation)
+            {
+                observations.Add(observation);
+            }
+
+            at = at.AddMilliseconds(frameTimeMs);
+        }
+
+        if (at == Start)
+        {
+            for (var i = 0; i < 200; i++)
+            {
+                Present(16.7);
+            }
+        }
+
+        for (var hitch = 0; hitch < hitches; hitch++)
+        {
+            Present(hitchMs);
+            for (var i = 0; i < framesBetween; i++)
+            {
+                Present(16.7);
+            }
+        }
+
+        timestamp = at;
+    }
+
+    /// <summary>
     /// Returns the trigger the detector acted on, so a suppressed observation reads as "nothing fired"
     /// here exactly as a null did before <see cref="AutoIncidentObservation"/> existed. Tests that care
     /// about suppression call <see cref="AutoIncidentDetector.Observe"/> directly.

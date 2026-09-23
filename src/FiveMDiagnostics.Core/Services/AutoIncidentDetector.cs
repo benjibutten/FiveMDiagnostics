@@ -12,6 +12,13 @@ public enum AutoIncidentKind
     /// severity by <see cref="AutoIncidentTrigger.FrameTimeMs"/> would rank a freeze below a mild spike.
     /// </summary>
     DroppedFrameRun,
+
+    /// <summary>
+    /// <see cref="AutoIncidentDetector.HitchSeriesPerMinute"/> hitches inside one rolling minute. The
+    /// minute is the event and no single frame in it is, so <see cref="AutoIncidentTrigger.FrameTimeMs"/>
+    /// is zero.
+    /// </summary>
+    HitchSeries,
 }
 
 /// <summary>Why the detector decided to mark an incident on its own.</summary>
@@ -19,7 +26,8 @@ public enum AutoIncidentKind
 /// The frame that crossed the threshold. Carried because two decisions downstream need the magnitude
 /// rather than the category: whether the hitch is worth spending a deep capture on, and whether it is
 /// worse than the incident already open over this moment. Not meaningful for
-/// <see cref="AutoIncidentKind.DroppedFrameRun"/>, where the frame times are normal by construction.
+/// <see cref="AutoIncidentKind.DroppedFrameRun"/>, where the frame times are normal by construction, and
+/// zero for <see cref="AutoIncidentKind.HitchSeries"/>.
 /// </param>
 public sealed record AutoIncidentTrigger(
     IncidentSeverity Severity,
@@ -93,6 +101,22 @@ public sealed class AutoIncidentDetector
     /// </summary>
     private const int BaselineRefreshFrames = 60;
 
+    /// <summary>
+    /// Hitches inside one rolling minute that make the minute an incident of its own.
+    /// </summary>
+    /// <remarks>
+    /// High enough that an ordinary evening stays quiet, low enough for a stall on a timer: on 22
+    /// September a frame of 35–85 ms every 0.355 seconds put 19–87 hitches in each minute it touched,
+    /// while no other minute held more than 11. Of the eight earlier evenings with frame data, only 2
+    /// September crosses it more than twice outside loading.
+    /// <para>
+    /// The VRAM band report uses the same bar for the minutes a series would otherwise decide on its own.
+    /// </para>
+    /// </remarks>
+    public const int HitchSeriesPerMinute = 20;
+
+    private static readonly TimeSpan HitchSeriesWindow = TimeSpan.FromMinutes(1);
+
     private readonly AutoDetectOptions _options;
     private readonly double _refreshIntervalMs;
     private readonly double[] _frameTimes;
@@ -103,6 +127,15 @@ public sealed class AutoIncidentDetector
     /// worth of timestamps is ever held, so this stays a handful of entries however long a session runs.
     /// </summary>
     private readonly Queue<DateTimeOffset> _triggersInWindow = new();
+
+    /// <summary>When each hitch inside the last <see cref="HitchSeriesWindow"/> was presented, oldest first.</summary>
+    private readonly Queue<DateTimeOffset> _recentHitches = new();
+
+    /// <summary>
+    /// Whether the series now running has been reported. Cleared once the rolling minute drops below
+    /// <see cref="HitchSeriesPerMinute"/>, so a series is one observation however long it lasts.
+    /// </summary>
+    private bool _seriesReported;
 
     private int _sampleCount;
     private int _writeIndex;
@@ -262,6 +295,8 @@ public sealed class AutoIncidentDetector
 
         if (sample.FrameTimeMs >= baseline * _options.SpikeMultiplier)
         {
+            RecordHitch(sample.Timestamp);
+
             // Both gates, not either. The multiplier says the frame was out of step with the evening;
             // the floor says it was long enough for a window and fourteen hypotheses to have anything to
             // find. Below it the frame is still a hitch, counted by the four monitors that measure the
@@ -279,6 +314,11 @@ public sealed class AutoIncidentDetector
             }
 
             _hitchesBelowFloor++;
+
+            if (ClassifyHitchSeries(sample.Timestamp, baseline) is { } series)
+            {
+                return series;
+            }
         }
 
         // A run of frames that never reached the screen is a visible freeze even when each individual
@@ -293,6 +333,49 @@ public sealed class AutoIncidentDetector
         }
 
         return null;
+    }
+
+    /// <summary>Adds a hitch to the rolling minute and drops the ones that have left it.</summary>
+    private void RecordHitch(DateTimeOffset timestamp)
+    {
+        _recentHitches.Enqueue(timestamp);
+
+        var windowStart = timestamp - HitchSeriesWindow;
+        while (_recentHitches.TryPeek(out var oldest) && oldest < windowStart)
+        {
+            _recentHitches.Dequeue();
+        }
+
+        if (_recentHitches.Count < HitchSeriesPerMinute)
+        {
+            _seriesReported = false;
+        }
+    }
+
+    /// <summary>
+    /// A trigger when the rolling minute has just reached <see cref="HitchSeriesPerMinute"/> hitches, or
+    /// null.
+    /// </summary>
+    /// <remarks>
+    /// Neither of the other rules can see this. The floor looks at one frame at a time, and pacing
+    /// averages the minute: one hitching frame in twenty-one still averages 57–59 fps. Reported whether
+    /// or not the caller acts on it, because a suppressed series is still the same series.
+    /// </remarks>
+    private AutoIncidentTrigger? ClassifyHitchSeries(DateTimeOffset timestamp, double baseline)
+    {
+        if (_seriesReported || _recentHitches.Count < HitchSeriesPerMinute)
+        {
+            return null;
+        }
+
+        _seriesReported = true;
+        var span = timestamp - _recentHitches.Peek();
+
+        return new AutoIncidentTrigger(
+            IncidentSeverity.Normal,
+            $"Auto: {_recentHitches.Count} hitches på {span.TotalSeconds:F0} s (baslinje {baseline:F1} ms)",
+            0,
+            AutoIncidentKind.HitchSeries);
     }
 
     private void RecordFrameTime(double frameTimeMs)

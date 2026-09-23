@@ -171,6 +171,11 @@ interval:
 | Frame time ≥ `SpikeMultiplier` × baseline | 2.0× (33 ms at 60 fps) | Normal |
 | Frame time ≥ `SevereMultiplier` × baseline | 4.0× (67 ms at 60 fps) | Severe |
 | `DroppedFrameRun` consecutive undisplayed frames | 3 | Normal |
+| Hitches (≥ `SpikeMultiplier` × baseline) inside one rolling minute | 20, fixed | Normal |
+
+The last rule catches a stall on a timer: a frame of 35–85 ms every third of a second passes no
+frame-time threshold and still averages 57–59 fps, so neither the floor nor frame pacing sees it. Its
+incident may spend one of the deep captures otherwise reserved for extreme frames, once per session.
 
 Guard rails, all configurable under `AutoDetect` in `settings.json`:
 

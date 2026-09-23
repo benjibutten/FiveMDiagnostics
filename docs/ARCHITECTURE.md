@@ -187,6 +187,14 @@ Normal tier only reappears on an evening whose baseline is above 25 ms. The out-
 `DiagnosticsSessionManager` keeps its own fixed 500 ms limit and never sees the floor; so does
 `AutoDeepCaptureBudget`, whose 120 ms is a different question again.
 
+Frames below the floor still count towards the hitch-series rule
+(`AutoIncidentDetector.HitchSeriesPerMinute`, 20 in a rolling minute), which raises an incident of kind
+`HitchSeries` with no frame time, once per stretch of the rolling minute at or above the bar. Its
+incident's escalation bar starts at the frame time the capture budget traces on its own, so a frame
+worth a trace still takes the incident over. Like saturation and dropped-frame runs, its capture has no
+frame time in `AutoDeepCaptureBudget`: an ordinary frame never displaces it, and an extreme frame only
+as a last resort.
+
 ## Incident lifecycle
 
 The ring buffer stores at least 3 minutes of samples in v1. Marking an incident does not stop collection. Instead, the materializer:

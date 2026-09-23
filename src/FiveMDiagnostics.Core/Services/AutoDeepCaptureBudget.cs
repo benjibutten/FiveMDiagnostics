@@ -188,6 +188,10 @@ public sealed class AutoDeepCaptureBudget
     /// unbroken bad patch, which the trace already on disk describes as well as a half-filled one would.
     /// </remarks>
     private double _lastCaptureFrameTimeMs;
+
+    /// <summary>Whether a hitch series has had its capture this session.</summary>
+    private bool _hitchSeriesTraced;
+
     private DateTimeOffset? _firstFrameAt;
     private DateTimeOffset? _lastFrameAt;
 
@@ -634,6 +638,39 @@ public sealed class AutoDeepCaptureBudget
             out _);
     }
 
+    /// <summary>
+    /// Reserves for a minute that held <see cref="AutoIncidentDetector.HitchSeriesPerMinute"/> hitches,
+    /// once per session.
+    /// </summary>
+    /// <remarks>
+    /// A series is made of frames too small for the reserve, so without an exception it meets slots held
+    /// for frames over the extreme threshold and goes untraced. It may therefore spend the reserve, once
+    /// per session: the first trace names the code that stalls, and a series can recur for a quarter of
+    /// an hour, each recurrence a slot taken from the frames the reserve is holding for.
+    /// </remarks>
+    public bool TryReserveForHitchSeries(DateTimeOffset timestamp, out string? refusal)
+    {
+        if (_hitchSeriesTraced)
+        {
+            _lastRefusalReason = CaptureRefusalReason.None;
+            refusal = null;
+            return false;
+        }
+
+        var reserved = TryReserveCore(
+            timestamp,
+            "en serie hitches",
+            mayOverrideCooldown: false,
+            mayOverrideRefill: false,
+            maySpendReserve: true,
+            frameTimeMs: 0,
+            out refusal,
+            out _);
+
+        _hitchSeriesTraced = reserved;
+        return reserved;
+    }
+
     /// <param name="mayOverrideCooldown">
     /// Whether the frame is catastrophic enough to spend budget the ordinary cooldown would have
     /// withheld. The shorter <see cref="DeepCaptureOptions.AutoCaptureOverrideCooldown"/> still applies:
@@ -904,6 +941,12 @@ public sealed class AutoDeepCaptureBudget
     /// so it may not cost an in-game trace. The rule only ever refuses: letting in-game frames displace
     /// out-of-focus captures first would buy extra flushes during play, which is the cost this budget is for.
     /// </para>
+    /// <para>
+    /// A capture without a frame time gives way only as a last resort, to a frame past
+    /// <see cref="EffectiveExtremeFrameTimeMs"/> with no weaker frame left to take the place of, and then
+    /// the oldest of them. Without that a session whose ceiling filled with saturation windows would
+    /// refuse the frame the reserve was held for.
+    /// </para>
     /// </remarks>
     private SpentCapture? WeakestCaptureBelow(double frameTimeMs, bool inFocus)
     {
@@ -912,10 +955,19 @@ public sealed class AutoDeepCaptureBudget
             return null;
         }
 
+        var extreme = frameTimeMs >= EffectiveExtremeFrameTimeMs;
+
         lock (_sync)
         {
-            var weakest = _captures.OrderBy(capture => capture.FrameTimeMs).FirstOrDefault();
-            return weakest is not null && frameTimeMs > weakest.FrameTimeMs ? weakest : null;
+            var weakest = Displaceable().OrderBy(capture => capture.FrameTimeMs).FirstOrDefault();
+            if (weakest is not null && frameTimeMs > weakest.FrameTimeMs)
+            {
+                return weakest;
+            }
+
+            return extreme
+                ? _captures.Where(capture => capture.FrameTimeMs <= 0).OrderBy(capture => capture.At).FirstOrDefault()
+                : null;
         }
     }
 
@@ -924,13 +976,24 @@ public sealed class AutoDeepCaptureBudget
     {
         lock (_sync)
         {
-            var weakest = _captures.OrderBy(capture => capture.FrameTimeMs).FirstOrDefault();
-            return weakest is { FrameTimeMs: > 0 } bar
+            var weakest = Displaceable().OrderBy(capture => capture.FrameTimeMs).FirstOrDefault();
+            return weakest is { } bar
                 ? $", och den minst allvarliga av dem togs för {bar.FrameTimeMs:F0} ms — en frame över det "
                     + "hade tagit dess plats"
                 : string.Empty;
         }
     }
+
+    /// <summary>
+    /// The captures a worse frame may take the place of. Called under the lock.
+    /// </summary>
+    /// <remarks>
+    /// A capture spent on something with no frame time — saturation, a dropped-frame run, a hitch series
+    /// — ranks at zero and would be the first thing any frame displaced. Those are the events the
+    /// frame-time tiers cannot see, so an ordinary frame never takes their slot; see
+    /// <see cref="WeakestCaptureBelow"/> for the one exception.
+    /// </remarks>
+    private IEnumerable<SpentCapture> Displaceable() => _captures.Where(capture => capture.FrameTimeMs > 0);
 
     /// <summary>One slot of the session ceiling: what it was spent on, and the file it produced.</summary>
     private sealed class SpentCapture
@@ -943,7 +1006,10 @@ public sealed class AutoDeepCaptureBudget
 
         public DateTimeOffset At { get; }
 
-        /// <summary>Zero for a capture taken for something with no frame time, which nothing may displace.</summary>
+        /// <summary>
+        /// Zero for a capture taken for something with no frame time, which only an extreme frame may
+        /// displace, and only when no capture with a frame time is weaker.
+        /// </summary>
         public double FrameTimeMs { get; }
 
         /// <summary>Filled in by <see cref="NoteCaptureWritten"/> once the trace is on disk.</summary>

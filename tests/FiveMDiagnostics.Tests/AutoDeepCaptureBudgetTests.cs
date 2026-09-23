@@ -377,6 +377,93 @@ public sealed class AutoDeepCaptureBudgetTests
     }
 
     /// <summary>
+    /// The evening of 22 September: four of six captures taken, two held for frames over 250 ms, and a
+    /// quarter hour of hitches on a 0.355-second timer whose one frame over the floor was 121 ms.
+    /// </summary>
+    [Fact]
+    public void AHitchSeriesMaySpendTheReserveOncePerSession()
+    {
+        var budget = new AutoDeepCaptureBudget(FixedThresholdOptions());
+
+        budget.Observe(Start, 180);
+        for (var i = 0; i < 4; i++)
+        {
+            Assert.True(budget.TryReserve(Start.AddMinutes(11 * i), frameTimeMs: 180, out _));
+        }
+
+        var timestamp = Start.AddMinutes(44);
+        budget.Observe(timestamp, 121);
+        Assert.False(budget.TryReserve(timestamp, frameTimeMs: 121, out var refusal));
+        Assert.Contains("2 är fortfarande reserverade", refusal!, StringComparison.Ordinal);
+
+        Assert.True(budget.TryReserveForHitchSeries(timestamp, out refusal));
+        Assert.Null(refusal);
+        Assert.Equal(5, budget.Spent);
+
+        // A series recurs; its first trace is the one worth a reserved slot.
+        Assert.False(budget.TryReserveForHitchSeries(Start.AddHours(3), out _));
+        Assert.Equal(5, budget.Spent);
+    }
+
+    /// <summary>
+    /// A capture taken for something with no frame time ranks at zero, and must not be the first thing
+    /// any later frame takes the place of.
+    /// </summary>
+    [Fact]
+    public void ACaptureWithoutAFrameTimeIsNotDisplacedByALaterFrame()
+    {
+        var budget = new AutoDeepCaptureBudget(FixedThresholdOptions());
+
+        budget.Observe(Start, 180);
+        Assert.True(budget.TryReserveForHitchSeries(Start, out _));
+        Assert.True(budget.TryReserveForSustainedSaturation(Start.AddMinutes(11), out _));
+        for (var i = 2; i < 6; i++)
+        {
+            var at = Start.AddMinutes(11 * i);
+            budget.Observe(at, 400);
+            Assert.True(budget.TryReserve(at, frameTimeMs: 400, out _, out _));
+        }
+
+        Assert.Equal(0, budget.Remaining);
+
+        // At the ceiling a worse frame takes the weakest frame's slot — never the series or the saturation.
+        var later = Start.AddMinutes(80);
+        budget.Observe(later, 900);
+        Assert.True(budget.TryReserve(later, frameTimeMs: 900, out _, out var replaced));
+        Assert.Equal(400, replaced!.FrameTimeMs);
+    }
+
+    /// <summary>
+    /// A ceiling filled with captures that have no frame time must still give way to the frame the
+    /// reserve was held for — the oldest of them, and only for a frame past the extreme threshold.
+    /// </summary>
+    [Fact]
+    public void AnExtremeFrameTakesTheOldestSlotWithoutAFrameTimeWhenNothingElseIsWeaker()
+    {
+        var budget = new AutoDeepCaptureBudget(FixedThresholdOptions());
+
+        budget.Observe(Start, 16.7);
+        Assert.True(budget.TryReserveForHitchSeries(Start, out _));
+        for (var i = 1; i < 4; i++)
+        {
+            Assert.True(budget.TryReserveForSustainedSaturation(Start.AddMinutes(11 * i), out _));
+        }
+
+        // The reserve lets go of one slot per quiet hour, and saturation takes each as it comes free.
+        Assert.True(budget.TryReserveForSustainedSaturation(Start.AddHours(1).AddMinutes(1), out _));
+        Assert.True(budget.TryReserveForSustainedSaturation(Start.AddHours(2).AddMinutes(1), out _));
+        Assert.Equal(0, budget.Remaining);
+
+        var late = Start.AddHours(2).AddMinutes(20);
+        budget.Observe(late, 180);
+        Assert.False(budget.TryReserve(late, frameTimeMs: 180, out _, out _));
+
+        budget.Observe(late, 1133);
+        Assert.True(budget.TryReserve(late, frameTimeMs: 1133, out _, out var replaced));
+        Assert.Equal(Start, replaced!.At);
+    }
+
+    /// <summary>
     /// Options with the adaptive thresholds pinned, for the tests that feed frames through
     /// <see cref="AutoDeepCaptureBudget.Observe"/> and need the two bars to stay where the defaults put
     /// them. Adaptation is a different subject with its own tests, and letting it move underneath these

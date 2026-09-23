@@ -198,6 +198,45 @@ public sealed class SuppressedFrameHandlingTests : IDisposable
         Assert.Equal(2, labels.Count);
     }
 
+    /// <summary>
+    /// A frame worth its own trace inside a hitch series' window takes the incident over. The series
+    /// has just armed the detector's cooldown, so this is the only way the frame reaches an incident.
+    /// </summary>
+    [Fact]
+    public async Task ACatastrophicFrameInsideAHitchSeriesTakesTheIncidentOver()
+    {
+        var labels = await RunAsync([.. HitchSeries(fromSecond: 10), new Hitch(AtSecond: 25, FrameTimeMs: 1018)]);
+
+        var label = Assert.Single(labels);
+        Assert.Contains("1018 ms", label, StringComparison.Ordinal);
+    }
+
+    /// <summary>An ordinary frame over the floor does not rename the series after itself.</summary>
+    [Fact]
+    public async Task AnOrdinaryFrameInsideAHitchSeriesLeavesItsName()
+    {
+        var labels = await RunAsync([.. HitchSeries(fromSecond: 10), new Hitch(AtSecond: 25, FrameTimeMs: 110)]);
+
+        var label = Assert.Single(labels);
+        Assert.Contains("hitches på", label, StringComparison.Ordinal);
+    }
+
+    /// <summary>Twenty 50 ms frames a third of a second apart, the shape of 22 September.</summary>
+    private static IEnumerable<Hitch> HitchSeries(double fromSecond) =>
+        Enumerable.Range(0, AutoIncidentDetector.HitchSeriesPerMinute)
+            .Select(index => new Hitch(AtSecond: fromSecond + (index * 0.35), FrameTimeMs: 50));
+
+    private async Task<IReadOnlyList<string>> RunAsync(IReadOnlyList<Hitch> hitches)
+    {
+        var collector = new ScriptedFrameCollector(hitches);
+        await using var manager = CreateManager(CreateSettings(), collector);
+        await manager.StartSessionAsync();
+        await collector.Completed;
+        await manager.StopSessionAsync();
+
+        return IncidentLabels();
+    }
+
     private IReadOnlyList<string> IncidentLabels()
     {
         var path = Directory.GetFiles(_workingDirectory, "session_*.jsonl").Single();

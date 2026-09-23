@@ -1766,12 +1766,28 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             trigger.Severity,
             trigger.Label,
             allowDeepCapture: captureThis,
-            trigger.FrameTimeMs,
+            EscalationBar(trigger),
 
             // A pacing incident carries no frame time, so its bar starts at zero and the next suppressed
             // frame of any size would clear it — replacing "FPS-taket nått i 15 min" with "Auto: 40 ms
             // frame", which says far less about the same window.
             allowFrameEscalation: !sustainedSaturation);
+    }
+
+    /// <summary>
+    /// The frame time a later frame has to beat to take over the incident this trigger opens.
+    /// </summary>
+    /// <remarks>
+    /// A hitch series has no frame time of its own. At zero, the first suppressed 101 ms frame would
+    /// rename "20 hitches på 7 s" to one frame; with escalation off, a 1 000 ms frame inside the window
+    /// would get neither the incident nor a capture, since the series has just armed the cooldown. The
+    /// frame size the capture budget traces on its own is the line between the two.
+    /// </remarks>
+    private double EscalationBar(AutoIncidentTrigger trigger)
+    {
+        return trigger.Kind == AutoIncidentKind.HitchSeries
+            ? _autoCaptureBudget?.EffectiveFrameTimeMs ?? _settings.DeepCapture.AutoCaptureFrameTimeMs
+            : trigger.FrameTimeMs;
     }
 
     /// <summary>
@@ -1867,7 +1883,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         // would open windows for frames the budget then refuses to trace.
         var captureThreshold = _autoCaptureBudget?.EffectiveFrameTimeMs ?? _settings.DeepCapture.AutoCaptureFrameTimeMs;
         var worthItsOwnIncident = trigger.Severity == IncidentSeverity.Severe
-            || trigger.Kind == AutoIncidentKind.DroppedFrameRun
+            || trigger.Kind is AutoIncidentKind.DroppedFrameRun or AutoIncidentKind.HitchSeries
             || trigger.FrameTimeMs >= captureThreshold;
 
         if (!worthItsOwnIncident)
@@ -1876,7 +1892,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         }
 
         var captureThis = TryReserveAutoCapture(timestamp, trigger);
-        CreateMarker(timestamp, trigger.Severity, trigger.Label, allowDeepCapture: captureThis, trigger.FrameTimeMs);
+        CreateMarker(timestamp, trigger.Severity, trigger.Label, allowDeepCapture: captureThis, EscalationBar(trigger));
     }
 
     /// <summary>
@@ -2037,9 +2053,9 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     }
 
     /// <summary>
-    /// Reserves according to what the detector observed. A dropped-frame run is a freeze made from
-    /// ordinary frame times, so it deliberately skips the millisecond gate while sharing the same
-    /// cooldown and session/window budgets as every other automatic capture.
+    /// Reserves according to what the detector observed. A dropped-frame run and a hitch series are made
+    /// from frames no millisecond gate would pass, so both skip it while sharing the same cooldown and
+    /// session/window budgets as every other automatic capture.
     /// </summary>
     private bool TryReserveAutoCapture(DateTimeOffset timestamp, AutoIncidentTrigger trigger)
     {
@@ -2049,9 +2065,12 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             return false;
         }
 
-        return trigger.Kind == AutoIncidentKind.DroppedFrameRun
-            ? ReportRefusal(budget.TryReserveForDroppedFrameRun(timestamp, out var refusal), refusal)
-            : TryReserveAutoCapture(timestamp, trigger.FrameTimeMs, inFocus: true);
+        return trigger.Kind switch
+        {
+            AutoIncidentKind.DroppedFrameRun => ReportRefusal(budget.TryReserveForDroppedFrameRun(timestamp, out var dropped), dropped),
+            AutoIncidentKind.HitchSeries => ReportRefusal(budget.TryReserveForHitchSeries(timestamp, out var series), series),
+            _ => TryReserveAutoCapture(timestamp, trigger.FrameTimeMs, inFocus: true),
+        };
     }
 
     /// <summary>As above, for a frame rate that has stopped recovering rather than one bad frame.</summary>
