@@ -195,6 +195,10 @@ worth a trace still takes the incident over. Like saturation and dropped-frame r
 frame time in `AutoDeepCaptureBudget`: an ordinary frame never displaces it, and an extreme frame only
 as a last resort.
 
+`VramPressureBandMonitor` uses the same number to name the clock minutes that held a series, and
+states the band comparison with them left out beside the full one; it withholds "the band cost
+nothing" unless both agree.
+
 ## Incident lifecycle
 
 The ring buffer stores at least 3 minutes of samples in v1. Marking an incident does not stop collection. Instead, the materializer:

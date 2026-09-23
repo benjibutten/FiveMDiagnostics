@@ -254,18 +254,19 @@ public sealed class VramPressureBandMonitor
             var inBand = _readings.Where(reading => reading.IsInBand).ToArray();
             var outside = _readings.Where(reading => !reading.IsInBand).ToArray();
 
-            // The denominator is the time the frames themselves cover, not a count of readings. A
-            // reading stands for the sampling cadence only while the collector is sampling: one taken
-            // either side of a gap absorbs every frame within the pairing window, five seconds of them
-            // against a cadence of half a second, and counting it as one reading would weight its
-            // hitches ten times. A frame's own interval is exactly the time it occupied, whatever
-            // reading it was counted against, and a reading that carried no frames contributes nothing
-            // to either side.
-            var inBandHours = inBand.Sum(reading => reading.FrameMs) / 3_600_000d;
-            var outsideHours = outside.Sum(reading => reading.FrameMs) / 3_600_000d;
+            var inBandRate = HitchesPerHour(inBand);
+            var outsideRate = HitchesPerHour(outside);
 
-            double? inBandRate = inBandHours > 0 ? inBand.Sum(reading => reading.Hitches) / inBandHours : null;
-            double? outsideRate = outsideHours > 0 ? outside.Sum(reading => reading.Hitches) / outsideHours : null;
+            // Clock minutes rather than the detector's rolling one, because readings are what is being
+            // divided. A series straddling a clock boundary can fall short of the bar on both sides and
+            // stay in the comparison, which only ever errs towards the full figure.
+            var seriesMinutes = _readings
+                .GroupBy(reading => MinuteOf(reading.At))
+                .Where(minute => minute.Sum(reading => reading.Hitches) >= AutoIncidentDetector.HitchSeriesPerMinute)
+                .Select(minute => minute.Key)
+                .ToHashSet();
+            bool OutsideSeries(Reading reading) => !seriesMinutes.Contains(MinuteOf(reading.At));
+
             var secondsPerReading = MedianReadingGapSeconds();
 
             // Decided here rather than when the reading arrived, because the caller can learn about a
@@ -288,9 +289,39 @@ public sealed class VramPressureBandMonitor
                 _gameStarts.Count,
                 loading.Length,
                 loading.Count(reading => reading.IsInBand),
-                loading.Where(reading => reading.IsInBand).Sum(reading => reading.Hitches));
+                loading.Where(reading => reading.IsInBand).Sum(reading => reading.Hitches),
+                seriesMinutes.Count,
+                HitchesPerHour(inBand.Where(OutsideSeries)),
+                HitchesPerHour(outside.Where(OutsideSeries)));
         }
     }
+
+    /// <summary>
+    /// Hitches per hour of the time the readings' frames cover, or null when they carried no frames.
+    /// </summary>
+    /// <remarks>
+    /// The denominator is the time the frames themselves cover, not a count of readings. A reading stands
+    /// for the sampling cadence only while the collector is sampling: one taken either side of a gap
+    /// absorbs every frame within the pairing window, five seconds of them against a cadence of half a
+    /// second, and counting it as one reading would weight its hitches ten times. A frame's own interval
+    /// is exactly the time it occupied, whatever reading it was counted against, and a reading that
+    /// carried no frames contributes nothing.
+    /// </remarks>
+    private static double? HitchesPerHour(IEnumerable<Reading> readings)
+    {
+        var hours = 0d;
+        var hitches = 0;
+        foreach (var reading in readings)
+        {
+            hours += reading.FrameMs / 3_600_000d;
+            hitches += reading.Hitches;
+        }
+
+        return hours > 0 ? hitches / hours : null;
+    }
+
+    private static DateTimeOffset MinuteOf(DateTimeOffset at) =>
+        new(at.UtcTicks - (at.UtcTicks % TimeSpan.TicksPerMinute), TimeSpan.Zero);
 
     /// <summary>
     /// Counts every frame that can no longer find a nearer reading than the ones already recorded.
@@ -489,6 +520,12 @@ public sealed class VramPressureBandMonitor
 /// <param name="LoadingReadings">Readings taken inside <see cref="VramPressureBandMonitor.LoadingWindow"/> of a start.</param>
 /// <param name="LoadingReadingsInBand">Of those, the ones inside the band.</param>
 /// <param name="LoadingInBandHitches">Hitches inside the band during loading, which the steady figure excludes.</param>
+/// <param name="SeriesMinutes">
+/// Clock minutes holding at least <see cref="AutoIncidentDetector.HitchSeriesPerMinute"/> hitches, on
+/// either side of the band.
+/// </param>
+/// <param name="InBandHitchesPerHourWithoutSeries">The band's rate with those minutes left out.</param>
+/// <param name="OutsideHitchesPerHourWithoutSeries">The rest's rate with those minutes left out.</param>
 public sealed record VramPressureBandReport(
     int AdapterReadings,
     int ReadingsInBand,
@@ -505,7 +542,10 @@ public sealed record VramPressureBandReport(
     int GameStarts = 0,
     int LoadingReadings = 0,
     int LoadingReadingsInBand = 0,
-    int LoadingInBandHitches = 0)
+    int LoadingInBandHitches = 0,
+    int SeriesMinutes = 0,
+    double? InBandHitchesPerHourWithoutSeries = null,
+    double? OutsideHitchesPerHourWithoutSeries = null)
 {
     /// <summary>Minutes above the band inside the loading window after a game start.</summary>
     public double MinutesInBandLoading => Minutes(LoadingReadingsInBand);
@@ -545,7 +585,8 @@ public sealed record VramPressureBandReport(
         : null;
 
     /// <summary>
-    /// True when a minute inside the band hitched less often than a minute outside it.
+    /// True when a minute inside the band hitched less often than a minute outside it, and still does
+    /// with the minutes that held a hitch series left out.
     /// </summary>
     /// <remarks>
     /// The strongest thing this measurement can say, and it says the opposite of a warning: the card was
@@ -553,8 +594,20 @@ public sealed record VramPressureBandReport(
     /// the evening with the highest VRAM pressure ever measured — half the session above the band — had
     /// its hitches concentrated <em>outside</em> it, 789 against 869 an hour, while the actual cause was
     /// a paging read. That line went out as a Warning and was read as a VRAM warning for a day.
+    /// <para>
+    /// A verdict that strong must not rest on one stretch of the evening. Minutes holding a hitch series
+    /// are a mechanism of their own, and sixteen of them below the band are enough to lift the rest past
+    /// a band that hitches three times as often.
+    /// </para>
     /// </remarks>
-    public bool BandCostNothing => HitchRatio is { } ratio && ratio < 1;
+    public bool BandCostNothing => HitchRatio is { } ratio && ratio < 1
+        && (SeriesMinutes == 0 || HitchRatioWithoutSeries is { } without && without < 1);
+
+    /// <summary><see cref="HitchRatio"/> with the minutes that held a hitch series left out.</summary>
+    public double? HitchRatioWithoutSeries =>
+        InBandHitchesPerHourWithoutSeries is { } inBand && OutsideHitchesPerHourWithoutSeries is > 0 and { } outside
+            ? inBand / outside
+            : null;
 
     /// <summary>True once the band was occupied enough to be worth acting on rather than noting.</summary>
     /// <remarks>
@@ -613,7 +666,7 @@ public sealed record VramPressureBandReport(
                 ? $" och över {VramPressureBandMonitor.DeepBandPercent:F0} % i {MinutesInDeepBand:F1} minuter"
                 : string.Empty;
 
-            var gradient = DescribeGradient();
+            var gradient = DescribeGradient() + DescribeSeries();
             var split = DescribeLoadingSplit();
 
             // The conclusion first when there is one, because the rest of the sentence is a large VRAM
@@ -638,6 +691,26 @@ public sealed record VramPressureBandReport(
                 + $"{AdapterReadings:N0} mätpunkter{DescribeUnpaired()}, ingen tidsbucket att hamna på fel "
                 + "sida om. Bandet är den här sessionens egen tid jämförd mot sig själv, inte en gissad gräns.";
         }
+    }
+
+    /// <summary>
+    /// The sentence giving the comparison without the minutes that held a hitch series, or nothing when
+    /// the session had none.
+    /// </summary>
+    private string DescribeSeries()
+    {
+        if (SeriesMinutes == 0)
+        {
+            return string.Empty;
+        }
+
+        var minutes = SeriesMinutes == 1 ? "1 klockminut" : $"{SeriesMinutes} klockminuter";
+        var lead = $" {minutes} hade minst {AutoIncidentDetector.HitchSeriesPerMinute} hitches — en hackserie";
+
+        return HitchRatioWithoutSeries is { } ratio
+            ? $"{lead}. Utan dem är kvoten {ratio:F1}× ({InBandHitchesPerHourWithoutSeries:F0} mot "
+                + $"{OutsideHitchesPerHourWithoutSeries:F0} per timme)."
+            : $"{lead}, och utan dem går kvoten inte att räkna.";
     }
 
     /// <summary>Minutes a number of readings stands for, at the session's own cadence.</summary>
@@ -712,11 +785,23 @@ public sealed record VramPressureBandReport(
 
             // The exoneration needs the same floor the accusation does. Read off a minute in the band it
             // is a coin toss with a sentence attached.
-            return HasEnoughForVerdict
-                ? $" I de minuterna var hitchfrekvensen lägre än i resten — {rates}. Det är ett motbevis mot "
-                    + "att bandet skulle vara orsaken, inte en varning om det."
-                : $" I de minuterna var hitchfrekvensen lägre än i resten — {rates} — men på "
+            if (!HasEnoughForVerdict)
+            {
+                return $" I de minuterna var hitchfrekvensen lägre än i resten — {rates} — men på "
                     + $"{MinutesInBand:F1} minuter i bandet är det ingen slutsats åt något håll.";
+            }
+
+            if (BandCostNothing)
+            {
+                return $" I de minuterna var hitchfrekvensen lägre än i resten — {rates}. Det är ett motbevis mot "
+                    + "att bandet skulle vara orsaken, inte en varning om det.";
+            }
+
+            return HitchRatioWithoutSeries is >= 1
+                ? $" I de minuterna var hitchfrekvensen lägre än i resten — {rates} — men bara för att "
+                    + "minuterna med hackserier drar upp resten."
+                : $" I de minuterna var hitchfrekvensen lägre än i resten — {rates} — men utan minuterna med "
+                    + "hackserier går jämförelsen inte att göra, så det är ingen slutsats åt något håll.";
         }
 
         return inBand > 0
