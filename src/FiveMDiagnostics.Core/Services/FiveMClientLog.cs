@@ -82,12 +82,38 @@ public sealed record FiveMClientLogEntry(
 /// from this machine for a month, and it was in the log all along.
 /// </para>
 /// </remarks>
+/// <param name="CacheEntriesSaved">
+/// <c>ResourceCache::AddEntry</c> lines: files the client wrote into its cache because they were not
+/// already there.
+/// </param>
 public sealed record FiveMClientLog(
     string Path,
     DateTimeOffset? StartedAtUtc,
     IReadOnlyList<string> Resources,
-    IReadOnlyList<FiveMClientLogEntry> Entries)
+    IReadOnlyList<FiveMClientLogEntry> Entries,
+    int CacheEntriesSaved = 0)
 {
+    /// <summary>
+    /// Cache entries a session writes when it starts from an empty cache.
+    /// </summary>
+    /// <remarks>
+    /// The three logs the investigation holds: 5 669 on 12 September and 6 500 on 22 September, both
+    /// evenings the cache had been emptied before the game started, against 327 on 21 September with the
+    /// cache left alone. A server update adds what changed, which is hundreds, not thousands.
+    /// </remarks>
+    public const int ColdCacheEntries = 2000;
+
+    /// <summary>Whether the client built its cache up from empty during this log.</summary>
+    public bool StartedWithColdCache => CacheEntriesSaved >= ColdCacheEntries;
+
+    /// <summary>The models the game asked for and gave up waiting for, each named once.</summary>
+    public IReadOnlyList<string> TimedOutModels =>
+        Entries.Where(entry => entry.Kind == FiveMClientLogKind.ModelTimeout)
+            .Select(entry => entry.Asset)
+            .OfType<string>()
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
     /// <summary><c>[      140] [         FiveM]             MainThrd/ text</c>.</summary>
     /// <remarks>
     /// The thread field is not one word — <c>UV loop: httpClient</c> is a thread name, and it is the one
@@ -217,7 +243,11 @@ public sealed record FiveMClientLog(
     /// is the slider's. Twelve evenings of advice about the slider rested on nobody being able to tell
     /// those apart.
     /// </remarks>
-    public string DescribeStreaming()
+    /// <param name="timedOutInAnEarlierRun">
+    /// The models that timed out in the previous session's client log, or null when there is none to
+    /// compare with. The caller passes null for a list read from this same log.
+    /// </param>
+    public string DescribeStreaming(IReadOnlySet<string>? timedOutInAnEarlierRun = null)
     {
         var failures = StreamingFailures;
         if (failures.Count == 0)
@@ -264,9 +294,16 @@ public sealed record FiveMClientLog(
         // the line asserted nine times that "klienten fick aldrig filerna", which was false about the
         // one question that decides where to look next. It also had no arm for mount failures at all, so
         // a log carrying only those got no mechanism sentence.
-        foreach (var sentence in Mechanisms(failures))
+        foreach (var sentence in Mechanisms(failures, StartedWithColdCache))
         {
             line += " " + sentence;
+        }
+
+        var again = TimedOutModels.Where(model => timedOutInAnEarlierRun?.Contains(model) == true).ToArray();
+        if (again.Length > 0)
+        {
+            line += $" {Name(again)} fastnade också i förra sessionens klientlogg. Ett slumpmässigt läsfel "
+                + "väljer inte ut samma modell två spelstarter i rad.";
         }
 
         return line;
@@ -287,8 +324,13 @@ public sealed record FiveMClientLog(
     /// to explain the timeout. Written without that guard it claimed "kvar står cachen eller disken" on
     /// the 2026-09-21 log, whose next sentence points at seven mount failures and the server.
     /// </para>
+    /// <para>
+    /// The elimination names the request itself beside the cache and the disk. A model asked for while
+    /// it is not registered — its definition not loaded at that moment — times out with every file
+    /// delivered and every pool empty, and an unchanged server repeats it evening after evening.
+    /// </para>
     /// </remarks>
-    private static IEnumerable<string> Mechanisms(IReadOnlyList<FiveMClientLogEntry> failures)
+    private static IEnumerable<string> Mechanisms(IReadOnlyList<FiveMClientLogEntry> failures, bool coldCache)
     {
         bool Any(FiveMClientLogKind kind) => failures.Any(entry => entry.Kind == kind);
 
@@ -322,11 +364,22 @@ public sealed record FiveMClientLog(
                 + "filerna kom fram och fick inte plats. Där är Extended Texture Budget rätt reglage.";
         }
 
+        if (timeouts && coldCache)
+        {
+            yield return "Klienten byggde upp sin cache från tomt den här sessionen och modellerna fastnade "
+                + "ändå, så cachen är inte orsaken.";
+        }
+
         if (timeouts && !downloads && !mounts && !pool)
         {
+            var remaining = coldCache
+                ? "Då står disken spelet läses från kvar"
+                : "Då står klientens egen strömningsväg kvar — cachen, eller disken spelet läses från —";
+
             yield return "Och eftersom loggen varken har nedladdningsfel, monteringsfel eller rader om "
-                + "mättat strömningsminne, kom filerna fram och fick plats. Då står klientens egen "
-                + "strömningsväg kvar: cachen, eller disken spelet läses från.";
+                + $"mättat strömningsminne, kom filerna fram och fick plats. {remaining} eller själva "
+                + "begäran: ett skript som ber om en modell som inte är registrerad just då, och det är "
+                + "serverns sak.";
         }
         else if (timeouts)
         {
@@ -378,6 +431,7 @@ public sealed record FiveMClientLog(
     {
         DateTimeOffset? startedAt = null;
         var resources = Array.Empty<string>();
+        var cacheEntries = 0;
         var entries = new List<FiveMClientLogEntry>();
 
         foreach (var raw in lines)
@@ -405,6 +459,12 @@ public sealed record FiveMClientLog(
                 continue;
             }
 
+            if (text.StartsWith("ResourceCache::AddEntry", StringComparison.Ordinal))
+            {
+                cacheEntries++;
+                continue;
+            }
+
             if (Classify(raw, text) is not { } classified)
             {
                 continue;
@@ -419,7 +479,7 @@ public sealed record FiveMClientLog(
                 classified.Asset));
         }
 
-        return new FiveMClientLog(path, startedAt, resources, entries);
+        return new FiveMClientLog(path, startedAt, resources, entries, cacheEntries);
     }
 
     /// <summary>

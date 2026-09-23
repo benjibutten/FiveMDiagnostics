@@ -428,6 +428,73 @@ public sealed class FiveMClientLogTests
         Assert.DoesNotContain("på 1 rader", once.DescribeStreaming(), StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// The evening of 22 September: the cache emptied before the game started, 6 500 entries written
+    /// back during play, and <c>v_9_kitchen_unit</c> timing out three times anyway.
+    /// </summary>
+    [Fact]
+    public void ATimeoutAfterAnEmptiedCacheRulesTheCacheOut()
+    {
+        var lines = new List<string>
+        {
+            Banner,
+            "[   2931015] [b3407_GTAProce]             MainThrd/ ^1Requesting of a model timed out \"2003410943:v_9_kitchen_unit\"",
+        };
+        lines.AddRange(Enumerable.Repeat(
+            "[   2923609] [b3407_GTAProce]                29184/ ResourceCache::AddEntry: Saved cache:v1:83aaf34b1fe17ebd7723923827501b7ec4eaaba0 to the index cache.",
+            FiveMClientLog.ColdCacheEntries));
+
+        var log = Parse([.. lines]);
+        var streaming = log.DescribeStreaming();
+
+        Assert.True(log.StartedWithColdCache);
+        Assert.Contains("cachen är inte orsaken", streaming, StringComparison.Ordinal);
+        Assert.Contains("Då står disken spelet läses från kvar", streaming, StringComparison.Ordinal);
+        Assert.DoesNotContain("cachen, eller disken", streaming, StringComparison.Ordinal);
+
+        // The cache lines are bookkeeping, not failures.
+        Assert.Single(log.StreamingFailures);
+        Assert.Empty(log.Errors);
+    }
+
+    /// <summary>
+    /// With the files delivered and every pool quiet, the request itself is still a candidate: a model
+    /// asked for while it is not registered times out with nothing wrong on this machine.
+    /// </summary>
+    [Fact]
+    public void TheEliminationKeepsTheRequestItselfAsACandidate()
+    {
+        var log = Parse(
+            Banner,
+            "[   2182734] [b3407_GTAProce]             MainThrd/ ^1Requesting of a model timed out \"2003410943:v_9_kitchen_unit\"");
+
+        var streaming = log.DescribeStreaming();
+
+        Assert.False(log.StartedWithColdCache);
+        Assert.Contains("cachen, eller disken spelet läses från", streaming, StringComparison.Ordinal);
+        Assert.Contains("själva begäran", streaming, StringComparison.Ordinal);
+    }
+
+    /// <summary>The same model two sessions running is not a random read error.</summary>
+    [Fact]
+    public void AModelThatTimedOutLastSessionTooIsNamedAsARepeat()
+    {
+        var log = Parse(
+            Banner,
+            "[   2182734] [b3407_GTAProce]             MainThrd/ ^1Requesting of a model timed out \"2003410943:v_9_kitchen_unit\"",
+            "[   8016016] [b3407_GTAProce]             MainThrd/ ^1Requesting of a model timed out \"1245315447:v_31_walltext016\"");
+
+        var lastSession = new HashSet<string>(["V_9_KITCHEN_UNIT", "v_31_walltext005"], StringComparer.OrdinalIgnoreCase);
+        var repeated = log.DescribeStreaming(lastSession);
+
+        Assert.Contains("v_9_kitchen_unit fastnade också i förra sessionens klientlogg", repeated, StringComparison.Ordinal);
+        Assert.DoesNotContain("v_31_walltext016 fastnade", repeated, StringComparison.Ordinal);
+
+        // No earlier list, or an earlier session with none, says nothing about repeats.
+        Assert.DoesNotContain("förra sessionens", log.DescribeStreaming(), StringComparison.Ordinal);
+        Assert.DoesNotContain("förra sessionens", log.DescribeStreaming(new HashSet<string>()), StringComparison.Ordinal);
+    }
+
     private static FiveMClientLog Parse(params string[] lines) =>
         FiveMClientLog.Parse("CitizenFX_log_2026-09-12T210103.log", lines);
 }

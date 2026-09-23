@@ -210,6 +210,9 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// <summary>The resource list this session has seen, kept for the next one.</summary>
     private IReadOnlyList<string> _resourcesThisSession = [];
 
+    /// <summary>The models that timed out last session, or null when no session has recorded any list.</summary>
+    private ModelTimeoutHistory? _previousSessionTimeouts;
+
     /// <summary>Client logs already copied into the session folder, by source path.</summary>
     /// <remarks>
     /// The copy runs both at the game's exit and at session end, and on an evening without a relaunch
@@ -475,6 +478,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _previousSessionProcessNames = PreviousSessionProcessLog.TryLoad(_settings.WorkingDirectory);
             _previousSessionResources = PreviousSessionResourceLog.TryLoad(_settings.WorkingDirectory);
             _resourcesThisSession = [];
+            _previousSessionTimeouts = PreviousSessionModelTimeoutLog.TryLoad(_settings.WorkingDirectory);
             _copiedClientLogs.Clear();
 
             _lastSummaryLine.Clear();
@@ -1587,10 +1591,22 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             return;
         }
 
+        var logFile = Path.GetFileName(log.Path);
         if (log.Resources.Count > 0)
         {
             _resourcesThisSession = log.Resources;
+
+            // On every read rather than at the end: the closing pass is skipped when the app is closed
+            // instead of stopped, and this session compares against the list it loaded at its start.
+            // Only a log that reached the server, so a start that never connected does not record "none".
+            PreviousSessionModelTimeoutLog.Save(_settings.WorkingDirectory, logFile, log.TimedOutModels);
         }
+
+        // A list from the same client log is this game run as an earlier app session saw it.
+        var timedOutInAnEarlierRun = _previousSessionTimeouts is { } previous
+            && !string.Equals(previous.LogFile, logFile, StringComparison.OrdinalIgnoreCase)
+                ? previous.Models
+                : null;
 
         var resources = log.DescribeResources(_previousSessionResources);
         if (ShouldWriteSummary("FiveM.Resources", resources))
@@ -1598,7 +1614,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             Report(StatusLevel.Info, "FiveM.Resources", resources);
         }
 
-        var streaming = log.DescribeStreaming();
+        var streaming = log.DescribeStreaming(timedOutInAnEarlierRun);
         if (ShouldWriteSummary("FiveM.Streaming", streaming))
         {
             Report(
