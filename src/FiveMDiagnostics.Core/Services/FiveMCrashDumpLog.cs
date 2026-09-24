@@ -19,6 +19,9 @@ public static class FiveMCrashDumpLog
     private const string FileName = "reported-crash-dumps.txt";
     private static readonly TimeSpan FirstCheckLookback = TimeSpan.FromDays(7);
 
+    /// <summary>How close together two dumps are written when FiveM writes both for the same crash.</summary>
+    private static readonly TimeSpan SameCrash = TimeSpan.FromSeconds(5);
+
     /// <summary>
     /// Serialises checks. The session start and the game-process watch can both ask within the same
     /// second, and two readers of the same record would report the same crash twice.
@@ -78,5 +81,34 @@ public static class FiveMCrashDumpLog
                 return [];
             }
         }
+    }
+
+    /// <summary>
+    /// One session-log line per crash. FiveM can write a second dump a second after the first for the same
+    /// crash, and it is named on the first one's line rather than read as a crash of its own.
+    /// </summary>
+    /// <param name="dumps">Dumps in any order; the lines come oldest crash first.</param>
+    /// <param name="frames">Frames the session saw presented; see <see cref="FiveMCrashDump.Describe"/>.</param>
+    public static IReadOnlyList<string> Describe(
+        IReadOnlyList<FiveMCrashDump> dumps,
+        DateTimeOffset now,
+        IReadOnlyList<FrameTelemetrySample> frames)
+    {
+        var lines = new List<string>();
+        FiveMCrashDump? first = null;
+        foreach (var dump in dumps.OrderBy(dump => dump.CrashedAt))
+        {
+            if (first is not null && dump.CrashedAt - first.CrashedAt <= SameCrash)
+            {
+                var after = (dump.CrashedAt - first.CrashedAt).TotalSeconds;
+                lines[^1] += $" En dump till från samma krasch, {after:F0} s senare: {dump.Location} ({dump.FileName}).";
+                continue;
+            }
+
+            first = dump;
+            lines.Add(dump.Describe(now, frames));
+        }
+
+        return lines;
     }
 }

@@ -46,6 +46,20 @@ public sealed class FiveMClientLogTests
         Assert.DoesNotContain("^7", streaming, StringComparison.Ordinal);
     }
 
+    /// <summary>The model hash is signed, and a negative one is still not part of the model's name.</summary>
+    [Fact]
+    public void ANegativeModelHashIsStrippedLikeAPositiveOne()
+    {
+        var log = Parse(
+            Banner,
+            "[  10907313] [b3407_GTAProce]             MainThrd/ ^1Requesting of a model timed out \"-941653984:v_31_walltext005\"");
+
+        var streaming = log.DescribeStreaming();
+
+        Assert.Contains("1 begärdes men kom aldrig (v_31_walltext005)", streaming, StringComparison.Ordinal);
+        Assert.DoesNotContain("-941653984", streaming, StringComparison.Ordinal);
+    }
+
     /// <summary>
     /// A pool running dry is the other mechanism, and it is the one the slider actually governs. The
     /// line has to say which of the two it saw.

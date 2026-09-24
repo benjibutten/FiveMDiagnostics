@@ -14,6 +14,9 @@ public sealed class FiveMCrashDumpTests : IDisposable
     private static readonly DateTimeOffset Crashed = new(2026, 9, 12, 20, 10, 31, TimeSpan.Zero);
     private const ulong DevtoolsBase = 0x7FF8_1000_0000;
 
+    /// <summary>Where the builder puts the game executable, the first module, below citizen-devtools.</summary>
+    private const ulong ExeBase = DevtoolsBase - 0x1000_0000;
+
     private readonly string _directory = Path.Combine(Path.GetTempPath(), "FiveMDiagnosticsTests", Guid.NewGuid().ToString("N"));
 
     public void Dispose()
@@ -48,6 +51,135 @@ public sealed class FiveMCrashDumpTests : IDisposable
 
         Assert.Contains("Steam-förklaringen gäller inte", dump!.Describe(Crashed), StringComparison.Ordinal);
     }
+
+    /// <summary>
+    /// The game's own exit path running into FiveM's trap, out of normal play: the line names the trap
+    /// and says the game did not hang first, so a Windows hang report written afterwards is not read as
+    /// the cause.
+    /// </summary>
+    [Fact]
+    public void AnEarlyExitTrapOutOfNormalPlaySaysTheGameDidNotHangFirst()
+    {
+        var crashed = new DateTimeOffset(2026, 9, 23, 20, 19, 21, TimeSpan.Zero);
+        var dump = MinidumpReader.Read(new MemoryStream(EarlyExitDump(crashed)), "520a42ae.dmp");
+
+        Assert.True(dump!.IsEarlyExitTrap);
+        Assert.False(dump.IsWatchdog);
+
+        var line = dump.Describe(crashed, FramesUntil(crashed.AddMilliseconds(40)));
+        Assert.Contains("FiveM_b3407_GTAProcess.exe+0x101C", line, StringComparison.Ordinal);
+        Assert.Contains("\"MainThrd\"", line, StringComparison.Ordinal);
+        Assert.Contains("early-exit trap", line, StringComparison.Ordinal);
+        Assert.Contains("frös alltså inte före kraschen", line, StringComparison.Ordinal);
+        Assert.Contains("AppHang", line, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TheWatchdogCrashIsNotAnEarlyExitTrap()
+    {
+        Assert.False(MinidumpReader.Read(new MemoryStream(Dump(steamLoaded: false)), "w.dmp")!.IsEarlyExitTrap);
+    }
+
+    /// <summary>A game that stopped presenting well before it died hung first, whatever the dump says.</summary>
+    [Fact]
+    public void FramesThatStoppedBeforeTheCrashSayTheGameHung()
+    {
+        var dump = MinidumpReader.Read(new MemoryStream(Dump(steamLoaded: false)), "w.dmp")!;
+
+        var line = dump.Describe(Crashed, FramesUntil(Crashed.AddSeconds(-20)));
+
+        Assert.Contains("Bilden stod still före kraschen", line, StringComparison.Ordinal);
+        Assert.DoesNotContain("frös alltså inte", line, StringComparison.Ordinal);
+    }
+
+    /// <summary>A two-second frame just before the crash is a hang even when frames came right up to it.</summary>
+    [Fact]
+    public void ALongFrameJustBeforeTheCrashSaysTheGameHung()
+    {
+        var dump = MinidumpReader.Read(new MemoryStream(EarlyExitDump(Crashed)), "e.dmp")!;
+        var frames = FramesUntil(Crashed.AddMilliseconds(-2400))
+            .Append(new FrameTelemetrySample(Crashed, 2400, 5, null, 2400, false, "FiveM_b3407_GTAProcess.exe"));
+
+        var line = dump.Describe(Crashed, frames);
+
+        Assert.Contains("en frame på 2400 ms", line, StringComparison.Ordinal);
+        Assert.DoesNotContain("frös alltså inte", line, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The dump is written a moment after the fault and the last frames reach the session late, so a few
+    /// seconds' silence before a dump is still a crash out of normal play.
+    /// </summary>
+    [Fact]
+    public void AFewSecondsOfSilenceBeforeTheDumpIsNotAHang()
+    {
+        var dump = MinidumpReader.Read(new MemoryStream(EarlyExitDump(Crashed)), "e.dmp")!;
+
+        var line = dump.Describe(Crashed, FramesUntil(Crashed.AddSeconds(-4)));
+
+        Assert.Contains("frös alltså inte", line, StringComparison.Ordinal);
+    }
+
+    /// <summary>Frames from long before the crash say nothing about whether it hung.</summary>
+    [Fact]
+    public void FramesFromLongBeforeTheCrashLeaveTheFrameSentenceOut()
+    {
+        var dump = MinidumpReader.Read(new MemoryStream(EarlyExitDump(Crashed)), "e.dmp")!;
+
+        var line = dump.Describe(Crashed, FramesUntil(Crashed.AddMinutes(-2)));
+
+        Assert.DoesNotContain("Bilden", line, StringComparison.Ordinal);
+    }
+
+    /// <summary>The watchdog fires on a game it judged hung, so the line does not say it did not freeze.</summary>
+    [Fact]
+    public void AWatchdogCrashDoesNotClaimTheGameDidNotFreeze()
+    {
+        var dump = MinidumpReader.Read(new MemoryStream(Dump(steamLoaded: false)), "w.dmp")!;
+
+        var line = dump.Describe(Crashed, FramesUntil(Crashed));
+
+        Assert.Contains("Bilden rullade normalt", line, StringComparison.Ordinal);
+        Assert.DoesNotContain("frös alltså inte", line, StringComparison.Ordinal);
+    }
+
+    /// <summary>With no frames from the crashed game, the line says nothing about them.</summary>
+    [Fact]
+    public void NoFramesBeforeTheCrashLeaveTheFrameSentenceOut()
+    {
+        var dump = MinidumpReader.Read(new MemoryStream(Dump(steamLoaded: false)), "w.dmp")!;
+
+        var line = dump.Describe(Crashed, FramesUntil(Crashed.AddMinutes(5))
+            .Where(frame => frame.Timestamp > Crashed.AddMinutes(1)).ToArray());
+
+        Assert.DoesNotContain("Bilden", line, StringComparison.Ordinal);
+    }
+
+    /// <summary>FiveM wrote two dumps a second apart for the crash of 2026-09-23; that is one crash.</summary>
+    [Fact]
+    public void TwoDumpsASecondApartAreOneCrash()
+    {
+        var crashed = new DateTimeOffset(2026, 9, 23, 20, 19, 21, TimeSpan.Zero);
+        var first = MinidumpReader.Read(new MemoryStream(EarlyExitDump(crashed)), "520a42ae.dmp")!;
+        var second = MinidumpReader.Read(new MemoryStream(EarlyExitDump(crashed.AddSeconds(1))), "383f5b6b.dmp")!;
+        var later = MinidumpReader.Read(new MemoryStream(EarlyExitDump(crashed.AddHours(2))), "later.dmp")!;
+
+        // Out of order: file write times, which the dumps are listed by, need not agree with their clocks.
+        var lines = FiveMCrashDumpLog.Describe([later, second, first], crashed, []);
+
+        Assert.Equal(2, lines.Count);
+        Assert.Contains("Dump: 520a42ae.dmp", lines[0], StringComparison.Ordinal);
+        Assert.Contains("En dump till från samma krasch, 1 s senare", lines[0], StringComparison.Ordinal);
+        Assert.Contains("383f5b6b.dmp", lines[0], StringComparison.Ordinal);
+        Assert.Contains("Dump: later.dmp", lines[1], StringComparison.Ordinal);
+    }
+
+    /// <summary>A minute of steady 60 FPS frames ending at <paramref name="last"/>.</summary>
+    private static FrameTelemetrySample[] FramesUntil(DateTimeOffset last) =>
+        Enumerable.Range(0, 3600)
+            .Select(index => new FrameTelemetrySample(
+                last.AddMilliseconds(-16.667 * index), 16.667, 5, null, 16.667, false, "FiveM_b3407_GTAProcess.exe"))
+            .ToArray();
 
     /// <summary>A dump FiveM is still writing is shorter than its own directory says.</summary>
     [Fact]
@@ -106,7 +238,17 @@ public sealed class FiveMCrashDumpTests : IDisposable
     /// The four streams the reader uses, laid out as <c>minidumpapiset.h</c> does: exception, module list,
     /// misc info and thread names, with the strings after them.
     /// </summary>
-    private static byte[] Dump(bool steamLoaded)
+    private static byte[] Dump(bool steamLoaded) =>
+        Dump(steamLoaded, Crashed, DevtoolsBase + 0x2CCD6, accessKind: 1, accessAddress: 0xDEED, "Window Watchdog");
+
+    /// <summary>
+    /// The crash of 2026-09-23 22:19:21: an execution fault at <c>FiveM_b3407_GTAProcess.exe+0x101C</c>
+    /// on the main thread, the address and the faulting instruction the same.
+    /// </summary>
+    private static byte[] EarlyExitDump(DateTimeOffset crashedAt) =>
+        Dump(steamLoaded: false, crashedAt, ExeBase + 0x101C, accessKind: 8, accessAddress: ExeBase + 0x101C, "MainThrd");
+
+    private static byte[] Dump(bool steamLoaded, DateTimeOffset crashedAt, ulong address, ulong accessKind, ulong accessAddress, string threadName)
     {
         const uint ThreadId = 4184;
         string[] modules = steamLoaded
@@ -134,7 +276,7 @@ public sealed class FiveMCrashDumpTests : IDisposable
         writer.Write(4u);
         writer.Write((uint)Header);
         writer.Write(0u);
-        writer.Write((uint)Crashed.ToUnixTimeSeconds());
+        writer.Write((uint)crashedAt.ToUnixTimeSeconds());
         writer.Write(0UL);
 
         foreach (var (type, size, rva) in new[] { (6u, Exception, exceptionRva), (4u, moduleList, moduleRva), (15u, Misc, miscRva), (24u, Names, namesRva) })
@@ -149,18 +291,18 @@ public sealed class FiveMCrashDumpTests : IDisposable
         writer.Write(0xC0000005u);
         writer.Write(0u);
         writer.Write(0UL);
-        writer.Write(DevtoolsBase + 0x2CCD6);
+        writer.Write(address);
         writer.Write(2u);
         writer.Write(0u);
-        writer.Write(1UL);
-        writer.Write(0xDEEDUL);
+        writer.Write(accessKind);
+        writer.Write(accessAddress);
         writer.Write(new byte[(15 - 2) * 8]);
         writer.Write(0u);
         writer.Write(0u);
 
         var strings = new MemoryStream();
         var nameRvas = new List<uint>();
-        foreach (var text in modules.Append("Window Watchdog"))
+        foreach (var text in modules.Append(threadName))
         {
             nameRvas.Add((uint)(stringsRva + strings.Length));
             var bytes = Encoding.Unicode.GetBytes(text);

@@ -28,6 +28,19 @@ public sealed record FiveMCrashDump(
     bool SteamClientLoaded)
 {
     private const uint AccessViolation = 0xC0000005;
+    private const double StalledFrameMs = 2000;
+
+    /// <summary>
+    /// Silence before the dump that reads as a hang. Wider than it looks: the dump header carries the
+    /// second the dump was written, not the fault, and the last frames reach the session through
+    /// PresentMon's own flush — together a few seconds on a crash out of normal play.
+    /// </summary>
+    private static readonly TimeSpan StalledGap = TimeSpan.FromSeconds(5);
+
+    /// <summary>Silence beyond which the frames say nothing about the crash, hung or not.</summary>
+    private static readonly TimeSpan NoFramesGap = TimeSpan.FromSeconds(30);
+
+    private static readonly TimeSpan LastFramesWindow = TimeSpan.FromSeconds(10);
 
     /// <summary>
     /// FiveM's deliberate crash of a game that stopped responding: a write to an address nothing owns,
@@ -40,8 +53,21 @@ public sealed record FiveMCrashDump(
         && AccessAddress == 0xDEED
         && string.Equals(FaultingModule, "citizen-devtools.dll", StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// An execution fault inside the game executable itself: the form a crash FiveM's dialog called an
+    /// early-exit trap took in its dump, the game's main thread running into a page it may not execute.
+    /// </summary>
+    public bool IsEarlyExitTrap =>
+        ExceptionCode == AccessViolation
+        && AccessKind == 8
+        && FaultingModule?.EndsWith("GTAProcess.exe", StringComparison.OrdinalIgnoreCase) == true;
+
     /// <param name="now">Local now, so a crash from an earlier day carries its date.</param>
-    public string Describe(DateTimeOffset now)
+    /// <param name="frames">
+    /// Frames the session saw presented, in any order. When they reach up to the crash, the line says
+    /// whether the game was still presenting or had already stopped.
+    /// </param>
+    public string Describe(DateTimeOffset now, IEnumerable<FrameTelemetrySample>? frames = null)
     {
         var crashed = CrashedAt.ToLocalTime();
         var when = crashed.Date == now.ToLocalTime().Date ? $"{crashed:HH:mm:ss}" : $"{crashed:yyyy-MM-dd HH:mm:ss}";
@@ -49,7 +75,6 @@ public sealed record FiveMCrashDump(
             ? $", {SessionStartAge.Humanise(CrashedAt - started)} efter start"
             : string.Empty;
 
-        var where = FaultingModule is null ? $"0x{FaultOffset:X}" : $"{FaultingModule}+0x{FaultOffset:X}";
         var thread = ThreadName is null ? string.Empty : $" (tråden \"{ThreadName}\")";
 
         var verdict = (IsWatchdog, SteamClientLoaded) switch
@@ -63,7 +88,62 @@ public sealed record FiveMCrashDump(
             (false, false) => " Steam var inte inladdat.",
         };
 
-        return $"Spelet kraschade {when}{age}: {where}{thread}, {DescribeException()}.{verdict} Dump: {FileName}.";
+        var trap = IsEarlyExitTrap
+            ? " Det är formen av FiveM:s early-exit trap: spelkoden gick själv in i sin avslutningsväg och "
+              + "stoppades där. Dumpen säger inte varför, men vad som hände i spelet just då brukar göra det."
+            : string.Empty;
+
+        return $"Spelet kraschade {when}{age}: {Location}{thread}, {DescribeException()}.{trap}{verdict}"
+            + $"{DescribeLastFrames(frames ?? [])} Dump: {FileName}.";
+    }
+
+    /// <summary>Where the fault was: <c>module+0xoffset</c>, or the raw address when no module holds it.</summary>
+    public string Location => FaultingModule is null ? $"0x{FaultOffset:X}" : $"{FaultingModule}+0x{FaultOffset:X}";
+
+    /// <summary>
+    /// Whether the game was still presenting when it crashed, which tells a crash out of normal play from
+    /// a game that hung first. Empty when no frame came in the half minute before the crash.
+    /// </summary>
+    private string DescribeLastFrames(IEnumerable<FrameTelemetrySample> frames)
+    {
+        // The dump's clock has whole seconds, so the crash itself can be up to a second after CrashedAt.
+        var end = CrashedAt.AddSeconds(1);
+        var before = frames.Where(frame => frame.Timestamp <= end).ToArray();
+        if (before.Length == 0)
+        {
+            return string.Empty;
+        }
+
+        var last = before.MaxBy(frame => frame.Timestamp)!;
+        var lastAt = last.Timestamp.ToLocalTime();
+        var silence = CrashedAt - last.Timestamp;
+        if (silence > NoFramesGap)
+        {
+            return string.Empty;
+        }
+
+        if (silence > StalledGap)
+        {
+            return $" Bilden stod still före kraschen: sista frame {lastAt:HH:mm:ss}, {silence.TotalSeconds:F0} s före. "
+                + "Spelet hängde innan det dog.";
+        }
+
+        var longest = before.Where(frame => frame.Timestamp > CrashedAt - LastFramesWindow).Max(frame => frame.FrameTimeMs);
+        if (longest >= StalledFrameMs)
+        {
+            return $" Bilden stod still före kraschen: en frame på {longest:F0} ms de sista "
+                + $"{LastFramesWindow.TotalSeconds:F0} sekunderna. Spelet hängde innan det dog.";
+        }
+
+        var rolled = $" Bilden rullade normalt ända till {lastAt:HH:mm:ss,f} (längsta frame de sista "
+            + $"{LastFramesWindow.TotalSeconds:F0} s: {longest:F0} ms).";
+
+        // The watchdog only fires on a game it judged hung, so "did not freeze" would contradict the dump;
+        // the frames are stated and the reader weighs them against it.
+        return IsWatchdog
+            ? rolled
+            : rolled + " Spelet frös alltså inte före kraschen, och en AppHang i händelseloggen efteråt är "
+                + "kraschdialogen, inte orsaken.";
     }
 
     private string DescribeException()
