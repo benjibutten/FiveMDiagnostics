@@ -3048,9 +3048,16 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             return;
         }
 
-        foreach (var dump in FiveMCrashDumpLog.TakeNew(directory, _settings.WorkingDirectory, DateTimeOffset.UtcNow))
+        var dumps = FiveMCrashDumpLog.TakeNew(directory, _settings.WorkingDirectory, DateTimeOffset.UtcNow);
+        if (dumps.Count == 0)
         {
-            Report(StatusLevel.Warning, "FiveM.Crash", dump.Describe(DateTimeOffset.Now));
+            return;
+        }
+
+        var frames = _ringBuffer?.SnapshotAll().OfType<FrameTelemetrySample>().ToArray() ?? [];
+        foreach (var line in FiveMCrashDumpLog.Describe(dumps, DateTimeOffset.Now, frames))
+        {
+            Report(StatusLevel.Warning, "FiveM.Crash", line);
         }
     }
 
