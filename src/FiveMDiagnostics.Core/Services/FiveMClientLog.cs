@@ -137,9 +137,12 @@ public sealed record FiveMClientLog(
         @"ResourceCacheDevice reporting failure downloading (?<asset>\S+?):",
         RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
 
-    /// <summary><c>Requesting of a model timed out "2003410943:v_9_kitchen_unit"</c>.</summary>
+    /// <summary>
+    /// <c>Requesting of a model timed out "2003410943:v_9_kitchen_unit"</c>. The hash is signed, so it
+    /// can also read <c>"-941653984:v_31_walltext005"</c>.
+    /// </summary>
     private static readonly Regex ModelTimeoutPattern = new(
-        """Requesting of a model timed out "(?:\d+:)?(?<asset>[^"]+)""",
+        """Requesting of a model timed out "(?:-?\d+:)?(?<asset>[^"]+)""",
         RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
 
     /// <summary><c>failed loading resources:/ultra-voltlab/audiodata/dlchei4_sounds.dat in data file mounter …</c>.</summary>
