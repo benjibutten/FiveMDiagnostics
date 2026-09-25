@@ -991,6 +991,61 @@ public sealed class AutoDeepCaptureBudgetTests
     }
 
     /// <summary>
+    /// 2026-09-24 22:20: a capture reserved for a 122 ms frame also held the 1 307 ms frame three seconds
+    /// later, and at 22:54 a 430 ms frame took its slot from the reserve as the weakest of the evening.
+    /// </summary>
+    [Fact]
+    public void ACaptureIsRankedByTheWorstFrameItsTraceCovers()
+    {
+        // The evening's own frames had lifted the extreme threshold past 430 ms, so that frame had to
+        // take a slot from the reserve rather than spend it.
+        var budget = new AutoDeepCaptureBudget(Options(item =>
+        {
+            item.MaxAutoCapturesPerWindow = 100;
+            item.AutoCaptureOverrideFrameTimeMs = 1000;
+        }));
+        var frameTimes = new[] { 847d, 1425, 122, 489 };
+
+        for (var index = 0; index < frameTimes.Length; index++)
+        {
+            var at = Start.AddHours(index);
+            Assert.True(budget.TryReserve(at, frameTimes[index], out _));
+            budget.NoteCaptureWritten(at.AddSeconds(30), $"deep_{index}.etl");
+        }
+
+        budget.NoteCaptureCovers("deep_2.etl", 1307);
+
+        Assert.False(budget.TryReserve(Start.AddHours(5), frameTimeMs: 430, out _, out var replaced));
+        Assert.Null(replaced);
+        Assert.Equal(4, budget.Spent);
+    }
+
+    /// <summary>
+    /// A capture spent on a hitch series ranks at zero so that no ordinary frame displaces it, and a
+    /// frame its trace happens to cover must not turn it into one that can be.
+    /// </summary>
+    [Fact]
+    public void ACoveredFrameDoesNotRankACaptureWithNoFrameTime()
+    {
+        var budget = new AutoDeepCaptureBudget(Options(item => item.MaxAutoCapturesPerWindow = 100));
+        var frameTimes = new[] { 300d, 290, 280, 270, 260 };
+
+        for (var index = 0; index < frameTimes.Length; index++)
+        {
+            var at = Start.AddHours(index);
+            Assert.True(budget.TryReserve(at, frameTimes[index], out _));
+            budget.NoteCaptureWritten(at.AddSeconds(30), $"deep_{index}.etl");
+        }
+
+        Assert.True(budget.TryReserveForHitchSeries(Start.AddHours(6), out _));
+        budget.NoteCaptureWritten(Start.AddHours(6).AddSeconds(30), "deep_series.etl");
+        budget.NoteCaptureCovers("deep_series.etl", 110);
+
+        Assert.True(budget.TryReserve(Start.AddHours(7), frameTimeMs: 400, out _, out var replaced));
+        Assert.Equal(260, replaced!.FrameTimeMs);
+    }
+
+    /// <summary>
     /// 2026-09-14 02:17: a 6 167 ms frame with OBS in front took the slot of the 214 ms trace from 01:23,
     /// the evening's only VRAM trace, for a frame the evening's figures exclude.
     /// </summary>

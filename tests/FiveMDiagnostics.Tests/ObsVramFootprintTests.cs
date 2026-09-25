@@ -77,6 +77,29 @@ public sealed class ObsVramFootprintTests
     }
 
     /// <summary>
+    /// 2026-09-24: OBS quit at 01:35:49, the game presented its last frame at 01:35:54 and the card fell
+    /// 6.8 GB from 01:35:56. The step read across the game's release and came out at 7 GB.
+    /// </summary>
+    [Fact]
+    public void TheGamesOwnReleaseIsNotCountedAsTheStacks()
+    {
+        var monitor = new ObsVramFootprintMonitor();
+
+        Play(monitor, from: 0, seconds: 20, vramPercent: 83.9, streaming: true, running: true, gamePresenting: true);
+        Play(monitor, from: 20, seconds: 30, vramPercent: 80.9, streaming: false, running: true, gamePresenting: true);
+        Play(monitor, from: 50, seconds: 5, vramPercent: 75.9, streaming: false, running: false, gamePresenting: true);
+
+        // The game's last frame, and its memory going two seconds later.
+        Play(monitor, from: 55, seconds: 2, vramPercent: 75.9, streaming: false, running: false);
+        Play(monitor, from: 57, seconds: 30, vramPercent: 12.8, streaming: false, running: false);
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report?.RestOfStack);
+        Assert.Equal(5.0, report.RestOfStack.PercentagePoints, 1);
+    }
+
+    /// <summary>
     /// The tail after the stack came off was eleven minutes of nobody really playing, and the line has to
     /// say that before somebody reads a hitch rate off it.
     /// </summary>
@@ -140,12 +163,18 @@ public sealed class ObsVramFootprintTests
         int seconds,
         double vramPercent,
         bool streaming,
-        bool running)
+        bool running,
+        bool gamePresenting = false)
     {
         for (var second = 0; second < seconds; second++)
         {
             var at = Start.AddSeconds(from + second);
             monitor.Observe(Obs(at, streaming, running));
+
+            if (gamePresenting)
+            {
+                monitor.ObserveGameFrame(at);
+            }
 
             // Twice a second, the cadence the GPU log is written at.
             monitor.Observe(Adapter(at, vramPercent));

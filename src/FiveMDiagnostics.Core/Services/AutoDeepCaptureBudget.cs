@@ -274,6 +274,30 @@ public sealed class AutoDeepCaptureBudget
         }
     }
 
+    /// <summary>
+    /// Ranks a written capture by the worst frame its trace turned out to cover, when that is worse than
+    /// the frame it was reserved for.
+    /// </summary>
+    /// <remarks>
+    /// A later frame then has to beat that frame to take the slot. A slot spent on something with no
+    /// frame time keeps its rank.
+    /// </remarks>
+    /// <param name="capturePath">The file <see cref="NoteCaptureWritten"/> filed against the slot.</param>
+    /// <param name="frameTimeMs">The worst in-game frame inside the window the trace covers.</param>
+    public void NoteCaptureCovers(string capturePath, double frameTimeMs)
+    {
+        lock (_sync)
+        {
+            var slot = _captures.FirstOrDefault(capture =>
+                string.Equals(capture.Path, capturePath, StringComparison.OrdinalIgnoreCase));
+
+            if (slot is { FrameTimeMs: > 0 } && frameTimeMs > slot.FrameTimeMs)
+            {
+                slot.FrameTimeMs = frameTimeMs;
+            }
+        }
+    }
+
     /// <summary>How many times a worse frame has taken an already-spent capture's slot this session.</summary>
     public int Replacements
     {
@@ -726,7 +750,8 @@ public sealed class AutoDeepCaptureBudget
         // worse than the least severe capture already taken takes that capture's slot instead, so the
         // ceiling still holds at six and the six it holds are the six worst.
         var atCeiling = Spent >= _options.MaxAutoCapturesPerSession;
-        var displaced = atCeiling ? WeakestCaptureBelow(frameTimeMs, inFocus) : null;
+        var displacedBelow = frameTimeMs;
+        var displaced = atCeiling ? WeakestCaptureBelow(displacedBelow, inFocus) : null;
         if (atCeiling && displaced is null)
         {
             _lastRefusalReason = CaptureRefusalReason.SessionBudgetSpent;
@@ -776,7 +801,8 @@ public sealed class AutoDeepCaptureBudget
         if (displaced is null && !maySpendReserve && reservedNow > 0
             && Spent >= _options.MaxAutoCapturesPerSession - reservedNow)
         {
-            displaced = WeakestCaptureBelow(frameTimeMs / ReserveReplacementRatio, inFocus);
+            displacedBelow = frameTimeMs / ReserveReplacementRatio;
+            displaced = WeakestCaptureBelow(displacedBelow, inFocus);
             fromReserve = true;
             if (displaced is null)
             {
@@ -822,6 +848,17 @@ public sealed class AutoDeepCaptureBudget
 
         lock (_sync)
         {
+            // The analysis of a finished trace can raise a slot's rank between the choice above and
+            // here, and a slot that now holds a worse frame than this one must not lose its file.
+            if (displaced is not null && (!_captures.Contains(displaced) || displacedBelow <= displaced.FrameTimeMs))
+            {
+                _lastRefusalReason = CaptureRefusalReason.SessionBudgetSpent;
+                refusal = $"Deep capture hoppades över för {description}: spåret den skulle ha ersatt visade "
+                    + "sig hålla en värre frame än den det togs för.";
+                replaced = null;
+                return false;
+            }
+
             if (displaced is not null)
             {
                 _captures.Remove(displaced);
@@ -1008,9 +1045,10 @@ public sealed class AutoDeepCaptureBudget
 
         /// <summary>
         /// Zero for a capture taken for something with no frame time, which only an extreme frame may
-        /// displace, and only when no capture with a frame time is weaker.
+        /// displace, and only when no capture with a frame time is weaker. Raised by
+        /// <see cref="NoteCaptureCovers"/> once the trace is known to hold a worse frame.
         /// </summary>
-        public double FrameTimeMs { get; }
+        public double FrameTimeMs { get; set; }
 
         /// <summary>Filled in by <see cref="NoteCaptureWritten"/> once the trace is on disk.</summary>
         public string? Path { get; set; }

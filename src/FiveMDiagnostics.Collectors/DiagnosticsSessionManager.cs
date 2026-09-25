@@ -2720,6 +2720,10 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 }
                 else if (telemetryEvent is FrameTelemetrySample frameSample)
                 {
+                    // Every frame, in focus or not: these two only need to know when the game stopped
+                    // presenting, which is when it starts giving its memory back.
+                    _obsVram?.ObserveGameFrame(frameSample.Timestamp);
+                    _postGameVram?.ObserveGameFrame(frameSample.Timestamp);
                     ObserveFrame(frameSample);
                 }
                 else if (telemetryEvent is ObsTelemetrySample obsSample)
@@ -3574,6 +3578,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                 evidence.Metrics,
                 evidence.SourceFile);
             TryAttachEvidenceToIncident(marker.Id, stamped, result.Attachment);
+            RankCaptureByWhatItCovers(capturePath, evidence.Metrics);
         }
 
         // Named, so this line and the one that says the file was deleted for a worse hitch can be
@@ -3582,6 +3587,37 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             StatusLevel.Info,
             nameof(DiagnosticsSessionManager),
             $"Deep capture analyserad ({Path.GetFileName(capturePath)}): {result.Evidence[0].Summary}");
+    }
+
+    /// <summary>
+    /// Tells the capture budget the worst in-game frame inside the window the trace covers, so the slot
+    /// is ranked by what the file holds rather than by the frame that reserved it.
+    /// </summary>
+    private void RankCaptureByWhatItCovers(string capturePath, IReadOnlyDictionary<string, double> metrics)
+    {
+        if (_autoCaptureBudget is not { } budget
+            || _ringBuffer is not { } ringBuffer
+            || !metrics.TryGetValue("traceCoveredStartUnixMs", out var startMs)
+            || !metrics.TryGetValue("traceCoveredEndUnixMs", out var endMs))
+        {
+            return;
+        }
+
+        var start = DateTimeOffset.FromUnixTimeMilliseconds((long)startMs);
+        var end = DateTimeOffset.FromUnixTimeMilliseconds((long)endMs);
+
+        // In-game frames only: a frame out of focus may not displace a capture, so it may not protect
+        // one either. And only frames whose whole stall is inside the window, since a frame presented
+        // just after the trace began is mostly seconds the trace does not hold.
+        var worst = ringBuffer.Snapshot(start, end)
+            .OfType<FrameTelemetrySample>()
+            .Where(frame => frame.Timestamp - TimeSpan.FromMilliseconds(frame.FrameTimeMs) >= start)
+            .Where(frame => _gameFocus?.StateAt(frame.Timestamp) is not (GameFocusState.NotInFocus or GameFocusState.Settling))
+            .Select(frame => frame.FrameTimeMs)
+            .DefaultIfEmpty(0)
+            .Max();
+
+        budget.NoteCaptureCovers(capturePath, worst);
     }
 
     /// <summary>

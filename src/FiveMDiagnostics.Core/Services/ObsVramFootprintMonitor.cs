@@ -93,6 +93,15 @@ public sealed class ObsVramFootprintMonitor
     /// </remarks>
     private static readonly TimeSpan History = ReleaseLead + Before + Settle + After + TimeSpan.FromSeconds(10);
 
+    /// <summary>
+    /// How long the game may go without presenting a frame before the monitor takes it as closing.
+    /// </summary>
+    /// <remarks>
+    /// Frames reach the session a second or so behind the adapter readings, so a shorter silence would cut
+    /// windows short on an ordinary delivery delay.
+    /// </remarks>
+    private static readonly TimeSpan GameSilence = TimeSpan.FromSeconds(3);
+
     private readonly object _sync = new();
     private readonly List<(DateTimeOffset At, double Percent)> _readings = [];
 
@@ -102,6 +111,7 @@ public sealed class ObsVramFootprintMonitor
     private DateTimeOffset? _streamStoppedAt;
     private DateTimeOffset? _processStoppedAt;
     private DateTimeOffset? _lastReadingAt;
+    private DateTimeOffset? _lastGameFrameAt;
     private ObsVramStep? _encoderStep;
     private ObsVramStep? _restOfStackStep;
 
@@ -176,6 +186,18 @@ public sealed class ObsVramFootprintMonitor
         }
     }
 
+    /// <summary>Notes that the game presented a frame, in focus or not.</summary>
+    public void ObserveGameFrame(DateTimeOffset at)
+    {
+        lock (_sync)
+        {
+            if (_lastGameFrameAt is not { } last || at > last)
+            {
+                _lastGameFrameAt = at;
+            }
+        }
+    }
+
     /// <summary>The steps, or null when the stack never came off during the session.</summary>
     public ObsVramFootprintReport? Summary()
     {
@@ -211,9 +233,26 @@ public sealed class ObsVramFootprintMonitor
         }
 
         var before = Median(Window(moment - ReleaseLead - Before, moment - ReleaseLead));
-        var after = Window(moment - ReleaseLead, moment + Settle + After);
+        var after = Window(moment - ReleaseLead, AfterWindowEnd(moment));
 
         return before is { } from && after.Length > 0 ? new ObsVramStep(moment, from, after.Min()) : null;
+    }
+
+    /// <summary>
+    /// Where a step's "after" reading ends: at the game's last frame when the game stopped presenting
+    /// inside the window. Called under the lock.
+    /// </summary>
+    /// <remarks>
+    /// The game frees its memory in the seconds after its last frame, and a minimum taken across that
+    /// is the game's memory rather than the stack's. On 2026-09-24 OBS quit at 01:35:49, the game's last
+    /// frame came at 01:35:54 and the card fell 6.8 GB from 01:35:56, which read as a 7 GB stream stack.
+    /// </remarks>
+    private DateTimeOffset AfterWindowEnd(DateTimeOffset moment)
+    {
+        var end = moment + Settle + After;
+        return _lastGameFrameAt is { } last && last > moment - ReleaseLead && last < end - GameSilence
+            ? last
+            : end;
     }
 
     private double[] Window(DateTimeOffset from, DateTimeOffset to)
