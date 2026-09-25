@@ -67,6 +67,53 @@ public sealed class PostGameVramReleaseTests
         Assert.Null(release.Summary());
     }
 
+    /// <summary>
+    /// The game frees its memory before its process is seen gone, so the level while it ran is the one
+    /// at its last frame, not the one when the exit is noticed.
+    /// </summary>
+    [Fact]
+    public void TheLevelWhileRunningIsReadBeforeTheGameLetGo()
+    {
+        var release = new PostGameVramRelease();
+        release.Observe(Reading(Exit.AddSeconds(-12), 81));
+        release.ObserveGameFrame(Exit.AddSeconds(-7));
+        release.Observe(Reading(Exit.AddSeconds(-4), 48));
+        release.Observe(Reading(Exit.AddSeconds(-1), 13));
+        release.NoteGameExit(Exit);
+        release.Observe(Reading(Exit.AddSeconds(30), 12));
+
+        var report = release.Summary();
+
+        Assert.NotNull(report);
+        Assert.Equal(81, report!.PercentWhileRunning, 0);
+        Assert.Equal(12, report.LowestPercentAfter, 0);
+        Assert.Equal(3, report.Samples);
+    }
+
+    /// <summary>
+    /// A game that restarts and dies again before its first frame must not be dated at the previous
+    /// process's last frame, which would count the whole reload as a release.
+    /// </summary>
+    [Fact]
+    public void ARestartForgetsThePreviousProcesssLastFrame()
+    {
+        var release = new PostGameVramRelease();
+        release.ObserveGameFrame(Exit.AddSeconds(-40));
+        release.NoteGameExit(Exit.AddSeconds(-35));
+        release.NoteGameRunning();
+
+        release.Observe(Reading(Exit.AddSeconds(-20), 60));
+        release.Observe(Reading(Exit.AddSeconds(-2), 70));
+        release.NoteGameExit(Exit);
+        release.Observe(Reading(Exit.AddSeconds(30), 12));
+
+        var report = release.Summary();
+
+        Assert.NotNull(report);
+        Assert.Equal(70, report!.PercentWhileRunning, 0);
+        Assert.Equal(1, report.Samples);
+    }
+
     [Fact]
     public void NothingIsClaimedBeforeTheGameHasExited()
     {

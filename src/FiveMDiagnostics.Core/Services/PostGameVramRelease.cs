@@ -23,10 +23,27 @@ namespace FiveMDiagnostics.Core;
 /// </remarks>
 public sealed class PostGameVramRelease
 {
+    /// <summary>
+    /// Readings kept while the game runs, so the level before its release can be found once the exit is
+    /// noticed — which is after the release, not before it.
+    /// </summary>
+    private static readonly TimeSpan RecentHistory = TimeSpan.FromMinutes(1);
+
+    /// <summary>
+    /// How long before the exit is noticed the game's last frame may be and still date it.
+    /// </summary>
+    /// <remarks>
+    /// The release takes a few seconds and the process is seen gone at its end. A last frame much older
+    /// than that is a capture that stopped or a game that hung, not a game that was closing.
+    /// </remarks>
+    private static readonly TimeSpan ClosingLead = TimeSpan.FromSeconds(15);
+
     private readonly object _sync = new();
+    private readonly List<Reading> _recent = [];
 
     private Reading? _whileRunning;
     private DateTimeOffset? _exitedAt;
+    private DateTimeOffset? _lastGameFrameAt;
     private Reading? _lowestAfter;
     private Reading? _latestAfter;
     private int _samplesAfter;
@@ -44,7 +61,8 @@ public sealed class PostGameVramRelease
         {
             if (_exitedAt is null)
             {
-                _whileRunning = reading;
+                _recent.Add(reading);
+                _recent.RemoveAll(item => item.At < reading.At - RecentHistory);
                 return;
             }
 
@@ -55,21 +73,60 @@ public sealed class PostGameVramRelease
                 return;
             }
 
-            _samplesAfter++;
-            _latestAfter = reading;
+            CountAfter(reading);
+        }
+    }
 
-            if (_lowestAfter is not { } lowest || reading.Percent < lowest.Percent)
+    /// <summary>Notes that the game presented a frame, in focus or not.</summary>
+    public void ObserveGameFrame(DateTimeOffset at)
+    {
+        lock (_sync)
+        {
+            if (_lastGameFrameAt is not { } last || at > last)
             {
-                _lowestAfter = reading;
+                _lastGameFrameAt = at;
             }
         }
     }
 
+    /// <summary>
+    /// Notes that the game process is gone. The exit is dated at the game's last frame when there was
+    /// one, since the game frees its memory in the seconds before its process disappears.
+    /// </summary>
+    /// <param name="at">When the process was noticed gone.</param>
     public void NoteGameExit(DateTimeOffset at)
     {
         lock (_sync)
         {
-            _exitedAt ??= at;
+            if (_exitedAt is not null)
+            {
+                return;
+            }
+
+            var exit = _lastGameFrameAt is { } last && last < at && at - last <= ClosingLead ? last : at;
+            _exitedAt = exit;
+
+            var running = _recent.FindLastIndex(item => item.At <= exit);
+            _whileRunning = running >= 0 ? _recent[running] : null;
+
+            foreach (var reading in _recent.Where(item => item.At >= exit))
+            {
+                CountAfter(reading);
+            }
+
+            _recent.Clear();
+        }
+    }
+
+    /// <summary>Folds one reading from after the exit into the release. Called under the lock.</summary>
+    private void CountAfter(Reading reading)
+    {
+        _samplesAfter++;
+        _latestAfter = reading;
+
+        if (_lowestAfter is not { } lowest || reading.Percent < lowest.Percent)
+        {
+            _lowestAfter = reading;
         }
     }
 
@@ -86,6 +143,7 @@ public sealed class PostGameVramRelease
         lock (_sync)
         {
             _exitedAt = null;
+            _lastGameFrameAt = null;
             _lowestAfter = null;
             _latestAfter = null;
             _samplesAfter = 0;
