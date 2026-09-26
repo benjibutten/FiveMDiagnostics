@@ -116,6 +116,21 @@ public interface IVramAwareTraceAnalysis
 }
 
 /// <summary>
+/// Lets a trace analyser describe the frame a capture was taken for, rather than whatever the trace
+/// happens to hold most of.
+/// </summary>
+public interface IFrameAwareTraceAnalysis
+{
+    /// <summary>
+    /// Parses the trace as <see cref="IArtifactParser.ParseAsync"/> does, but anchors the wait chain on
+    /// the game thread's wait around <paramref name="frameAt"/> instead of on the longest wait in the
+    /// trace, when there is one.
+    /// </summary>
+    /// <param name="frameAt">When the frame the capture was taken for was presented.</param>
+    Task<ArtifactParseResult?> ParseAsync(string path, DateTimeOffset frameAt, CancellationToken cancellationToken);
+}
+
+/// <summary>
 /// Lets the session tell the analysis that the present mode has already been accounted for.
 /// </summary>
 /// <remarks>

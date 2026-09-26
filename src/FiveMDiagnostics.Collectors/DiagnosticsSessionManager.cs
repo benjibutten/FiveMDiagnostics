@@ -3551,7 +3551,9 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         ArtifactParseResult? result;
         try
         {
-            result = await parser.ParseAsync(capturePath, cancellationToken).ConfigureAwait(false);
+            result = parser is IFrameAwareTraceAnalysis frameAware
+                ? await frameAware.ParseAsync(capturePath, marker.WorstFrameAt, cancellationToken).ConfigureAwait(false)
+                : await parser.ParseAsync(capturePath, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {

@@ -48,6 +48,17 @@ internal sealed class ThreadWaitAttribution
     /// <summary>FiveM's browser process for server UI, as the kernel names it.</summary>
     private const string NuiProcessName = "FiveM_ChromeBrowser";
 
+    /// <summary>
+    /// How far from a frame's present a wait may end and still be taken as that frame's wait.
+    /// </summary>
+    /// <remarks>
+    /// The frame's timestamp comes from PresentMon's anchor and the wait's from the trace clock, and the
+    /// two disagree by about half a second: on 25 September the 138 ms frame presented at 23:27:54.0 and
+    /// its wait ended at 23:27:53.4. Two seconds covers that with room, and is still far from the next
+    /// long wait a trace usually holds.
+    /// </remarks>
+    private static readonly TimeSpan FrameMatch = TimeSpan.FromSeconds(2);
+
     private readonly Dictionary<int, SwitchOut> _switchOutByThread = [];
     private readonly List<ThreadWait> _longWaits = [];
 
@@ -175,31 +186,28 @@ internal sealed class ThreadWaitAttribution
     }
 
     /// <summary>
-    /// The release chain behind a given thread's longest wait, for tests and for
-    /// <see cref="Summarize(CpuSampleAttribution, string?, CancellationToken)"/>.
+    /// The release chain behind a given thread's wait at <paramref name="frameAt"/>, or behind its
+    /// longest wait when no frame is given or none of its waits ends near it.
     /// </summary>
-    internal IReadOnlyList<ThreadWaitChainLink> ChainFor(int threadId, Func<int, string> processNameOf)
+    internal IReadOnlyList<ThreadWaitChainLink> ChainFor(int threadId, Func<int, string> processNameOf, DateTimeOffset? frameAt = null)
     {
-        return ChainFor(threadId, processNameOf, TraceStacks.Empty.Wakers);
+        return ChainFor(threadId, processNameOf, TraceStacks.Empty.Wakers, frameAt);
     }
 
     /// <summary>The same, with the wakers a second pass read out of the ReadyThread stacks.</summary>
     internal IReadOnlyList<ThreadWaitChainLink> ChainFor(
         int threadId,
         Func<int, string> processNameOf,
-        IReadOnlyDictionary<(int Processor, long Qpc), int> recordedWakers)
+        IReadOnlyDictionary<(int Processor, long Qpc), int> recordedWakers,
+        DateTimeOffset? frameAt = null)
     {
-        var anchor = _longWaits
-            .Where(wait => wait.ThreadId == threadId)
-            .OrderByDescending(wait => wait.DurationMs)
-            .FirstOrDefault();
-
+        var (anchor, _) = Anchor(_longWaits.Where(wait => wait.ThreadId == threadId), frameAt);
         return WalkChain(anchor, processNameOf, recordedWakers);
     }
 
     public ThreadWaitSummary? Summarize(CpuSampleAttribution cpu)
     {
-        return Summarize(cpu, stacksFrom: null, CancellationToken.None);
+        return Summarize(cpu, stacksFrom: null, frameAt: null, CancellationToken.None);
     }
 
     /// <param name="stacksFrom">
@@ -208,7 +216,15 @@ internal sealed class ThreadWaitAttribution
     /// the only way to see what the thread at the end of the chain was doing <em>during</em> the wait
     /// rather than across the whole retained window.
     /// </param>
-    public ThreadWaitSummary? Summarize(CpuSampleAttribution cpu, string? stacksFrom, CancellationToken cancellationToken)
+    /// <param name="frameAt">
+    /// The frame the capture was taken for. The chain is walked from the wait behind that frame when the
+    /// trace has one, and from the longest wait otherwise.
+    /// </param>
+    public ThreadWaitSummary? Summarize(
+        CpuSampleAttribution cpu,
+        string? stacksFrom,
+        DateTimeOffset? frameAt,
+        CancellationToken cancellationToken)
     {
         if (cpu.FirstSampleTimestamp is not { } windowStart || cpu.LastSampleTimestamp is not { } windowEnd)
         {
@@ -259,7 +275,12 @@ internal sealed class ThreadWaitAttribution
             .Select(group => $"{group.Key} ×{group.Count()}")
             .ToArray();
 
-        var anchor = selectedWaits[0];
+        var (anchor, anchoredOnFrame) = Anchor(candidates.Waits, frameAt);
+        if (anchor is null)
+        {
+            return null;
+        }
+
         var stacks = stacksFrom is null
             ? TraceStacks.Empty
             : StackSecondPass.Read(stacksFrom, ReadyKeysAround(anchor), anchor.Start, anchor.End, cpu.ModuleForFrame, cancellationToken);
@@ -301,7 +322,30 @@ internal sealed class ThreadWaitAttribution
             blockerModulesDuringWait.Sum(module => module.Cores),
             blockerStacksDuringWait,
             nuiDuringWait,
-            nuiAcrossWindow);
+            nuiAcrossWindow,
+            anchor.DurationMs,
+            anchoredOnFrame);
+    }
+
+    /// <summary>
+    /// The wait to walk the chain from: the longest one ending within <see cref="FrameMatch"/> of the
+    /// frame, or the longest of all when there is no frame or no such wait.
+    /// </summary>
+    /// <remarks>
+    /// The longest wait in a thirty second trace need not be the one the capture was taken for: the
+    /// trace for a 138 ms frame on 25 September also held a 132 ms wait 26 seconds earlier, released
+    /// through a different thread.
+    /// </remarks>
+    private static (ThreadWait? Wait, bool OnFrame) Anchor(IEnumerable<ThreadWait> waits, DateTimeOffset? frameAt)
+    {
+        var byLength = waits.OrderByDescending(wait => wait.DurationMs).ToArray();
+        if (frameAt is { } frame
+            && byLength.FirstOrDefault(wait => (new DateTimeOffset(wait.End) - frame).Duration() <= FrameMatch) is { } atFrame)
+        {
+            return (atFrame, true);
+        }
+
+        return (byLength.FirstOrDefault(), false);
     }
 
     /// <summary>
@@ -470,7 +514,7 @@ internal sealed record ThreadWaitChainLink(
     bool WakerRecorded = false);
 
 /// <param name="ReleaseChain">
-/// The threads behind the longest wait, nearest first. Empty when nothing readied the thread — a timer
+/// The threads behind the anchored wait, nearest first. Empty when nothing readied the thread — a timer
 /// expiry — or when the trace could not attribute the wake to anything.
 /// </param>
 /// <param name="BlockerModules">
@@ -478,7 +522,7 @@ internal sealed record ThreadWaitChainLink(
 /// the chain names no such thread.
 /// </param>
 /// <param name="BlockerModulesDuringWait">
-/// The same, restricted to the longest wait itself. Empty when the thread was never sampled inside it.
+/// The same, restricted to the anchored wait itself. Empty when the thread was never sampled inside it.
 /// </param>
 /// <param name="BlockerCoresDuringWait">
 /// How much of the wait the blocker was actually on a processor, as a share of one core. The chain
@@ -502,11 +546,16 @@ internal sealed record ThreadWaitSummary(
     double BlockerCoresDuringWait,
     IReadOnlyList<string> BlockerStacksDuringWait,
     double? NuiCoresDuringWait = null,
-    double? NuiCoresAcrossWindow = null)
+    double? NuiCoresAcrossWindow = null,
+    double? AnchorWaitMs = null,
+    bool AnchoredOnFrame = false)
 {
     public int LongWaitCount => Intervals.Count;
     public double MaxWaitMs => Intervals.Select(wait => wait.DurationMs).DefaultIfEmpty().Max();
     public double TotalWaitMs => Intervals.Sum(wait => wait.DurationMs);
+
+    /// <summary>How long the wait the chain was walked from lasted.</summary>
+    public double ChainWaitMs => AnchorWaitMs ?? MaxWaitMs;
 
     /// <summary>
     /// The thread the chain ends on, which is the one that was actually running. Null when the chain
@@ -576,7 +625,8 @@ internal sealed record ThreadWaitSummary(
                 ? " Kedjan kunde inte följas hela vägen."
                 : DescribeBlocker();
 
-        return $" Kedjan bakom den längsta väntan: tid {ThreadId} → {steps}." + derivation + ending;
+        var which = AnchoredOnFrame ? "väntan vid framen" : "den längsta väntan";
+        return $" Kedjan bakom {which} ({ChainWaitMs:F0} ms): tid {ThreadId} → {steps}." + derivation + ending;
     }
 
     /// <summary>
@@ -593,12 +643,12 @@ internal sealed record ThreadWaitSummary(
         var threadId = Blocker!.ThreadId;
         var presence = BlockerCoresDuringWait switch
         {
-            >= 0.9 => $" Tråd {threadId} låg på processorn nästan hela väntan ({MaxWaitMs:F0} ms)",
-            >= 0.1 => $" Tråd {threadId} var på processorn {BlockerCoresDuringWait:P0} av väntan ({MaxWaitMs:F0} ms) "
+            >= 0.9 => $" Tråd {threadId} låg på processorn nästan hela väntan ({ChainWaitMs:F0} ms)",
+            >= 0.1 => $" Tråd {threadId} var på processorn {BlockerCoresDuringWait:P0} av väntan ({ChainWaitMs:F0} ms) "
                 + "och däremellan i väntor kortare än 100 ms",
-            > 0 => $" Tråd {threadId} var på processorn bara {BlockerCoresDuringWait:P0} av väntan ({MaxWaitMs:F0} ms) "
+            > 0 => $" Tråd {threadId} var på processorn bara {BlockerCoresDuringWait:P0} av väntan ({ChainWaitMs:F0} ms) "
                 + "— den väntade själv, i steg kortare än 100 ms",
-            _ => $" Tråd {threadId} har inga samples alls under väntan ({MaxWaitMs:F0} ms)",
+            _ => $" Tråd {threadId} har inga samples alls under väntan ({ChainWaitMs:F0} ms)",
         };
 
         var duringWait = BlockerModulesDuringWait.Count > 0

@@ -599,7 +599,7 @@ public sealed class WprDeepCaptureService : IDeepCaptureService, IStallAwareDeep
     private sealed record CommandResult(bool Success, bool RequiresElevation, string Message);
 }
 
-public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
+public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis, IFrameAwareTraceAnalysis
 {
     /// <summary>
     /// A DPC that runs longer than this blocks everything at its IRQL, including the scheduler, and is
@@ -623,6 +623,16 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
     }
 
     public Task<ArtifactParseResult?> ParseAsync(string path, CancellationToken cancellationToken)
+    {
+        return ParseAsync(path, frameAt: null, cancellationToken);
+    }
+
+    public Task<ArtifactParseResult?> ParseAsync(string path, DateTimeOffset frameAt, CancellationToken cancellationToken)
+    {
+        return ParseAsync(path, (DateTimeOffset?)frameAt, cancellationToken);
+    }
+
+    private Task<ArtifactParseResult?> ParseAsync(string path, DateTimeOffset? frameAt, CancellationToken cancellationToken)
     {
         var adapterVramPercent = AdapterVramPercent;
 
@@ -748,7 +758,7 @@ public sealed class EtlArtifactParser : IArtifactParser, IVramAwareTraceAnalysis
             // The path, and so a second read of the file, only when the trace carried stacks at all. A
             // capture taken without stack walking has nothing for the second pass to find, and the pass
             // costs the same as the first one — twelve seconds on the 900 MB ring buffers measured.
-            var threadWait = threadWaits.Summarize(cpu, stacks.Count > 0 ? path : null, cancellationToken);
+            var threadWait = threadWaits.Summarize(cpu, stacks.Count > 0 ? path : null, frameAt, cancellationToken);
 
             // Asked after the parse and about one second, not before it and about the window. The trace
             // is the only thing that knows which second the driver was evacuating in, and that second is

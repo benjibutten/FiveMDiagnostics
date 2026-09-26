@@ -140,5 +140,48 @@ public sealed class ThreadWaitReleaseChainTests
         Assert.Empty(attribution.ChainFor(13572, Names));
     }
 
+    /// <summary>
+    /// The chain describes the wait behind the frame the capture was taken for, not the longest wait
+    /// the trace happens to hold.
+    /// </summary>
+    /// <remarks>
+    /// 25 September 23:27: the trace for a 138 ms frame held a 132 ms wait 26 seconds earlier, released
+    /// by 24668, while the frame's own 125 ms wait ran through 8544 to the render thread 8132.
+    /// </remarks>
+    [Fact]
+    public void TheChainIsWalkedFromTheWaitBehindTheFrame()
+    {
+        var attribution = new ThreadWaitAttribution();
+
+        // 24668 on CPU 3 and the render thread 8132 on CPU 4, both running throughout.
+        attribution.RecordSwitch(3, Start, newThreadId: 24668, oldThreadId: -1, oldProcessId: -1, Waiting, "Executive");
+        attribution.RecordSwitch(4, Start, newThreadId: 8132, oldThreadId: -1, oldProcessId: -1, Waiting, "Executive");
+
+        // The longest wait, early in the trace: released by 24668.
+        attribution.RecordSwitch(2, Start, newThreadId: 998, oldThreadId: 16320, oldProcessId: 24400, Waiting, "UserRequest");
+        attribution.RecordReady(16320, processorNumber: 3, fromDeferredProcedureCall: false);
+        attribution.RecordSwitch(2, Start.AddMilliseconds(132), newThreadId: 16320, oldThreadId: 998, oldProcessId: 24400, Waiting, "Executive");
+
+        // The frame's wait, 26 seconds later: 8544 waits on the render thread and releases the main thread.
+        var frameWait = Start.AddSeconds(26);
+        attribution.RecordSwitch(1, frameWait, newThreadId: 997, oldThreadId: 8544, oldProcessId: 24400, Waiting, "UserRequest");
+        attribution.RecordSwitch(2, frameWait, newThreadId: 998, oldThreadId: 16320, oldProcessId: 24400, Waiting, "UserRequest");
+        attribution.RecordReady(8544, processorNumber: 4, fromDeferredProcedureCall: false);
+        attribution.RecordSwitch(1, frameWait.AddMilliseconds(124), newThreadId: 8544, oldThreadId: 997, oldProcessId: 24400, Waiting, "Executive");
+        attribution.RecordReady(16320, processorNumber: 1, fromDeferredProcedureCall: false);
+        attribution.RecordSwitch(2, frameWait.AddMilliseconds(125), newThreadId: 16320, oldThreadId: 998, oldProcessId: 24400, Waiting, "Executive");
+
+        // Presented about half a second after the wait ended, which is how far PresentMon's clock and the
+        // trace's disagree.
+        var presentedAt = new DateTimeOffset(frameWait.AddMilliseconds(700));
+
+        var atFrame = attribution.ChainFor(16320, Names, presentedAt);
+        Assert.Equal([8544, 8132], atFrame.Select(link => link.ThreadId));
+
+        // Without a frame, or with one nowhere near any wait, it is the longest wait.
+        Assert.Equal(24668, Assert.Single(attribution.ChainFor(16320, Names)).ThreadId);
+        Assert.Equal(24668, Assert.Single(attribution.ChainFor(16320, Names, presentedAt.AddSeconds(10))).ThreadId);
+    }
+
     private static string Names(int threadId) => "FiveM_b3407_GTAProcess";
 }
