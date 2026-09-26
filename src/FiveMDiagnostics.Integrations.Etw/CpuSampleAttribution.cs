@@ -720,7 +720,7 @@ internal sealed record VideoMemoryPressure(
         var meaning = adapterVramPercent switch
         {
             { } percent when percent >= CorroboratingVramPercent =>
-                $" Kortet låg i den sekunden{second} på {percent:F0} %, så flyttningen är eviction: "
+                $" Kortet låg i den sekunden{second} på {percent:F1} %, så flyttningen är eviction: "
                 + "drivrutinen gjorde plats genom att skyffla ytor över PCIe.",
 
             // Under the band, but the subject stopped computing while the driver moved memory. The
@@ -732,14 +732,14 @@ internal sealed record VideoMemoryPressure(
             // The quiet clause below already says the subject stopped counting, so this arm says only
             // what the occupancy does and does not settle.
             { } percent when SubjectWentQuiet =>
-                $" Kortet låg i den sekunden{second} på {percent:F0} %, alltså under "
+                $" Kortet låg i den sekunden{second} på {percent:F1} %, alltså under "
                 + $"{CorroboratingVramPercent:F0} % där eviction annars börjar — så fyllnadsgraden "
                 + "förklarar inte flyttningen, och vad som utlöste den svarar spåret inte på.",
 
             // The subject kept computing through it, so nothing waited and the occupancy agrees: this one
             // really is housekeeping.
             { } percent =>
-                $" Men kortet låg i den sekunden{second} bara på {percent:F0} %, alltså under "
+                $" Men kortet låg i den sekunden{second} bara på {percent:F1} %, alltså under "
                 + $"{CorroboratingVramPercent:F0} % där eviction börjar, och spelet fortsatte räkna under "
                 + "tiden. Drivrutinen flyttade minne av något annat skäl — en inladdning eller ett "
                 + "lägesbyte — och det här var inte minnestryck.",

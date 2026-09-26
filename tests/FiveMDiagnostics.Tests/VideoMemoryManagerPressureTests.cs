@@ -41,7 +41,7 @@ public sealed class VideoMemoryManagerPressureTests
         var described = pressure.Describe(adapterVramPercent: 92);
         Assert.Contains("0,91 kärnor", described, StringComparison.Ordinal);
         Assert.Contains("0,18", described, StringComparison.Ordinal);
-        Assert.Contains("92 %", described, StringComparison.Ordinal);
+        Assert.Contains("92,0 %", described, StringComparison.Ordinal);
         Assert.Contains("eviction", described, StringComparison.Ordinal);
         Assert.Contains("vänta, inte till att räkna", described, StringComparison.Ordinal);
     }
@@ -65,7 +65,7 @@ public sealed class VideoMemoryManagerPressureTests
         var described = pressure.Describe(adapterVramPercent: 54);
 
         Assert.Contains("0,42 kärnor", described, StringComparison.Ordinal);
-        Assert.Contains("54 %", described, StringComparison.Ordinal);
+        Assert.Contains("54,0 %", described, StringComparison.Ordinal);
         Assert.Contains("inte minnestryck", described, StringComparison.Ordinal);
 
         // The claim that was made about this trace, and must not be made again.
@@ -167,7 +167,7 @@ public sealed class VideoMemoryManagerPressureTests
 
         Assert.True(pressure.SubjectWentQuiet);
         Assert.Contains("1,00 kärnor", described, StringComparison.Ordinal);
-        Assert.Contains("87 %", described, StringComparison.Ordinal);
+        Assert.Contains("87,1 %", described, StringComparison.Ordinal);
         Assert.Contains("vänta, inte till att räkna", described, StringComparison.Ordinal);
         Assert.Contains("fyllnadsgraden förklarar inte flyttningen", described, StringComparison.Ordinal);
 
@@ -177,6 +177,24 @@ public sealed class VideoMemoryManagerPressureTests
 
         // And it still must not claim the thing the occupancy rules out.
         Assert.DoesNotContain("flyttningen är eviction", described, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A reading just under the band is not rounded up to it in the sentence that says it is under it.
+    /// </summary>
+    /// <remarks>
+    /// 25 September 23:15:46: the card at 87.6% with the driver on 0.66 cores, written as "bara på 88 %,
+    /// alltså under 88 %".
+    /// </remarks>
+    [Fact]
+    public void AReadingJustUnderTheBandIsNotRoundedUpToIt()
+    {
+        var pressure = new VideoMemoryPressure(0.03, 0.66, "FiveM_b3407_GTAProcess.exe", 3.5, 3.5, null);
+
+        var described = pressure.Describe(adapterVramPercent: 87.6);
+
+        Assert.Contains("87,6 %, alltså under", described, StringComparison.Ordinal);
+        Assert.DoesNotContain("88 %, alltså under", described, StringComparison.Ordinal);
     }
 
     /// <summary>
