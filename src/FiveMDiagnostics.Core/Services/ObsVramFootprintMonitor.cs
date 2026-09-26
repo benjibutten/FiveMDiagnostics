@@ -141,8 +141,9 @@ public sealed class ObsVramFootprintMonitor
             // Each step is worked out once, as soon as the readings that describe it have all arrived.
             var hadEncoder = _encoderStep is not null;
             var hadRestOfStack = _restOfStackStep is not null;
-            _encoderStep ??= CompletedStep(_streamStoppedAt, sample.Timestamp);
-            _restOfStackStep ??= CompletedStep(_processStoppedAt, sample.Timestamp);
+            // The encoder first: the rest of the stack may start where the encoder's step ended.
+            _encoderStep ??= EncoderStep(sample.Timestamp, sessionEnding: false);
+            _restOfStackStep ??= RestOfStackStep(sample.Timestamp, sessionEnding: false);
             var completed = (!hadEncoder && _encoderStep is not null) || (!hadRestOfStack && _restOfStackStep is not null);
 
             var cutoff = sample.Timestamp - History;
@@ -199,10 +200,21 @@ public sealed class ObsVramFootprintMonitor
     }
 
     /// <summary>The steps, or null when the stack never came off during the session.</summary>
-    public ObsVramFootprintReport? Summary()
+    /// <param name="sessionEnding">
+    /// True when no more readings will come. A step whose "after" window is still open is then read from
+    /// the readings there are, as long as they reach <see cref="Settle"/> past the transition: a machine
+    /// switched off seconds after OBS quit leaves no other chance to read it.
+    /// </param>
+    public ObsVramFootprintReport? Summary(bool sessionEnding = false)
     {
         lock (_sync)
         {
+            if (sessionEnding && _lastReadingAt is { } now)
+            {
+                _encoderStep ??= EncoderStep(now, sessionEnding: true);
+                _restOfStackStep ??= RestOfStackStep(now, sessionEnding: true);
+            }
+
             if (_encoderStep is null && _restOfStackStep is null)
             {
                 return null;
@@ -211,30 +223,89 @@ public sealed class ObsVramFootprintMonitor
             var lastTransition = _processStoppedAt ?? _streamStoppedAt;
             var tail = _lastReadingAt is { } last && lastTransition is { } at ? last - at : TimeSpan.Zero;
 
-            var separation = _streamStoppedAt is { } stream && _processStoppedAt is { } process
-                ? (process - stream).Duration()
-                : (TimeSpan?)null;
-            var stepsTooClose = separation is { } gap && gap < MinimumStepSeparation;
-
             return new ObsVramFootprintReport(
-                _encoderStep, _restOfStackStep, _totalVramGb, tail, tail >= UsableComparison, separation, stepsTooClose);
+                _encoderStep,
+                _restOfStackStep,
+                _totalVramGb,
+                tail,
+                tail >= UsableComparison,
+                StepSeparation,
+                StepsTooClose,
+                _processStoppedAt);
         }
     }
 
+    /// <summary>How far apart the stream stopping and OBS quitting landed, or null unless both did.</summary>
+    private TimeSpan? StepSeparation => _streamStoppedAt is { } stream && _processStoppedAt is { } process
+        ? (process - stream).Duration()
+        : null;
+
+    private bool StepsTooClose => StepSeparation is { } gap && gap < MinimumStepSeparation;
+
     /// <summary>
-    /// The drop across one transition, once every reading that describes it has arrived. Null until then,
-    /// and null when either side of it was never sampled.
+    /// The drop across the stream stopping, once its readings have arrived. Called under the lock.
     /// </summary>
-    private ObsVramStep? CompletedStep(DateTimeOffset? at, DateTimeOffset now)
+    /// <remarks>
+    /// When OBS quits inside the "after" window, its own release lands there too and the whole stack
+    /// reads as the encoder, so the window ends where that release can begin: <see cref="ReleaseLead"/>
+    /// before OBS was seen gone.
+    /// </remarks>
+    private ObsVramStep? EncoderStep(DateTimeOffset now, bool sessionEnding)
     {
-        if (at is not { } moment || now < moment + Settle + After)
+        if (!IsReadable(_streamStoppedAt, now, sessionEnding))
         {
             return null;
         }
 
-        var before = Median(Window(moment - ReleaseLead - Before, moment - ReleaseLead));
-        var after = Window(moment - ReleaseLead, AfterWindowEnd(moment));
+        var moment = _streamStoppedAt!.Value;
+        var end = AfterWindowEnd(moment);
+        if (_processStoppedAt is { } quit && quit - ReleaseLead > moment && quit - ReleaseLead < end)
+        {
+            end = quit - ReleaseLead;
+        }
 
+        return Step(moment, Median(Window(moment - ReleaseLead - Before, moment - ReleaseLead)), end);
+    }
+
+    /// <summary>
+    /// The drop across OBS quitting, once its readings have arrived. Called under the lock.
+    /// </summary>
+    /// <remarks>
+    /// Closer than <see cref="MinimumStepSeparation"/> to the stream stopping, the seconds before OBS quit
+    /// still hold the encoder's release, and a level read there would count the encoder twice. The rest
+    /// of the stack then starts where the encoder's step ended.
+    /// </remarks>
+    private ObsVramStep? RestOfStackStep(DateTimeOffset now, bool sessionEnding)
+    {
+        if (!IsReadable(_processStoppedAt, now, sessionEnding))
+        {
+            return null;
+        }
+
+        var moment = _processStoppedAt!.Value;
+        var before = StepsTooClose && _encoderStep is { } encoder
+            ? encoder.PercentAfter
+            : Median(Window(moment - ReleaseLead - Before, moment - ReleaseLead));
+
+        return Step(moment, before, AfterWindowEnd(moment));
+    }
+
+    /// <summary>
+    /// Whether the readings describing a transition have arrived: the whole "after" window, or at the end
+    /// of a session only the seconds the release needs.
+    /// </summary>
+    private static bool IsReadable(DateTimeOffset? at, DateTimeOffset now, bool sessionEnding)
+    {
+        return at is { } moment && now >= moment + Settle + (sessionEnding ? TimeSpan.Zero : After);
+    }
+
+    /// <summary>
+    /// The drop from <paramref name="before"/> to the lowest reading up to <paramref name="afterEnd"/>, or
+    /// null when either side was never sampled.
+    /// </summary>
+    private ObsVramStep? Step(DateTimeOffset moment, double? before, DateTimeOffset afterEnd)
+    {
+        var after = Window(moment - ReleaseLead, afterEnd);
         return before is { } from && after.Length > 0 ? new ObsVramStep(moment, from, after.Min()) : null;
     }
 
@@ -292,9 +363,10 @@ public sealed record ObsVramStep(DateTimeOffset At, double PercentBefore, double
 /// How far apart the stream stopping and OBS quitting landed, or null when only one of them happened.
 /// </param>
 /// <param name="StepsTooClose">
-/// Whether that separation is short enough that the two steps' reading windows overlap, which makes
-/// each step's own figure unreliable even though both were measured.
+/// Whether that separation is short enough that the two releases cannot be told apart with certainty.
+/// The total stands; the split between the steps does not.
 /// </param>
+/// <param name="ObsQuitAt">When OBS was seen gone, or null when it kept running.</param>
 public sealed record ObsVramFootprintReport(
     ObsVramStep? Encoder,
     ObsVramStep? RestOfStack,
@@ -302,7 +374,8 @@ public sealed record ObsVramFootprintReport(
     TimeSpan TailWithoutObs,
     bool TailIsUsable,
     TimeSpan? StepSeparation = null,
-    bool StepsTooClose = false)
+    bool StepsTooClose = false,
+    DateTimeOffset? ObsQuitAt = null)
 {
     public double TotalMegabytesFreed =>
         (Encoder?.MegabytesFreed(TotalVramGb) ?? 0) + (RestOfStack?.MegabytesFreed(TotalVramGb) ?? 0);
@@ -342,6 +415,9 @@ public sealed record ObsVramFootprintReport(
             {
                 // Worded to hold both when written the moment the encoder step completes and at the end
                 // of an evening where OBS kept running.
+                (not null, null) when ObsQuitAt is { } quit => $" OBS avslutades {quit.ToLocalTime():HH:mm:ss}, "
+                    + "men det steget är inte avläst: det behöver några sekunders mätning efter att processen "
+                    + "stängts. Resten av stacken — kanvas, game capture och webbkällor — är omätt så länge.",
                 (not null, null) => " OBS-processen har inte avslutats under mätningen, så resten av "
                     + "stacken — kanvas, game capture och webbkällor — är omätt än så länge. Den delen "
                     + "kräver att processen stängs medan mätningen fortfarande rullar.",
@@ -355,12 +431,13 @@ public sealed record ObsVramFootprintReport(
                 : $" Perioden efter är {TailWithoutObs.TotalMinutes:F0} minuter, vilket är för kort för att "
                     + "jämföra frametider över — VRAM-stegen är sekundupplösta och står ändå.";
 
-            // Overlapping windows, not a failed measurement: both steps have a figure, but each one's
-            // "efter"-läsning may already include part of the other transition's drop.
+            // Both steps have a figure, but the encoder's release may not have finished before OBS began
+            // its own, so part of one can sit in the other.
             var overlap = StepsTooClose && Encoder is not null && RestOfStack is not null
                 ? $" VARNING: stegen låg {StepSeparation!.Value.TotalSeconds:F0} s isär, vilket är för tätt "
-                    + "för att skilja encodern från resten — siffrorna ovan överlappar och ska inte jämföras "
-                    + "med kvällar där rutinen (stoppa strömmen, vänta, avsluta OBS) hölls."
+                    + "för att skilja encodern säkert från resten — summan gäller, men fördelningen mellan "
+                    + "stegen ska inte jämföras med kvällar där rutinen (stoppa strömmen, vänta, avsluta OBS) "
+                    + "hölls."
                 : string.Empty;
 
             return $"OBS-avstängningen mätt: {string.Join("; ", steps)}.{total}{missing}{overlap}{caveat} "

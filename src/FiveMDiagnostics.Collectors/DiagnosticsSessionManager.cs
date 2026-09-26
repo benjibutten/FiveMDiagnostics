@@ -1208,7 +1208,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// </remarks>
     private void FinalizeObsVramFootprint(bool final)
     {
-        if (_obsVram?.Summary() is { } report && ShouldWriteSummary("Obs.VramFootprint", report.Message))
+        if (_obsVram?.Summary(sessionEnding: final) is { } report && ShouldWriteSummary("Obs.VramFootprint", report.Message))
         {
             Report(StatusLevel.Info, "Obs.VramFootprint", report.Message);
         }

@@ -146,6 +146,57 @@ public sealed class ObsVramFootprintTests
         Assert.Contains("omätt än så länge", report.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// 2026-09-25 03:23:54: the stream stopped, OBS quit eight seconds later and the machine was switched
+    /// off five seconds after that.
+    /// </summary>
+    /// <remarks>
+    /// The card read 83.6 → 81.4 % for the encoder and 81.4 → 77.1 % for the rest of the stack. The line
+    /// said "6,6 pp ≈ 678 MB, encodern" and that OBS had not quit.
+    /// </remarks>
+    [Fact]
+    public void AnOBSQuitSecondsAfterTheStreamAndASessionEndingSecondsLaterAreBothRead()
+    {
+        var monitor = new ObsVramFootprintMonitor();
+
+        Play(monitor, from: 0, seconds: 30, vramPercent: 83.6, streaming: true, running: true, gamePresenting: true);
+        Play(monitor, from: 30, seconds: 8, vramPercent: 81.4, streaming: false, running: true, gamePresenting: true);
+        Play(monitor, from: 38, seconds: 6, vramPercent: 77.1, streaming: false, running: false, gamePresenting: true);
+
+        var report = monitor.Summary(sessionEnding: true);
+
+        Assert.NotNull(report?.Encoder);
+        Assert.Equal(2.2, report.Encoder.PercentagePoints, 1);
+
+        Assert.NotNull(report.RestOfStack);
+        Assert.Equal(4.3, report.RestOfStack.PercentagePoints, 1);
+
+        Assert.Contains("webbkällor", report.Message, StringComparison.Ordinal);
+        Assert.Contains("VARNING: stegen låg 8 s isär", report.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("har inte avslutats", report.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Before the session ends, OBS having quit is still said, with its step not yet read.
+    /// </summary>
+    [Fact]
+    public void AQuitWhoseStepIsNotReadYetIsNotCalledARunningOBS()
+    {
+        var monitor = new ObsVramFootprintMonitor();
+
+        Play(monitor, from: 0, seconds: 30, vramPercent: 83.6, streaming: true, running: true, gamePresenting: true);
+        Play(monitor, from: 30, seconds: 8, vramPercent: 81.4, streaming: false, running: true, gamePresenting: true);
+        Play(monitor, from: 38, seconds: 6, vramPercent: 77.1, streaming: false, running: false, gamePresenting: true);
+
+        var report = monitor.Summary();
+
+        Assert.NotNull(report?.Encoder);
+        Assert.Equal(2.2, report.Encoder.PercentagePoints, 1);
+        Assert.Null(report.RestOfStack);
+        Assert.Contains("inte avläst", report.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("har inte avslutats", report.Message, StringComparison.Ordinal);
+    }
+
     /// <summary>An evening where OBS ran to the end has no step to read and says nothing.</summary>
     [Fact]
     public void AStackThatNeverCameOffIsSilent()
