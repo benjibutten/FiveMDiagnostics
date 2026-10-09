@@ -1330,7 +1330,7 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             // render time, severe spikes, an NVENC sawtooth — is downstream of the freeze it was blamed
             // for, and output skipped stood at zero for the whole evening.
             confidence = Math.Min(confidence, ObsWitnessConfidenceCeiling);
-            evidence.Add($"Noll output skipped frames: tittarna tappade ingen bild. Utan en räknare som är OBS egen kan hypotesen inte rankas över {ObsWitnessConfidenceCeiling:P0}.");
+            evidence.Add($"Noll output skipped frames: kodningen hann med varje bildruta. Utan en räknare som är OBS egen kan hypotesen inte rankas över {ObsWitnessConfidenceCeiling:P0}.");
         }
 
         if (confidence > 0)
@@ -2521,8 +2521,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
 
         var outputSkipped = Delta(connected.Select(item => item.OutputSkippedFrames));
         var viewers = outputSkipped == 0
-            ? "Output skipped rörde sig inte, så tittarna tappade ingenting"
-            : $"Output skipped steg med {outputSkipped} i samma fönster — de bildrutorna nådde aldrig tittarna";
+            ? "Output skipped (kodningslagg) rörde sig inte, så kodningen tappade ingenting"
+            : $"Output skipped (kodningslagg) steg med {outputSkipped} i samma fönster — kodningen hann inte med de bildrutorna";
 
         return $"OBS hoppade över {skipped} renderingar i det här fönstret. OBS renderar från sin egen duk "
             + "och påverkas inte av att spelet står stilla, så ett hopp av den storleken betyder att "

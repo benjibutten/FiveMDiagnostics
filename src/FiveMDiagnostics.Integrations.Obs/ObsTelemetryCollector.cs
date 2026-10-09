@@ -371,11 +371,14 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
             ? lastOutput - firstOutput
             : 0;
 
+        // This counter is the encoder's, not the network's. It used to close with "ingen bildruta uteblev
+        // för tittarna", and on 7 October said exactly that while the stream dropped 15.5% of its frames
+        // to the connection. Network drops are reported per stream by ObsStreamHealthMonitor.
         var viewers = skippedHere == 0
-            ? $"Output skipped rörde sig inte under sessionen (står på {_lastOutputSkipped ?? 0}): ingen "
-                + "bildruta uteblev för tittarna."
-            : $"Output skipped steg med {skippedHere} under sessionen (till {_lastOutputSkipped}) — de "
-                + "bildrutorna nådde aldrig tittarna.";
+            ? $"Output skipped (kodningslagg) rörde sig inte under sessionen (står på {_lastOutputSkipped ?? 0}): "
+                + "kodningen hann med varje bildruta. Tappade bildrutor mot nätverket redovisas separat per stream."
+            : $"Output skipped (kodningslagg) steg med {skippedHere} under sessionen (till {_lastOutputSkipped}) — "
+                + "kodningen hann inte med de bildrutorna, och de nådde aldrig tittarna.";
 
         var render = last == first
             ? $"OBS render skipped stod stilla på {first} hela sessionen."
