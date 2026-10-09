@@ -303,6 +303,12 @@ public sealed class IncidentBundleExporter : IIncidentExporter
                 ("isWebSocketConnected", obs.IsConnected.ToString()),
                 ("isStreaming", obs.IsStreaming.ToString()),
                 ("isRecording", obs.IsRecording.ToString()),
+                ("streamDroppedFrames", obs.StreamDroppedFrames?.ToString(CultureInfo.InvariantCulture) ?? string.Empty),
+                ("streamTotalFrames", obs.StreamTotalFrames?.ToString(CultureInfo.InvariantCulture) ?? string.Empty),
+                ("streamBytes", obs.StreamBytes?.ToString(CultureInfo.InvariantCulture) ?? string.Empty),
+                ("streamCongestion", obs.StreamCongestion?.ToString("F3", CultureInfo.InvariantCulture) ?? string.Empty),
+                ("isStreamReconnecting", obs.IsStreamReconnecting.ToString()),
+                ("streamDurationMs", obs.StreamDurationMs?.ToString(CultureInfo.InvariantCulture) ?? string.Empty),
             ],
             CaptureHealthTelemetrySample health =>
             [

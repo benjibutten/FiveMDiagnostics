@@ -1552,6 +1552,23 @@ public sealed record ProcessTelemetrySample(
     long ReadBytesPerSecond,
     long WriteBytesPerSecond) : TelemetryEvent(Timestamp, "Process");
 
+/// <summary>One OBS poll.</summary>
+/// <remarks>
+/// <para>
+/// <see cref="OutputSkippedFrames"/> is <c>GetStats.outputSkippedFrames</c>: frames the encoder could not
+/// keep up with. It says nothing about the network. On 7 October it stood still while the stream dropped
+/// 30 859 frames (15.5%) to "insufficient bandwidth/connection stalls", and the session closed by saying
+/// no frame had failed to reach the viewers.
+/// </para>
+/// <para>
+/// The <c>Stream*</c> fields are <c>GetStreamStatus</c> — the stream output's own counters, which is where
+/// the network drops are. They count from the moment the output started and reset when it restarts.
+/// <see cref="StreamTotalFrames"/> is the frames that were sent and excludes the dropped ones (OBS's log
+/// prints "Total frames output: 168233 (199092 attempted)" for 30 859 dropped), and
+/// <see cref="StreamDurationMs"/> is derived by obs-websocket from that same count, so it falls behind the
+/// clock while frames are being dropped or the output is reconnecting.
+/// </para>
+/// </remarks>
 public sealed record ObsTelemetrySample(
     DateTimeOffset Timestamp,
     bool IsConnected,
@@ -1563,7 +1580,13 @@ public sealed record ObsTelemetrySample(
     double? MemoryUsageMb,
     bool IsStreaming,
     bool IsRecording,
-    bool IsProcessRunning = false) : TelemetryEvent(Timestamp, "OBS");
+    bool IsProcessRunning = false,
+    long? StreamDroppedFrames = null,
+    long? StreamTotalFrames = null,
+    long? StreamBytes = null,
+    double? StreamCongestion = null,
+    bool IsStreamReconnecting = false,
+    long? StreamDurationMs = null) : TelemetryEvent(Timestamp, "OBS");
 
 /// <summary>
 /// Low-rate PresentMon health snapshot. Keeping this at roughly one sample per second exposes gaps and
