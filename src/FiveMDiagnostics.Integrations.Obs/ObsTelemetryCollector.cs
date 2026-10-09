@@ -25,6 +25,19 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
     private long? _lastOutputSkipped;
     private string? _lastSkippedFrameTotals;
     private DateTimeOffset _nextSkippedFrameTotals = DateTimeOffset.MinValue;
+    private ObsStreamHealthMonitor _streamHealth = new();
+    private ObsStreamCsvLog? _streamCsv;
+    private bool _triedStreamCsv;
+    private bool _reportedStreamCsvFailure;
+    private DateTimeOffset? _ingestLookupFor;
+    private DateTimeOffset _nextIngestLookup = DateTimeOffset.MinValue;
+    private DateTimeOffset _ingestLookupDeadline = DateTimeOffset.MinValue;
+
+    /// <summary>How long after a (re)connect is noticed the OBS log is searched for the server it went to.</summary>
+    private static readonly TimeSpan IngestLookupWindow = TimeSpan.FromMinutes(2);
+
+    /// <summary>How often the log is reread while that search is on.</summary>
+    private static readonly TimeSpan IngestLookupInterval = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// How often the skipped-frame totals are written while the session runs.
@@ -56,6 +69,12 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
         _lastOutputSkipped = null;
         _lastSkippedFrameTotals = null;
         _nextSkippedFrameTotals = sessionStart + SkippedFrameTotalsInterval;
+        _streamHealth = new ObsStreamHealthMonitor();
+        _triedStreamCsv = false;
+        _reportedStreamCsvFailure = false;
+        _ingestLookupFor = null;
+        _nextIngestLookup = DateTimeOffset.MinValue;
+        _ingestLookupDeadline = DateTimeOffset.MinValue;
 
         try
         {
@@ -69,6 +88,7 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
                     ReportConnectionHealth(context, sample);
                     ReportRenderSkipOnset(context, sample);
                     NoteSkippedFrames(sample);
+                    ObserveStreamHealth(context, sample);
                     await context.Writer.WriteAsync(sample, cancellationToken).ConfigureAwait(false);
 
                     // On the quarter-hour as well as on the way out, so a session that ends with the
@@ -98,7 +118,83 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
                 ReportSkippedFrameTotals(context);
             }
 
+            foreach (var report in _streamHealth.Finish())
+            {
+                context.StatusSink.Report(report.Level, Name, report.Message);
+            }
+
+            _streamCsv?.Dispose();
+            _streamCsv = null;
+
             await ResetSocketAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Feeds the stream output's counters to <see cref="ObsStreamHealthMonitor"/>, finds the ingest
+    /// server in OBS's log after each (re)connect, and keeps the per-poll CSV.
+    /// </summary>
+    internal void ObserveStreamHealth(CollectorContext context, ObsTelemetrySample sample)
+    {
+        foreach (var report in _streamHealth.Observe(sample))
+        {
+            context.StatusSink.Report(report.Level, Name, report.Message);
+        }
+
+        if (_streamHealth.ConnectionStartedAt is { } connectedAt)
+        {
+            var now = context.UtcNow();
+            if (_ingestLookupFor != connectedAt)
+            {
+                // The window runs from when the search began, not from the connection: a stream that was
+                // already running when the session opened connected long before the first reading, and
+                // its line is still in the log to be found.
+                _ingestLookupFor = connectedAt;
+                _nextIngestLookup = now;
+                _ingestLookupDeadline = now + IngestLookupWindow;
+            }
+
+            if (now <= _ingestLookupDeadline && now >= _nextIngestLookup)
+            {
+                _nextIngestLookup = now + IngestLookupInterval;
+                if (ObsSessionLogReader.TryReadStreamConnection(connectedAt, now) is { } ingest)
+                {
+                    // Found is found, whether or not it is news: the same server again after a reconnect
+                    // says nothing new, and searching on would reread the whole log every few seconds.
+                    _nextIngestLookup = DateTimeOffset.MaxValue;
+                    if (_streamHealth.NoteIngest(ingest) is { } report)
+                    {
+                        context.StatusSink.Report(report.Level, Name, report.Message);
+                    }
+                }
+            }
+        }
+
+        if (!sample.IsConnected || !sample.IsStreaming)
+        {
+            return;
+        }
+
+        if (!_triedStreamCsv)
+        {
+            // Opened at the first streamed poll rather than at session start: an evening without a
+            // stream should not leave an empty file behind.
+            _triedStreamCsv = true;
+            _streamCsv = ObsStreamCsvLog.TryOpen(context.Settings.WorkingDirectory, context.UtcNow(), out var error);
+            context.StatusSink.Report(
+                _streamCsv is null ? StatusLevel.Warning : StatusLevel.Info,
+                Name,
+                _streamCsv is null
+                    ? $"Stream-loggen kunde inte skapas: {error}. Tappade bildrutor rapporteras ändå per minut i sessionsloggen."
+                    : $"Streamens tappade bildrutor, uppladdning och congestion loggas varje sekund till {_streamCsv.Path}.");
+        }
+
+        _streamCsv?.Append(sample, _streamHealth.CurrentIngest);
+
+        if (!_reportedStreamCsvFailure && _streamCsv?.Failure is { } failure)
+        {
+            _reportedStreamCsvFailure = true;
+            context.StatusSink.Report(StatusLevel.Warning, Name, failure);
         }
     }
 
@@ -275,11 +371,14 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
             ? lastOutput - firstOutput
             : 0;
 
+        // This counter is the encoder's, not the network's. It used to close with "ingen bildruta uteblev
+        // för tittarna", and on 7 October said exactly that while the stream dropped 15.5% of its frames
+        // to the connection. Network drops are reported per stream by ObsStreamHealthMonitor.
         var viewers = skippedHere == 0
-            ? $"Output skipped rörde sig inte under sessionen (står på {_lastOutputSkipped ?? 0}): ingen "
-                + "bildruta uteblev för tittarna."
-            : $"Output skipped steg med {skippedHere} under sessionen (till {_lastOutputSkipped}) — de "
-                + "bildrutorna nådde aldrig tittarna.";
+            ? $"Output skipped (kodningslagg) rörde sig inte under sessionen (står på {_lastOutputSkipped ?? 0}): "
+                + "kodningen hann med varje bildruta. Tappade bildrutor mot nätverket redovisas separat per stream."
+            : $"Output skipped (kodningslagg) steg med {skippedHere} under sessionen (till {_lastOutputSkipped}) — "
+                + "kodningen hann inte med de bildrutorna, och de nådde aldrig tittarna.";
 
         var render = last == first
             ? $"OBS render skipped stod stilla på {first} hela sessionen."
@@ -341,6 +440,7 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
     {
         _socketLock.Dispose();
         _socket?.Dispose();
+        _streamCsv?.Dispose();
     }
 
     private async Task<ObsTelemetrySample> PollAsync(ObsOptions options, CancellationToken cancellationToken)
@@ -380,7 +480,15 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
                 MemoryUsageMb: TryGetDouble(stats, "memoryUsage"),
                 IsStreaming: TryGetBool(stream, "outputActive") || TryGetBool(stream, "outputReconnecting"),
                 IsRecording: TryGetBool(record, "outputActive"),
-                IsProcessRunning: true);
+                IsProcessRunning: true,
+                // The stream output's own counters. outputSkippedFrames means something different here
+                // than in GetStats: these are the frames the connection could not take.
+                StreamDroppedFrames: TryGetLong(stream, "outputSkippedFrames"),
+                StreamTotalFrames: TryGetLong(stream, "outputTotalFrames"),
+                StreamBytes: TryGetLong(stream, "outputBytes"),
+                StreamCongestion: TryGetDouble(stream, "outputCongestion"),
+                IsStreamReconnecting: TryGetBool(stream, "outputReconnecting"),
+                StreamDurationMs: TryGetLong(stream, "outputDuration"));
         }
         catch
         {

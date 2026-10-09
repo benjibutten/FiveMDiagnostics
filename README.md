@@ -908,6 +908,29 @@ counter instances the figure was summed from. Long format rather than a column p
 set of processes holding GPU memory changes during a session and a wide file would have to fix its
 columns when the header is written.
 
+## Stream health
+
+While OBS streams and its WebSocket is connected, the stream output's own counters are read every poll
+(`GetStreamStatus`: dropped frames, total frames, bytes sent, congestion, reconnecting). These are the
+frames lost on the way to the ingest server — not the same counter as `GetStats.outputSkippedFrames`,
+which is the encoder falling behind. On 7 October the stream dropped 15.5% of its frames to the
+connection while the encoder counter stood still, and the session closed saying nothing had failed to
+reach the viewers.
+
+The journal gets a line when the stream starts, a warning the first minute more than 1% of frames are
+dropped (with the clock, minutes into the stream, upload rate, whether the encoder kept up, and the
+ingest server read from OBS's log), a restatement every five minutes while it lasts, a line when three
+clean minutes in a row end it, and a summary per stream. Every poll taken while streaming is also
+written to:
+
+```text
+%LocalAppData%\FiveMDiagnostics\Sessions\obsstream_<yyyyMMdd_HHmmss>.csv
+```
+
+Columns are timestamp, streaming, reconnecting, dropped frames, sent frames (OBS's total, which excludes
+the dropped ones), duration, bytes, congestion, encoder and render skipped frames, active FPS, average
+render time and the ingest server. Drop percentages are against sent plus dropped, as in OBS's own log.
+
 ## Export bundle
 
 By default exports are written under:

@@ -12,7 +12,9 @@ public sealed record ObsSessionLogSummary(
     long? TotalOutputFrames,
     long? SkippedEncodingFrames,
     long? TotalEncodedFrames,
-    string? OutputName)
+    string? OutputName,
+    long? NetworkDroppedFrames = null,
+    long? StreamAttemptedFrames = null)
 {
     public double? RenderLagShare => TotalOutputFrames is > 0 && LaggedRenderFrames is { } lagged
         ? (double)lagged / TotalOutputFrames.Value
@@ -22,9 +24,23 @@ public sealed record ObsSessionLogSummary(
         ? (double)skipped / TotalEncodedFrames.Value
         : null;
 
+    /// <summary>
+    /// Frames the stream output dropped because the connection could not take them, against what the
+    /// stream attempted to send — the same denominator OBS prints its own percentage against. Both come
+    /// from the stream's block of totals, never from a recording's.
+    /// </summary>
+    public double? NetworkDropShare => NetworkDroppedFrames is { } dropped && StreamAttemptedFrames is { } attempted and > 0
+        ? (double)dropped / attempted
+        : null;
+
     public string Describe()
     {
         var parts = new List<string>();
+
+        if (NetworkDropShare is { } network)
+        {
+            parts.Add($"{NetworkDroppedFrames:N0} av {StreamAttemptedFrames:N0} frames tappades mot nätverket ({network:P1})");
+        }
 
         if (RenderLagShare is { } render)
         {
@@ -91,7 +107,22 @@ public static class ObsSessionLogReader
         RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
 
     private static readonly Regex TotalFramesPattern = new(
-        @"Output '(?<output>[^']*)':\s*Total frames output:\s*(?<total>" + CountPattern + ")",
+        @"Output '(?<output>[^']*)':\s*Total frames output:\s*(?<total>" + CountPattern + @")(?:\s*\((?<attempted>" + CountPattern + @")\s+attempted\))?",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// The stream's network drops. OBS writes the line only when the count is above zero.
+    /// </summary>
+    private static readonly Regex NetworkDroppedPattern = new(
+        @"Output '(?<output>[^']*)':\s*Number of dropped frames due to insufficient bandwidth/connection stalls:\s*(?<dropped>" + CountPattern + ")",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// The stream connecting, with the ingest server's address when OBS resolved one:
+    /// <c>21:16:54.047: [rtmp stream: 'rtmp multitrack video'] Connection to rtmp://host/app (35.55.42.6) successful</c>.
+    /// </summary>
+    private static readonly Regex ConnectionPattern = new(
+        @"^(?<time>\d{2}:\d{2}:\d{2})(?:\.\d+)?:\s*\[rtmp stream: '[^']*'\] Connection to (?<url>\S+?)(?: \((?<ip>[^)]+)\))? successful",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     /// <summary>
@@ -162,16 +193,7 @@ public static class ObsSessionLogReader
     /// <summary>Parses one OBS log. Public so a log can be pointed at directly, and for tests.</summary>
     public static ObsSessionLogSummary? TryReadFile(string path)
     {
-        string[] lines;
-        try
-        {
-            // OBS keeps the current log open for writing, so it has to be read share-all rather than
-            // through the convenience overloads.
-            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            using var reader = new StreamReader(stream);
-            lines = reader.ReadToEnd().Split('\n');
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        if (ReadLogLines(path) is not { } lines)
         {
             return null;
         }
@@ -180,12 +202,31 @@ public static class ObsSessionLogReader
         long? totalOutput = null;
         long? skipped = null;
         long? totalEncoded = null;
+        long? networkDropped = null;
+        long? streamAttempted = null;
         string? outputName = null;
 
         // Last match wins. A session that streamed and also recorded writes these lines once per output,
         // and the stream is the one that stops last and matters most.
         foreach (var line in lines)
         {
+            // The network figures are kept per stream block and only a stream block replaces them. A
+            // recording stopped after the stream writes a block of its own, and letting that clear the
+            // stream's drops would have lost exactly the 15.5% of 7 October this reads the log for.
+            if (TotalFramesPattern.Match(line) is { Success: true } streamTotals && IsStreamOutput(streamTotals.Groups["output"].Value))
+            {
+                // The drop line follows only when there were drops, so a new stream block starts at none.
+                networkDropped = null;
+                streamAttempted = streamTotals.Groups["attempted"].Success
+                    ? ParseCount(streamTotals.Groups["attempted"].Value)
+                    : ParseCount(streamTotals.Groups["total"].Value);
+            }
+
+            if (NetworkDroppedPattern.Match(line) is { Success: true } droppedMatch)
+            {
+                networkDropped = ParseCount(droppedMatch.Groups["dropped"].Value);
+            }
+
             if (LaggedPattern.Match(line) is { Success: true } laggedMatch)
             {
                 lagged = ParseCount(laggedMatch.Groups["lagged"].Value);
@@ -205,12 +246,145 @@ public static class ObsSessionLogReader
             }
         }
 
-        if (lagged is null && skipped is null)
+        if (lagged is null && skipped is null && networkDropped is null)
         {
             return null;
         }
 
-        return new ObsSessionLogSummary(path, lagged, totalOutput, skipped, totalEncoded, outputName);
+        return new ObsSessionLogSummary(path, lagged, totalOutput, skipped, totalEncoded, outputName, networkDropped, streamAttempted);
+    }
+
+    /// <summary>
+    /// Whether an output name is a stream rather than a recording, replay buffer or virtual camera.
+    /// </summary>
+    /// <remarks>
+    /// The names OBS uses: <c>adv_stream</c>, <c>simple_stream</c> and <c>rtmp multitrack video</c>
+    /// stream; <c>adv_file_output</c>, <c>simple_file_output</c>, <c>ReplayBuffer</c> and
+    /// <c>virtualcam_output</c> do not.
+    /// </remarks>
+    internal static bool IsStreamOutput(string outputName)
+    {
+        return outputName.Contains("stream", StringComparison.OrdinalIgnoreCase)
+            || outputName.Contains("rtmp", StringComparison.OrdinalIgnoreCase)
+            || outputName.Contains("multitrack", StringComparison.OrdinalIgnoreCase)
+            || outputName.Contains("whip", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Reads a whole OBS log, or null when it cannot be read.</summary>
+    /// <remarks>
+    /// OBS keeps the current log open for writing, so it has to be read share-all rather than through
+    /// the convenience overloads.
+    /// </remarks>
+    private static string[]? ReadLogLines(string path)
+    {
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var reader = new StreamReader(stream);
+            return reader.ReadToEnd().Split('\n');
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Finds the ingest server the stream connected to at or after <paramref name="since"/>, in the
+    /// newest OBS log, or null when there is no such line yet.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The WebSocket does not say which server the stream went to, and on Twitch with Enhanced
+    /// Broadcasting it is picked anew at every start. The two streams that dropped frames on 7 and 8
+    /// October went to 35.55.42.6 and 35.55.41.6; the four that dropped none went elsewhere, and the
+    /// restart that fixed it both evenings was also a change of server. Nothing recorded that until it
+    /// was dug out of the log by hand.
+    /// </para>
+    /// <para>
+    /// OBS stamps its lines with local time of day and no date, so the line is placed on the date that
+    /// puts it nearest <paramref name="now"/> without lying in the future — which handles a stream
+    /// started just before midnight and read just after.
+    /// </para>
+    /// </remarks>
+    public static string? TryReadStreamConnection(DateTimeOffset since, DateTimeOffset now, string? logDirectory = null)
+    {
+        var directory = logDirectory ?? DefaultLogDirectory();
+        if (directory is null || !Directory.Exists(directory))
+        {
+            return null;
+        }
+
+        FileInfo? newest;
+        try
+        {
+            newest = new DirectoryInfo(directory)
+                .EnumerateFiles("*.txt")
+                .MaxBy(file => file.LastWriteTimeUtc);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+
+        if (newest is null || newest.LastWriteTimeUtc < since.UtcDateTime.AddMinutes(-1))
+        {
+            return null;
+        }
+
+        return ReadLogLines(newest.FullName) is { } lines ? FindStreamConnection(lines, since, now) : null;
+    }
+
+    /// <summary>The parsing half of <see cref="TryReadStreamConnection"/>, separated for tests.</summary>
+    internal static string? FindStreamConnection(IEnumerable<string> lines, DateTimeOffset since, DateTimeOffset now, TimeZoneInfo? zone = null)
+    {
+        zone ??= TimeZoneInfo.Local;
+        var localNow = TimeZoneInfo.ConvertTime(now, zone);
+        string? found = null;
+
+        foreach (var line in lines)
+        {
+            if (ConnectionPattern.Match(line.TrimEnd('\r')) is not { Success: true } match
+                || !TimeSpan.TryParseExact(match.Groups["time"].Value, @"hh\:mm\:ss", CultureInfo.InvariantCulture, out var timeOfDay))
+            {
+                continue;
+            }
+
+            var at = AtLocal(localNow.Date + timeOfDay, zone);
+            if (at > now.AddMinutes(1))
+            {
+                at = AtLocal(localNow.Date.AddDays(-1) + timeOfDay, zone);
+            }
+
+            // A little slack before the stream was seen: the connection is made before OBS reports the
+            // output active, and the poll that noticed it can be a second or two behind.
+            if (at < since.AddMinutes(-1))
+            {
+                continue;
+            }
+
+            var host = Uri.TryCreate(match.Groups["url"].Value, UriKind.Absolute, out var uri) ? uri.Host : match.Groups["url"].Value;
+            found = match.Groups["ip"].Success ? $"{match.Groups["ip"].Value} ({host})" : host;
+        }
+
+        return found;
+    }
+
+    /// <summary>
+    /// Places a wall-clock time from the log at the offset that was in force at that time, not the one
+    /// in force now — a line from before the clocks changed is otherwise an hour out.
+    /// </summary>
+    /// <remarks>
+    /// In the hour the clocks go back the wall time occurs twice and the earlier (summer) offset is
+    /// taken; a stream connected in that hour is rare enough that the hour's ambiguity can stand.
+    /// </remarks>
+    private static DateTimeOffset AtLocal(DateTime wallClock, TimeZoneInfo zone)
+    {
+        var unspecified = DateTime.SpecifyKind(wallClock, DateTimeKind.Unspecified);
+        var offset = zone.IsAmbiguousTime(unspecified)
+            ? zone.GetAmbiguousTimeOffsets(unspecified).Max()
+            : zone.GetUtcOffset(unspecified);
+        return new DateTimeOffset(unspecified, offset);
     }
 
     /// <summary>
