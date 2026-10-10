@@ -13,8 +13,7 @@ public sealed class TrayIconService : IDisposable
     private readonly Forms.ToolStripMenuItem _showMenuItem;
     private readonly Forms.ToolStripMenuItem _startSessionMenuItem;
     private readonly Forms.ToolStripMenuItem _stopSessionMenuItem;
-    private readonly Forms.ToolStripMenuItem _markStutterMenuItem;
-    private readonly Forms.ToolStripMenuItem _markSevereMenuItem;
+    private readonly Forms.ToolStripMenuItem _markMenuItem;
     private readonly Forms.ToolStripMenuItem _exportLatestMenuItem;
     private readonly Forms.ToolStripMenuItem _checkForUpdatesMenuItem;
     private readonly Forms.ToolStripMenuItem _exitMenuItem;
@@ -25,8 +24,7 @@ public sealed class TrayIconService : IDisposable
         _showMenuItem = CreateMenuItem(Strings.TrayShowWindow, (_, _) => ShowRequested?.Invoke(this, EventArgs.Empty));
         _startSessionMenuItem = CreateMenuItem(Strings.StartSession, (_, _) => StartSessionRequested?.Invoke(this, EventArgs.Empty));
         _stopSessionMenuItem = CreateMenuItem(Strings.StopSession, (_, _) => StopSessionRequested?.Invoke(this, EventArgs.Empty));
-        _markStutterMenuItem = CreateMenuItem(Strings.MarkStutter, (_, _) => MarkStutterRequested?.Invoke(this, EventArgs.Empty));
-        _markSevereMenuItem = CreateMenuItem(Strings.MarkSevere, (_, _) => MarkSevereRequested?.Invoke(this, EventArgs.Empty));
+        _markMenuItem = CreateMenuItem(Strings.MarkStutter, (_, _) => MarkRequested?.Invoke(this, EventArgs.Empty));
         _exportLatestMenuItem = CreateMenuItem(Strings.ExportLatest, (_, _) => ExportLatestRequested?.Invoke(this, EventArgs.Empty));
         _checkForUpdatesMenuItem = CreateMenuItem(Strings.TrayCheckForUpdates, (_, _) => CheckForUpdatesRequested?.Invoke(this, EventArgs.Empty));
         _exitMenuItem = CreateMenuItem(Strings.TrayExit, (_, _) => ExitRequested?.Invoke(this, EventArgs.Empty));
@@ -37,15 +35,14 @@ public sealed class TrayIconService : IDisposable
             new Forms.ToolStripSeparator(),
             _startSessionMenuItem,
             _stopSessionMenuItem,
-            _markStutterMenuItem,
-            _markSevereMenuItem,
+            _markMenuItem,
             _exportLatestMenuItem,
             new Forms.ToolStripSeparator(),
             _checkForUpdatesMenuItem,
             _exitMenuItem,
         ]);
 
-        UpdateDiagnosticsActions(canStartSession: true, canStopSession: false, canMarkStutter: false, canMarkSevere: false, canExportLatest: false);
+        UpdateDiagnosticsActions(canStartSession: true, canStopSession: false, canMark: false, canExportLatest: false);
 
         _notifyIcon = new Forms.NotifyIcon
         {
@@ -64,9 +61,7 @@ public sealed class TrayIconService : IDisposable
 
     public event EventHandler? StopSessionRequested;
 
-    public event EventHandler? MarkStutterRequested;
-
-    public event EventHandler? MarkSevereRequested;
+    public event EventHandler? MarkRequested;
 
     public event EventHandler? ExportLatestRequested;
 
@@ -79,12 +74,11 @@ public sealed class TrayIconService : IDisposable
         _notifyIcon.ShowBalloonTip(2500, title, text, Forms.ToolTipIcon.Info);
     }
 
-    public void UpdateDiagnosticsActions(bool canStartSession, bool canStopSession, bool canMarkStutter, bool canMarkSevere, bool canExportLatest)
+    public void UpdateDiagnosticsActions(bool canStartSession, bool canStopSession, bool canMark, bool canExportLatest)
     {
         _startSessionMenuItem.Enabled = canStartSession;
         _stopSessionMenuItem.Enabled = canStopSession;
-        _markStutterMenuItem.Enabled = canMarkStutter;
-        _markSevereMenuItem.Enabled = canMarkSevere;
+        _markMenuItem.Enabled = canMark;
         _exportLatestMenuItem.Enabled = canExportLatest;
     }
 

@@ -10,6 +10,7 @@ using FiveMDiagnostics.App.Wpf.Properties;
 using FiveMDiagnostics.App.Wpf.Services;
 using FiveMDiagnostics.Collectors;
 using FiveMDiagnostics.Core;
+using FiveMDiagnostics.Export;
 using FiveMDiagnostics.Fakes;
 using FiveMDiagnostics.Integrations.PresentMon;
 
@@ -112,6 +113,16 @@ public sealed class MainWindowViewModel : ObservableObject
     private string _pacingCurrentText = string.Empty;
     private string _pacingCaptureBudgetText = string.Empty;
     private bool _hasPacingData;
+    private bool _streams;
+    private string _stutterHotkey = string.Empty;
+    private string _severeHotkey = string.Empty;
+    private string _fiveMLaunchArguments = string.Empty;
+    private SessionChoice? _selectedSession;
+    private RunningProgram? _selectedRunningProgram;
+    private bool _shareIncludeTraces;
+    private bool _shareIncludeSensitive;
+    private string _shareResultText = string.Empty;
+    private string? _lastSharedZip;
 
     public MainWindowViewModel(DiagnosticsSessionManager sessionManager, SettingsStore settingsStore, DiagnosticsSettings settings, IUserDialogService dialogService)
     {
@@ -141,6 +152,10 @@ public sealed class MainWindowViewModel : ObservableObject
         _autoSessionEnabled = settings.AutoSession;
         _captureNormalManualIncidents = settings.DeepCapture.CaptureNormalManualIncidents;
         _selectedLanguage = settings.Language;
+        _streams = settings.MeasuresStream;
+        _stutterHotkey = settings.Hotkeys.Stutter;
+        _severeHotkey = settings.Hotkeys.Severe;
+        _fiveMLaunchArguments = settings.FiveMLaunchArguments;
 
         StartSessionCommand = new AsyncRelayCommand(StartSessionAsync, () => !IsSessionActive);
         StopSessionCommand = new AsyncRelayCommand(StopSessionManuallyAsync, () => IsSessionActive);
@@ -154,13 +169,20 @@ public sealed class MainWindowViewModel : ObservableObject
         SimulateNetworkScenarioCommand = new RelayCommand(() => AddScenario(FakeScenarioKind.NetworkIssue));
         CloseAppsAndLaunchCommand = new AsyncRelayCommand(CloseAppsAndLaunchAsync, () => !_fiveMRunning && _sessionManager.ActiveProcess is null);
         ClearFiveMCacheCommand = new AsyncRelayCommand(ClearFiveMCacheAsync, () => !_fiveMRunning && _sessionManager.ActiveProcess is null);
+        RestartAsAdministratorCommand = new RelayCommand(RestartAsAdministrator, () => !IsElevated);
+        RefreshSessionsCommand = new RelayCommand(RefreshSessions);
+        ExportSessionCommand = new AsyncRelayCommand(ExportSessionAsync, () => SelectedSession is not null);
+        OpenSharedZipCommand = new RelayCommand(OpenSharedZip, () => _lastSharedZip is not null);
+        RefreshSessions();
 
-        PreLaunchApps = PreLaunch.Apps
-            .Select(app => new PreLaunchAppViewModel(
-                app,
-                settings.PreLaunchClose?.Contains(app.Name, StringComparer.OrdinalIgnoreCase) ?? app.ClosedByDefault,
-                SavePreLaunchChoice))
-            .ToArray();
+        AddRunningProgramCommand = new RelayCommand(AddRunningProgram, () => SelectedRunningProgram is not null);
+        settings.PreLaunchApps ??= [];
+        foreach (var entry in settings.PreLaunchApps)
+        {
+            PreLaunchApps.Add(NewPreLaunchRow(entry));
+        }
+
+        RefreshPreLaunchSuggestions();
         RefreshPreLaunchRunning();
 
         _sessionManager.StateChanged += OnSessionStateChanged;
@@ -198,6 +220,12 @@ public sealed class MainWindowViewModel : ObservableObject
     /// session automation acts.
     /// </summary>
     public event EventHandler<string>? TrayNoticeRequested;
+
+    /// <summary>Raised when saved settings carry hotkeys that have to be claimed again.</summary>
+    public event EventHandler? HotkeysChanged;
+
+    /// <summary>Raised when the app should close for real, such as after starting an elevated copy of itself.</summary>
+    public event EventHandler? ExitRequested;
 
     public DiagnosticsSettings Settings { get; }
 
@@ -239,7 +267,133 @@ public sealed class MainWindowViewModel : ObservableObject
 
     public AsyncRelayCommand ClearFiveMCacheCommand { get; }
 
-    public IReadOnlyList<PreLaunchAppViewModel> PreLaunchApps { get; }
+    /// <summary>The player's own list of programs the launch button can close.</summary>
+    public ObservableCollection<PreLaunchAppViewModel> PreLaunchApps { get; } = [];
+
+    /// <summary>Programs running with a window right now that are not on the list yet.</summary>
+    public ObservableCollection<RunningProgram> RunningPrograms { get; } = [];
+
+    /// <summary>Programs the previous session measured as heavy that are not on the list yet.</summary>
+    public ObservableCollection<PreLaunchSuggestionViewModel> PreLaunchSuggestions { get; } = [];
+
+    public RelayCommand AddRunningProgramCommand { get; }
+
+    public RunningProgram? SelectedRunningProgram
+    {
+        get => _selectedRunningProgram;
+        set
+        {
+            if (SetProperty(ref _selectedRunningProgram, value))
+            {
+                AddRunningProgramCommand.RaiseCanExecuteChanged();
+            }
+        }
+    }
+
+    public RelayCommand RestartAsAdministratorCommand { get; }
+
+    public RelayCommand RefreshSessionsCommand { get; }
+
+    public AsyncRelayCommand ExportSessionCommand { get; }
+
+    public RelayCommand OpenSharedZipCommand { get; }
+
+    /// <summary>Recorded sessions that can be shared, newest first.</summary>
+    public ObservableCollection<SessionChoice> Sessions { get; } = [];
+
+    public bool IsElevated => Elevation.IsElevated;
+
+    /// <summary>
+    /// Whether the player streams with OBS. Off stops OBS from being measured and hides what only
+    /// concerns a stream; it takes effect at the next session start.
+    /// </summary>
+    public bool Streams
+    {
+        get => _streams;
+        set
+        {
+            if (SetProperty(ref _streams, value))
+            {
+                Settings.Streams = value;
+            }
+        }
+    }
+
+    public string StutterHotkey
+    {
+        get => _stutterHotkey;
+        set
+        {
+            if (SetProperty(ref _stutterHotkey, value))
+            {
+                Settings.Hotkeys.Stutter = value.Trim();
+                OnPropertyChanged(nameof(HotkeyHintText));
+            }
+        }
+    }
+
+    public string SevereHotkey
+    {
+        get => _severeHotkey;
+        set
+        {
+            if (SetProperty(ref _severeHotkey, value))
+            {
+                Settings.Hotkeys.Severe = value.Trim();
+                OnPropertyChanged(nameof(HotkeyHintText));
+            }
+        }
+    }
+
+    public string HotkeyHintText => string.IsNullOrWhiteSpace(Settings.Hotkeys.Stutter)
+        ? string.Format(Strings.HotkeyHintFormat, Settings.Hotkeys.Severe)
+        : string.Format(Strings.HotkeyHintWithLightFormat, Settings.Hotkeys.Severe, Settings.Hotkeys.Stutter);
+
+    public string FiveMLaunchArguments
+    {
+        get => _fiveMLaunchArguments;
+        set
+        {
+            if (SetProperty(ref _fiveMLaunchArguments, value))
+            {
+                Settings.FiveMLaunchArguments = value;
+            }
+        }
+    }
+
+    public SessionChoice? SelectedSession
+    {
+        get => _selectedSession;
+        set
+        {
+            if (SetProperty(ref _selectedSession, value))
+            {
+                ExportSessionCommand.RaiseCanExecuteChanged();
+            }
+        }
+    }
+
+    public bool ShareIncludeTraces
+    {
+        get => _shareIncludeTraces;
+        set => SetProperty(ref _shareIncludeTraces, value);
+    }
+
+    /// <summary>
+    /// Whether this one package goes out unredacted. Not saved: a package sent without redaction must
+    /// not turn it off for the next one, or for incident exports.
+    /// </summary>
+    public bool ShareIncludeSensitive
+    {
+        get => _shareIncludeSensitive;
+        set => SetProperty(ref _shareIncludeSensitive, value);
+    }
+
+    public string ShareResultText
+    {
+        get => _shareResultText;
+        private set => SetProperty(ref _shareResultText, value);
+    }
 
     public bool IsSessionActive
     {
@@ -662,7 +816,7 @@ public sealed class MainWindowViewModel : ObservableObject
         string shortcut;
         try
         {
-            shortcut = PreLaunch.PrepareFiveMShortcut();
+            shortcut = PreLaunch.PrepareFiveMShortcut(Settings.FiveMLaunchArguments);
         }
         catch (Exception ex)
         {
@@ -670,7 +824,7 @@ public sealed class MainWindowViewModel : ObservableObject
             return;
         }
 
-        var apps = PreLaunchApps.Where(row => row.IsChecked).Select(row => row.App).ToArray();
+        var apps = PreLaunchApps.Where(row => row.IsChecked).Select(row => row.Entry).ToArray();
         var result = await Task.Run(() => PreLaunch.Close(apps)).ConfigureAwait(true);
 
         var message = string.Format(
@@ -767,9 +921,93 @@ public sealed class MainWindowViewModel : ObservableObject
 
     private static string Megabytes(long bytes) => $"{bytes / 1024d / 1024d:N0} MB";
 
+    /// <summary>Fills the add list; called when it is opened, so it shows what runs at that moment.</summary>
+    public void RefreshRunningPrograms()
+    {
+        var listed = ListedProcessNames();
+        RunningPrograms.Clear();
+        foreach (var program in PreLaunch.RunningPrograms().Where(program => !listed.Contains(program.ProcessName)))
+        {
+            RunningPrograms.Add(program);
+        }
+    }
+
+    private void AddRunningProgram()
+    {
+        if (SelectedRunningProgram is not { } program)
+        {
+            return;
+        }
+
+        AddPreLaunchApp(program.Name, program.ProcessName);
+        RunningPrograms.Remove(program);
+        SelectedRunningProgram = null;
+    }
+
+    private void AddPreLaunchApp(string name, string processName)
+    {
+        var entry = new PreLaunchAppEntry { Name = name, ProcessNames = [processName], Close = true };
+        Settings.PreLaunchApps!.Add(entry);
+        PreLaunchApps.Add(NewPreLaunchRow(entry));
+        RefreshPreLaunchSuggestions();
+        RefreshPreLaunchRunning();
+        SavePreLaunchChoice();
+    }
+
+    private void RemovePreLaunchApp(PreLaunchAppViewModel row)
+    {
+        Settings.PreLaunchApps!.Remove(row.Entry);
+        PreLaunchApps.Remove(row);
+        RefreshPreLaunchSuggestions();
+        SavePreLaunchChoice();
+    }
+
+    private PreLaunchAppViewModel NewPreLaunchRow(PreLaunchAppEntry entry) =>
+        new(entry, SavePreLaunchChoice, RemovePreLaunchApp);
+
+    /// <summary>
+    /// Offers what the previous session measured as heavy, leaving out what is already on the list.
+    /// </summary>
+    private void RefreshPreLaunchSuggestions()
+    {
+        var listed = ListedProcessNames();
+        PreLaunchSuggestions.Clear();
+        foreach (var process in HeavyProcessTally.TryLoad(Settings.WorkingDirectory)
+                     .Where(process => process.IsWorthClosing
+                         && BackgroundProgram.IsCandidate(process.ProcessName)
+                         && !listed.Contains(process.ProcessName))
+                     .Take(5))
+        {
+            var reason = string.Format(Strings.PreLaunchSuggestionReasonFormat, DescribeWeight(process));
+            PreLaunchSuggestions.Add(new PreLaunchSuggestionViewModel(
+                process,
+                reason,
+                suggestion => AddPreLaunchApp(suggestion.Name, suggestion.Process.ProcessName)));
+        }
+    }
+
+    /// <summary>The readings that made the program a suggestion, and only those.</summary>
+    private static string DescribeWeight(HeavyProcess process)
+    {
+        var parts = new List<string>(2);
+        if (process.PeakVramMegabytes >= HeavyProcess.VramWorthClosingMegabytes)
+        {
+            parts.Add(string.Format(Strings.PreLaunchSuggestionVramFormat, (process.PeakVramMegabytes / 1024).ToString("F1")));
+        }
+
+        if (process.AverageCpuPercent >= HeavyProcess.CpuWorthClosingPercent)
+        {
+            parts.Add(string.Format(Strings.PreLaunchSuggestionCpuFormat, process.AverageCpuPercent.ToString("F0")));
+        }
+
+        return string.Join(", ", parts);
+    }
+
+    private HashSet<string> ListedProcessNames() =>
+        PreLaunchApps.SelectMany(row => row.Entry.ProcessNames).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
     private async void SavePreLaunchChoice()
     {
-        Settings.PreLaunchClose = PreLaunchApps.Where(row => row.IsChecked).Select(row => row.Name).ToList();
         try
         {
             await _settingsStore.SaveAsync(Settings).ConfigureAwait(true);
@@ -786,7 +1024,7 @@ public sealed class MainWindowViewModel : ObservableObject
         var running = PreLaunch.RunningProcessNames();
         foreach (var row in PreLaunchApps)
         {
-            row.IsRunning = PreLaunch.IsRunning(row.App, running);
+            row.IsRunning = PreLaunch.IsRunning(row.Entry, running);
         }
 
         _fiveMRunning = PreLaunch.IsFiveMRunning(running);
@@ -828,6 +1066,94 @@ public sealed class MainWindowViewModel : ObservableObject
     {
         await _settingsStore.SaveAsync(Settings).ConfigureAwait(true);
         _sessionManager.Report(StatusLevel.Info, nameof(MainWindowViewModel), string.Format(Strings.SettingsSavedFormat, _settingsStore.SettingsPath));
+        HotkeysChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>
+    /// Stores the setup guide's answer and saves, so the guide is not shown again.
+    /// </summary>
+    public async Task CompleteSetupAsync(bool streams)
+    {
+        // Set on the settings directly: an unanswered question already reads as streaming, so the
+        // property sees no change for a "yes" and would leave the answer unsaved.
+        Settings.Streams = streams;
+        Streams = streams;
+        await _settingsStore.SaveAsync(Settings).ConfigureAwait(true);
+    }
+
+    private void RestartAsAdministrator()
+    {
+        if (Elevation.TryRestartElevated())
+        {
+            ExitRequested?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
+    private void RefreshSessions()
+    {
+        var previous = SelectedSession?.Session.JournalPath;
+        Sessions.Clear();
+        foreach (var session in SessionShareExporter.FindSessions(Settings.WorkingDirectory))
+        {
+            Sessions.Add(new SessionChoice(session));
+        }
+
+        SelectedSession = Sessions.FirstOrDefault(choice => choice.Session.JournalPath == previous) ?? Sessions.FirstOrDefault();
+    }
+
+    private async Task ExportSessionAsync()
+    {
+        if (SelectedSession is not { } choice)
+        {
+            return;
+        }
+
+        ShareResultText = Strings.ShareWorking;
+        try
+        {
+            var package = await SessionShareExporter.ExportAsync(
+                choice.Session,
+                Settings.ExportDirectory,
+                ShareIncludeTraces,
+                redact: !ShareIncludeSensitive,
+                extraSensitive: [Settings.ServerProfile.ProbeHost ?? string.Empty, Settings.ServerProfile.EndpointHint ?? string.Empty],
+                CancellationToken.None).ConfigureAwait(true);
+
+            _lastSharedZip = package.ZipPath;
+            var result = string.Format(Strings.ShareDoneFormat, package.Files, Megabytes(package.Bytes), package.ZipPath);
+            if (package.TracesLeftOut > 0)
+            {
+                result += " " + string.Format(Strings.ShareTracesLeftOutFormat, package.TracesLeftOut);
+            }
+
+            if (package.Unreadable.Count > 0)
+            {
+                result += " " + string.Format(Strings.ShareUnreadableFormat, string.Join(", ", package.Unreadable));
+            }
+
+            ShareResultText = result;
+            OpenSharedZip();
+        }
+        catch (Exception ex)
+        {
+            // Anything, including a mistyped export folder: an exception out of an async command would
+            // take the app down with it.
+            _lastSharedZip = null;
+            ShareResultText = string.Format(Strings.ShareFailedFormat, ex.Message);
+        }
+
+        OpenSharedZipCommand.RaiseCanExecuteChanged();
+    }
+
+    /// <summary>Shows the package selected in Explorer, ready to be dragged into a chat.</summary>
+    private void OpenSharedZip()
+    {
+        if (_lastSharedZip is not { } path || !File.Exists(path))
+        {
+            return;
+        }
+
+        using var _ = System.Diagnostics.Process.Start("explorer.exe", $"/select,\"{path}\"");
     }
 
     private async Task ImportArtifactsAsync()
@@ -1213,6 +1539,14 @@ public sealed class MainWindowViewModel : ObservableObject
     {
         var wasActive = IsSessionActive;
         IsSessionActive = _sessionManager.IsSessionActive;
+
+        // A start opens a new journal and a stop closes one, and both change what can be shared. A stop
+        // also leaves new measurements behind for the suggestions.
+        if (IsSessionActive != wasActive)
+        {
+            RefreshSessions();
+            RefreshPreLaunchSuggestions();
+        }
 
         // The banner describes the session that is running. A collector unhappy last evening has not
         // said anything about this one yet, and the same reasoning as ResetPacing below applies: the

@@ -1,26 +1,39 @@
 namespace FiveMDiagnostics.App.Wpf;
 
-using FiveMDiagnostics.App.Wpf.Services;
+using FiveMDiagnostics.Core;
 
-/// <summary>One tick box in the pre-launch list.</summary>
-public sealed class PreLaunchAppViewModel(PreLaunchApp app, bool isChecked, Action changed) : ObservableObject
+/// <summary>One program in the pre-launch list: its tick box, whether it runs, and its remove button.</summary>
+public sealed class PreLaunchAppViewModel : ObservableObject
 {
-    private bool _isChecked = isChecked;
+    private readonly Action _changed;
     private bool _isRunning;
 
-    public PreLaunchApp App { get; } = app;
+    public PreLaunchAppViewModel(PreLaunchAppEntry entry, Action changed, Action<PreLaunchAppViewModel> remove)
+    {
+        Entry = entry;
+        _changed = changed;
+        RemoveCommand = new RelayCommand(() => remove(this));
+    }
 
-    public string Name => App.Name;
+    public PreLaunchAppEntry Entry { get; }
+
+    public string Name => Entry.Name;
+
+    public RelayCommand RemoveCommand { get; }
 
     public bool IsChecked
     {
-        get => _isChecked;
+        get => Entry.Close;
         set
         {
-            if (SetProperty(ref _isChecked, value))
+            if (Entry.Close == value)
             {
-                changed();
+                return;
             }
+
+            Entry.Close = value;
+            OnPropertyChanged();
+            _changed();
         }
     }
 
@@ -29,4 +42,23 @@ public sealed class PreLaunchAppViewModel(PreLaunchApp app, bool isChecked, Acti
         get => _isRunning;
         set => SetProperty(ref _isRunning, value);
     }
+}
+
+/// <summary>A program the previous session measured as heavy, offered for the pre-launch list.</summary>
+public sealed class PreLaunchSuggestionViewModel
+{
+    public PreLaunchSuggestionViewModel(HeavyProcess process, string reason, Action<PreLaunchSuggestionViewModel> add)
+    {
+        Process = process;
+        Reason = reason;
+        AddCommand = new RelayCommand(() => add(this));
+    }
+
+    public HeavyProcess Process { get; }
+
+    public string Name => Process.ProcessName;
+
+    public string Reason { get; }
+
+    public RelayCommand AddCommand { get; }
 }

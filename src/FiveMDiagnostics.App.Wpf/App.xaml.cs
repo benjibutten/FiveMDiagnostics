@@ -1,5 +1,6 @@
 ﻿using System.Globalization;
 using System.IO;
+using System.Windows.Interop;
 using FiveMDiagnostics.Analysis;
 using FiveMDiagnostics.App.Wpf.Properties;
 using FiveMDiagnostics.App.Wpf.Services;
@@ -55,6 +56,8 @@ public partial class App : System.Windows.Application
 		// folder is still on disk and nothing else will remove it.
 		UpdateInstaller.ScheduleCleanup(e.Args);
 
+		// A restart as administrator starts while the instance that asked for it still holds the lock.
+		Elevation.WaitForPredecessor(e.Args);
 		_singleInstanceManager = new SingleInstanceManager();
 
 		if (!_singleInstanceManager.IsPrimaryInstance)
@@ -113,9 +116,30 @@ public partial class App : System.Windows.Application
 		_singleInstanceManager.StartListening();
 
 		// Started by Windows at sign-in: straight to the tray, where the session waits for FiveM.
-		if (!WindowsAutostart.IsStartArgument(e.Args))
+		var closed = false;
+		mainWindow.Closed += (_, _) => closed = true;
+
+		if (WindowsAutostart.IsStartArgument(e.Args))
+		{
+			// The hotkeys are registered against the window's handle, which a window that is never shown
+			// does not otherwise get.
+			new WindowInteropHelper(mainWindow).EnsureHandle();
+		}
+		else
 		{
 			mainWindow.Show();
+
+			// Until it has been answered once; closing the guide without an answer asks again next start.
+			if (settings.Streams is null)
+			{
+				new SetupWindow(viewModel) { Owner = mainWindow }.ShowDialog();
+			}
+		}
+
+		// The guide can restart the app as administrator, which closes this instance's window.
+		if (closed)
+		{
+			return;
 		}
 
 		// Before the evening rather than after it: a prune that ran at shutdown would compete with the

@@ -3,6 +3,7 @@ using System.Text.Json;
 
 namespace FiveMDiagnostics.App.Wpf;
 
+using FiveMDiagnostics.App.Wpf.Services;
 using FiveMDiagnostics.Core;
 
 public sealed class SettingsStore
@@ -102,6 +103,11 @@ public sealed class SettingsStore
         }
 
         if (settings.Obs.Normalize())
+        {
+            changed = true;
+        }
+
+        if (PreLaunch.MigrateList(settings))
         {
             changed = true;
         }

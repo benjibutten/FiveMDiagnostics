@@ -149,8 +149,7 @@ public static class FiveMCache
 /// </summary>
 /// <remarks>
 /// A session leaves a journal, two GPU CSVs, a PresentMon CSV and up to six deep captures behind, and the
-/// captures are around 900 MB each. An evening is therefore several gigabytes, and nothing has ever
-/// removed one — the files are copied to FindTheproblem by hand the morning after and the originals stay.
+/// captures are around 900 MB each, so an evening is several gigabytes.
 /// </remarks>
 public static class SessionArtifacts
 {
