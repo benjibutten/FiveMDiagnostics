@@ -35,6 +35,15 @@ Default redaction behavior:
 - artifact file paths are reduced to file names
 - attached artifacts are excluded unless explicitly enabled
 
+## Sharing a session
+
+The *Share* tab packages one session's journal, CSV files, the copy of FiveM's client log and any app crash
+log into a zip in the export folder. Unless *Include sensitive details* is ticked, every text file in it is
+redacted line by line: IPv4 and IPv6 addresses, the configured probe host and server endpoint (with and
+without its port), and your Windows account name where it appears in a path become `[redacted]`. Process
+names, hardware details and the analysis text are kept, because they are what the person helping you
+needs. Deep-capture traces are binary, cannot be redacted, and are only included when you tick them.
+
 ## Session journals are not redacted
 
 The session journal is written to the working directory alongside the raw PresentMon CSVs and ETL
