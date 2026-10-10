@@ -35,20 +35,19 @@
 
   <!-- App-level -->
   <data name="AppTitle" xml:space="preserve"><value>FiveM Diagnostics</value></data>
-  <data name="AppSubtitle" xml:space="preserve"><value>One-click local stutter diagnostics for FiveM. Start a session first and add extras only if you need them.</value></data>
   <data name="AlreadyRunningMessage" xml:space="preserve"><value>FiveM Diagnostics is already running, but the running window did not respond. Look for the icon in the notification area.</value></data>
   <data name="StateLabel" xml:space="preserve"><value>State:</value></data>
   <data name="ActiveProcessLabel" xml:space="preserve"><value>Active process:</value></data>
   <data name="QuickStartHeader" xml:space="preserve"><value>How it works</value></data>
-  <data name="QuickStartIntro" xml:space="preserve"><value>Start a session and play. There is no mode to pick — the app always collects system, process and network evidence.</value></data>
-  <data name="QuickStartStepOne" xml:space="preserve"><value>1. Start the session.</value></data>
-  <data name="QuickStartStepTwo" xml:space="preserve"><value>2. Mark stutter when it happens.</value></data>
-  <data name="QuickStartStepThree" xml:space="preserve"><value>3. Export the latest incident when you're done.</value></data>
-  <data name="QuickStartDeepNote" xml:space="preserve"><value>Mark severe stutter additionally starts a short WPR trace. That is automatic and requires the app to run as administrator.</value></data>
+  <data name="QuickStartIntro" xml:space="preserve"><value>Just play: the session follows FiveM, and the app marks bad frames on its own.</value></data>
+  <data name="QuickStartStepOne" xml:space="preserve"><value>1. Start FiveM, or press Start session.</value></data>
+  <data name="QuickStartStepTwo" xml:space="preserve"><value>2. Press the hotkey when it stutters.</value></data>
+  <data name="QuickStartStepThree" xml:space="preserve"><value>3. Afterwards, open Share and create a zip of the evening for whoever is helping you.</value></data>
+  <data name="QuickStartDeepNote" xml:space="preserve"><value>Marking stutter also saves a short deep capture of the seconds before, which needs administrator rights.</value></data>
   <data name="PresentMonStatusLabel" xml:space="preserve"><value>Frame telemetry</value></data>
   <data name="PresentMonStatusConfigured" xml:space="preserve"><value>PresentMon is configured. Frame telemetry will be included.</value></data>
   <data name="PresentMonStatusAutoDetected" xml:space="preserve"><value>PresentMon was found automatically. No manual path is needed.</value></data>
-  <data name="PresentMonStatusMissing" xml:space="preserve"><value>PresentMon was not found. The app still works without it; add it later under Advanced if you want deeper frame data.</value></data>
+  <data name="PresentMonStatusMissing" xml:space="preserve"><value>PresentMon was not found, so there is no frame data. It ships with the app; if it is missing, set its path under Settings.</value></data>
   <data name="CaptureFeedbackHeader" xml:space="preserve"><value>Capture status</value></data>
   <data name="CaptureFeedbackHint" xml:space="preserve"><value>When you mark stutter, the app keeps collecting for another 60 seconds before the finished incident appears in the list.</value></data>
   <data name="CaptureFeedbackSessionStarted" xml:space="preserve"><value>Session started. Waiting for PresentMon frames and the 30-second pre-buffer.</value></data>
@@ -60,7 +59,6 @@
   <!-- Controls -->
   <data name="PacingHeader" xml:space="preserve"><value>Frame pacing this session</value></data>
   <data name="PacingIdle" xml:space="preserve"><value>No frame pacing data yet. The first window closes after a minute of frames.</value></data>
-  <data name="PacingSaturatedLabel" xml:space="preserve"><value>Could not hold the frame rate:</value></data>
   <data name="PacingWorstLabel" xml:space="preserve"><value>Worst minute:</value></data>
   <data name="PacingCurrentLabel" xml:space="preserve"><value>Right now:</value></data>
   <data name="PacingCaptureBudgetLabel" xml:space="preserve"><value>Deep captures left:</value></data>
@@ -69,12 +67,11 @@
   <data name="PacingCurrentFormat" xml:space="preserve"><value>{0} — {1} fps, CPU headroom {2} ms</value></data>
   <data name="PacingCurrentNoHeadroomFormat" xml:space="preserve"><value>{0} — {1} fps</value></data>
   <data name="PacingCaptureBudgetFormat" xml:space="preserve"><value>{0} of {1}</value></data>
-  <data name="ControlsHeader" xml:space="preserve"><value>Controls</value></data>
-  <data name="SessionGroup" xml:space="preserve"><value>Quick start</value></data>
+  <data name="SessionGroup" xml:space="preserve"><value>Session</value></data>
   <data name="StartSession" xml:space="preserve"><value>Start session</value></data>
-  <data name="StopSession" xml:space="preserve"><value>Stop Session</value></data>
+  <data name="StopSession" xml:space="preserve"><value>Stop session</value></data>
   <data name="PreLaunchGroup" xml:space="preserve"><value>Before you play</value></data>
-  <data name="PreLaunchHint" xml:space="preserve"><value>Ticked apps are closed, then FiveM starts. The choice is remembered.</value></data>
+  <data name="PreLaunchHint" xml:space="preserve"><value>Ticked apps are asked to close, then FiveM starts. The choices are remembered.</value></data>
   <data name="PreLaunchRunning" xml:space="preserve"><value>running</value></data>
   <data name="PreLaunchButton" xml:space="preserve"><value>Close ticked and start FiveM</value></data>
   <data name="PreLaunchClosedFormat" xml:space="preserve"><value>Before launch {0}: closed {1}.</value></data>
@@ -95,19 +92,15 @@ Clear it?</value></data>
   <data name="CacheClearNothing" xml:space="preserve"><value>FiveM cache is already empty — nothing to clear.</value></data>
   <data name="CacheClearGameRunning" xml:space="preserve"><value>The cache cannot be cleared while FiveM is running. Close the game first.</value></data>
   <data name="SessionRetentionLabel" xml:space="preserve"><value>Keep session files for (days)</value></data>
-  <data name="SessionRetentionHint" xml:space="preserve"><value>Older journals, CSVs and deep captures are deleted at startup. A session leaves several GB behind. 0 keeps everything.</value></data>
+  <data name="SessionRetentionHint" xml:space="preserve"><value>Older journals, CSV files and deep captures are deleted at start. A session can leave several GB behind. 0 keeps everything.</value></data>
   <data name="SessionPrunedFormat" xml:space="preserve"><value>Housekeeping: {0} session file(s) older than {1} days deleted, {2} freed.</value></data>
   <data name="PreLaunchLaunchFailedFormat" xml:space="preserve"><value>FiveM could not be started: {0}</value></data>
   <data name="IncidentActionsGroup" xml:space="preserve"><value>During gameplay</value></data>
-  <data name="MarkStutter" xml:space="preserve"><value>Mark Stutter</value></data>
-  <data name="MarkSevere" xml:space="preserve"><value>Mark severe stutter</value></data>
-  <data name="DataGroup" xml:space="preserve"><value>Afterwards</value></data>
-  <data name="ExportLatest" xml:space="preserve"><value>Export Latest</value></data>
+  <data name="MarkStutter" xml:space="preserve"><value>Mark stutter</value></data>
+  <data name="ExportLatest" xml:space="preserve"><value>Export selected</value></data>
   <data name="ImportArtifacts" xml:space="preserve"><value>Add extra files</value></data>
 
   <!-- Settings -->
-  <data name="SettingsHeader" xml:space="preserve"><value>Optional setup</value></data>
-  <data name="SettingsIntro" xml:space="preserve"><value>Start with quick start. Everything below is optional and only needed for extra context or custom folders.</value></data>
   <data name="ServerProfile" xml:space="preserve"><value>Server name (optional)</value></data>
   <data name="ServerProfileHint" xml:space="preserve"><value>Only used as a label in the incident list and exports.</value></data>
   <data name="NetworkHintsHeader" xml:space="preserve"><value>Optional network hints</value></data>
@@ -128,18 +121,13 @@ Clear it?</value></data>
   <data name="AutoSessionStoppedFormat" xml:space="preserve"><value>The game has been closed for {0:F0} minutes. The session is ending by itself and the summaries are written to the journal.</value></data>
   <data name="AutoSessionStartFailedFormat" xml:space="preserve"><value>The session could not be started automatically: {0}. Start it with the button.</value></data>
   <data name="AutoSessionStopFailedFormat" xml:space="preserve"><value>The session could not be ended automatically: {0}. Stop it with the button.</value></data>
-  <data name="IncludeSensitiveFields" xml:space="preserve"><value>Include sensitive fields in export</value></data>
+  <data name="IncludeSensitiveFields" xml:space="preserve"><value>Include sensitive details (IP addresses, user name in paths)</value></data>
   <data name="IncludeAttachedArtifacts" xml:space="preserve"><value>Include attached artifacts in export</value></data>
-  <data name="SaveSettings" xml:space="preserve"><value>Save Settings</value></data>
+  <data name="SaveSettings" xml:space="preserve"><value>Save settings</value></data>
   <data name="LanguageLabel" xml:space="preserve"><value>Language</value></data>
   <data name="LanguageChangeHint" xml:space="preserve"><value>Restart the app to apply language changes.</value></data>
   <data name="EnglishLanguageName" xml:space="preserve"><value>English</value></data>
   <data name="SwedishLanguageName" xml:space="preserve"><value>Swedish</value></data>
-  <data name="TrayHeader" xml:space="preserve"><value>Tray menu</value></data>
-  <data name="TrayIntro" xml:space="preserve"><value>Right-click the tray icon to control diagnostics without reopening the window.</value></data>
-  <data name="TrayStartStop" xml:space="preserve"><value>Start or stop sessions directly from the tray.</value></data>
-  <data name="TrayMark" xml:space="preserve"><value>Mark normal or severe stutter from the tray menu while a session is active.</value></data>
-  <data name="TrayExport" xml:space="preserve"><value>Export the latest incident from the tray when you want to capture evidence quickly.</value></data>
   <data name="TrayShowWindow" xml:space="preserve"><value>Show window</value></data>
   <data name="TrayExit" xml:space="preserve"><value>Exit</value></data>
   <data name="TrayReadyMessage" xml:space="preserve"><value>Right-click the tray icon to control diagnostics.</value></data>
@@ -147,10 +135,10 @@ Clear it?</value></data>
   <data name="AppHiddenToTrayMessage" xml:space="preserve"><value>App hidden to tray. Diagnostics can keep running in the background.</value></data>
   <data name="TraySessionStartingMessage" xml:space="preserve"><value>Session starting in the background.</value></data>
   <data name="TraySessionStoppedMessage" xml:space="preserve"><value>Session stopped.</value></data>
-  <data name="TrayAutoSessionStopped" xml:space="preserve"><value>Session ended — the evening is written to the journal.</value></data>
+  <data name="TrayAutoSessionStopped" xml:space="preserve"><value>Session ended — everything is written to the journal.</value></data>
   <data name="HotkeyNoSessionMessage" xml:space="preserve"><value>Hotkey pressed, but no session is running — nothing was marked.</value></data>
-  <data name="TrayMarkStutterMessage" xml:space="preserve"><value>Stutter marked.</value></data>
-  <data name="TrayMarkSevereMessage" xml:space="preserve"><value>Severe stutter marked.</value></data>
+  <data name="TrayMarkStutterMessage" xml:space="preserve"><value>Light mark saved.</value></data>
+  <data name="TrayMarkSevereMessage" xml:space="preserve"><value>Stutter marked.</value></data>
   <data name="TrayExportStartingMessage" xml:space="preserve"><value>Exporting the latest incident.</value></data>
 
   <!-- Fake Data -->
@@ -162,22 +150,21 @@ Clear it?</value></data>
 
   <!-- Status and Incidents -->
   <data name="StatusLogHeader" xml:space="preserve"><value>Activity log</value></data>
-  <data name="RecentIncidentsHeader" xml:space="preserve"><value>Recent Incidents</value></data>
+  <data name="RecentIncidentsHeader" xml:space="preserve"><value>Recent incidents</value></data>
   <data name="MarkedColumn" xml:space="preserve"><value>Marked</value></data>
   <data name="SeverityColumn" xml:space="preserve"><value>Severity</value></data>
   <data name="ServerColumn" xml:space="preserve"><value>Server</value></data>
   <data name="SummaryColumn" xml:space="preserve"><value>Summary</value></data>
-  <data name="IncidentSummaryHeader" xml:space="preserve"><value>Incident Summary</value></data>
-  <data name="RankedHypothesesHeader" xml:space="preserve"><value>Ranked Hypotheses</value></data>
+  <data name="IncidentSummaryHeader" xml:space="preserve"><value>Incident summary</value></data>
+  <data name="RankedHypothesesHeader" xml:space="preserve"><value>Likely causes</value></data>
   <data name="TimelineHeader" xml:space="preserve"><value>Timeline</value></data>
 
   <!-- ViewModel strings -->
-  <data name="SessionActive" xml:space="preserve"><value>Session active. Collectors sample only while FiveM/GTA is running.</value></data>
   <data name="SessionWarmingUp" xml:space="preserve"><value>Collecting PresentMon pre-buffer.</value></data>
   <data name="SessionReady" xml:space="preserve"><value>Ready for incident.</value></data>
   <data name="CaptureFeedbackIncidentReady" xml:space="preserve"><value>PresentMon is delivering frames and the 30-second pre-buffer is complete. Ready for incident.</value></data>
   <data name="CaptureFeedbackWarmingFormat" xml:space="preserve"><value>Waiting for continuous PresentMon frames and pre-buffer: {0:F0}/{1:F0} seconds.</value></data>
-  <data name="CaptureNormalManualIncidents" xml:space="preserve"><value>Deep capture for normal manual markers</value></data>
+  <data name="CaptureNormalManualIncidents" xml:space="preserve"><value>Deep capture for light marks too</value></data>
   <data name="SessionIdle" xml:space="preserve"><value>Session idle.</value></data>
   <data name="SessionIdleAuto" xml:space="preserve"><value>Session idle. It starts by itself when FiveM appears.</value></data>
   <data name="SessionPostGameTail" xml:space="preserve"><value>The game closed. Measuring what the card releases.</value></data>
@@ -244,4 +231,71 @@ or download the latest release from https://github.com/benjibutten/FiveMDiagnost
   <data name="StartWithWindows" xml:space="preserve"><value>Start with Windows (in the tray)</value></data>
   <data name="StartWithWindowsFailedFormat" xml:space="preserve"><value>Starting with Windows could not be changed: {0}</value></data>
   <data name="StartWithWindowsNotElevated" xml:space="preserve"><value>Start with Windows is on, but the app is not running as administrator right now. Windows will then start it without administrator rights, and deep capture will not work. Turn the option off and on again while the app runs as administrator.</value></data>
+  <data name="NotElevatedBadge" xml:space="preserve"><value>Running without administrator rights: no deep capture.</value></data>
+  <data name="ElevatedBadge" xml:space="preserve"><value>Running as administrator</value></data>
+  <data name="RestartAsAdministrator" xml:space="preserve"><value>Restart as administrator</value></data>
+  <data name="TabOverview" xml:space="preserve"><value>Overview</value></data>
+  <data name="TabIncidents" xml:space="preserve"><value>Incidents</value></data>
+  <data name="TabShare" xml:space="preserve"><value>Share</value></data>
+  <data name="TabSettings" xml:space="preserve"><value>Settings</value></data>
+  <data name="TabAdvanced" xml:space="preserve"><value>Advanced</value></data>
+  <data name="SessionAutoHint" xml:space="preserve"><value>The session starts by itself when FiveM starts and ends ten minutes after the game closes. The buttons are for when you want to decide yourself.</value></data>
+  <data name="LiveHeader" xml:space="preserve"><value>Right now</value></data>
+  <data name="ReadinessHeader" xml:space="preserve"><value>What the app can measure</value></data>
+  <data name="ReadinessAdminLabel" xml:space="preserve"><value>Administrator rights</value></data>
+  <data name="ReadinessAdminOk" xml:space="preserve"><value>The app runs as administrator, so deep capture works.</value></data>
+  <data name="ReadinessAdminMissing" xml:space="preserve"><value>Deep capture needs administrator rights. Without them the app still measures frames, CPU, memory, VRAM and network, but cannot record what the computer was doing during a stutter.</value></data>
+  <data name="ReadinessStreamLabel" xml:space="preserve"><value>Streaming</value></data>
+  <data name="ReadinessStreamOn" xml:space="preserve"><value>You stream with OBS, so OBS and the stream are measured too. OBS's WebSocket server has to be enabled (Tools → WebSocket Server Settings).</value></data>
+  <data name="ReadinessStreamOff" xml:space="preserve"><value>You don't stream, so OBS is not measured. Change it under Settings if you start.</value></data>
+  <data name="ShareHeader" xml:space="preserve"><value>Share logs</value></data>
+  <data name="ShareIntro" xml:space="preserve"><value>Pick an evening and create a zip with everything the app recorded: the journal with every incident, the measurement files and FiveM's own log. Explorer opens with the file selected, ready to drag into Discord or attach to a ticket.</value></data>
+  <data name="ShareSessionLabel" xml:space="preserve"><value>Session</value></data>
+  <data name="ShareRefresh" xml:space="preserve"><value>Refresh</value></data>
+  <data name="ShareNoSessions" xml:space="preserve"><value>No recorded sessions yet. Play a session first.</value></data>
+  <data name="ShareRedactHint" xml:space="preserve"><value>While unticked, IP addresses and your Windows user name in file paths are replaced with [redacted].</value></data>
+  <data name="ShareIncludeTraces" xml:space="preserve"><value>Include deep captures (ETL)</value></data>
+  <data name="ShareIncludeTracesHint" xml:space="preserve"><value>Close to a gigabyte each and cannot be redacted. Only include them if the person helping you asks for them.</value></data>
+  <data name="ShareCreate" xml:space="preserve"><value>Create zip</value></data>
+  <data name="ShareShowInExplorer" xml:space="preserve"><value>Show in Explorer</value></data>
+  <data name="ShareWorking" xml:space="preserve"><value>Packing…</value></data>
+  <data name="ShareDoneFormat" xml:space="preserve"><value>{0} files, {1}: {2}</value></data>
+  <data name="ShareTracesLeftOutFormat" xml:space="preserve"><value>{0} deep captures were left out.</value></data>
+  <data name="ShareUnreadableFormat" xml:space="preserve"><value>Locked by another program and left out: {0}.</value></data>
+  <data name="ShareFailedFormat" xml:space="preserve"><value>The zip could not be created: {0}</value></data>
+  <data name="SettingsGeneralHeader" xml:space="preserve"><value>General</value></data>
+  <data name="StreamsLabel" xml:space="preserve"><value>I stream with OBS</value></data>
+  <data name="StreamsHint" xml:space="preserve"><value>Off: OBS is not measured and nothing about streaming is shown. Takes effect at the next session.</value></data>
+  <data name="HotkeysHeader" xml:space="preserve"><value>Hotkeys</value></data>
+  <data name="HotkeysHint" xml:space="preserve"><value>Works while the game has focus. Write it like F9 or Ctrl+Shift+F9. The app takes the key for itself, so pick one the game and the server don't use.</value></data>
+  <data name="HotkeyStutterLabel" xml:space="preserve"><value>Light mark</value></data>
+  <data name="HotkeySevereLabel" xml:space="preserve"><value>Mark stutter</value></data>
+  <data name="HotkeyHintFormat" xml:space="preserve"><value>Hotkey: {0} marks stutter.</value></data>
+  <data name="HotkeyNoWindow" xml:space="preserve"><value>The hotkeys could not be attached to the window.</value></data>
+  <data name="HotkeyUnparseableFormat" xml:space="preserve"><value>"{0}" is not a key the app understands. Change it under Settings.</value></data>
+  <data name="HotkeyTakenFormat" xml:space="preserve"><value>Hotkey {0} could not be registered; another app holds it. Pick another under Settings.</value></data>
+  <data name="SettingsMeasurementHeader" xml:space="preserve"><value>Measurement</value></data>
+  <data name="SettingsFiveMHeader" xml:space="preserve"><value>FiveM</value></data>
+  <data name="LaunchArgumentsLabel" xml:space="preserve"><value>FiveM launch arguments</value></data>
+  <data name="LaunchArgumentsHint" xml:space="preserve"><value>Used by the launch button on Overview. Leave empty to start FiveM as usual.</value></data>
+  <data name="SettingsPrivacyHeader" xml:space="preserve"><value>Privacy</value></data>
+  <data name="SetupTitle" xml:space="preserve"><value>Welcome to FiveM Diagnostics</value></data>
+  <data name="SetupIntro" xml:space="preserve"><value>The app measures your computer while you play FiveM, so a stutter can be traced to its cause. Answer one question and check that everything can be measured.</value></data>
+  <data name="SetupStreamQuestion" xml:space="preserve"><value>Do you stream with OBS while you play?</value></data>
+  <data name="SetupStreamYes" xml:space="preserve"><value>Yes, I stream with OBS</value></data>
+  <data name="SetupStreamNo" xml:space="preserve"><value>No</value></data>
+  <data name="SetupStreamHint" xml:space="preserve"><value>Only changes what is measured and shown. You can change it later under Settings.</value></data>
+  <data name="SetupHotkeysHint" xml:space="preserve"><value>Press it while you play when it stutters. It can be changed under Settings.</value></data>
+  <data name="SetupDone" xml:space="preserve"><value>Get started</value></data>
+  <data name="HotkeyLightHeader" xml:space="preserve"><value>Extra key: mark without a deep capture</value></data>
+  <data name="HotkeyLightHint" xml:space="preserve"><value>Records the moment without saving a deep capture. Leave it empty to not use it.</value></data>
+  <data name="HotkeyHintWithLightFormat" xml:space="preserve"><value>Hotkeys: {0} marks stutter, {1} makes a light mark without a deep capture.</value></data>
+  <data name="PreLaunchEmpty" xml:space="preserve"><value>No programs yet. Add the ones that usually run while you play, or take one of the suggestions.</value></data>
+  <data name="PreLaunchRemove" xml:space="preserve"><value>Remove from the list</value></data>
+  <data name="PreLaunchAddLabel" xml:space="preserve"><value>Add a program that is running</value></data>
+  <data name="PreLaunchAdd" xml:space="preserve"><value>Add</value></data>
+  <data name="PreLaunchSuggestionsHeader" xml:space="preserve"><value>Heavy last session</value></data>
+  <data name="PreLaunchSuggestionReasonFormat" xml:space="preserve"><value>Last session: {0}</value></data>
+  <data name="PreLaunchSuggestionVramFormat" xml:space="preserve"><value>{0} GB of VRAM</value></data>
+  <data name="PreLaunchSuggestionCpuFormat" xml:space="preserve"><value>{0} % of the CPU on average</value></data>
 </root>

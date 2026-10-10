@@ -4,10 +4,16 @@ using System.IO;
 
 namespace FiveMDiagnostics.App.Wpf.Services;
 
-/// <summary>An app that can be closed before FiveM starts, and every process name it runs under.</summary>
-public sealed record PreLaunchApp(string Name, string[] ProcessNames, bool ClosedByDefault);
+using FiveMDiagnostics.Core;
+
+/// <summary>A program on the starter list, and whether a settings file without a choice had it ticked.</summary>
+public sealed record PreLaunchStarterApp(string Name, string[] ProcessNames, bool TickedWhenUnset);
 
 public sealed record PreLaunchResult(IReadOnlyList<string> Closed, IReadOnlyList<string> Failed);
+
+/// <summary>A program running with a window, as the add list offers it.</summary>
+/// <param name="Name">The program's own description when it has one, otherwise its process name.</param>
+public sealed record RunningProgram(string Name, string ProcessName);
 
 /// <summary>
 /// Closes the apps that should not be running with the game, then starts FiveM.
@@ -15,32 +21,24 @@ public sealed record PreLaunchResult(IReadOnlyList<string> Closed, IReadOnlyList
 public static class PreLaunch
 {
     /// <summary>
-    /// Everything the session logs have shown running beside the game that is not part of the stream
-    /// or the voice chain. OBS, StreamDeck, TwitchOverlayHelper, MicMixer (the test build included) and
-    /// Discord are left off on purpose: closing them breaks the evening rather than cleaning it.
+    /// The list a settings file without its own list is given. A new install starts with an empty list
+    /// and builds its own from the programs it runs and the suggestions.
     /// </summary>
-    /// <remarks>
-    /// Ticked by default are the ones the notes have held against an evening: Steam's client in the
-    /// 09-12 crash, OneDrive's sync on the CPU, Voicemod starting mid-game on 09-11, and the idle apps
-    /// holding VRAM. Browsers and Spotify are listed but left for the user.
-    /// </remarks>
-    public static IReadOnlyList<PreLaunchApp> Apps { get; } =
+    public static IReadOnlyList<PreLaunchStarterApp> StarterApps { get; } =
     [
-        new("Steam", ["steam", "steamwebhelper", "steamservice"], true),
-        new("OneDrive", ["OneDrive", "OneDrive.Sync.Service"], true),
-        new("Voicemod", ["Voicemod"], true),
-        new("ChatGPT", ["ChatGPT"], true),
-        new("Photos", ["Photos"], true),
-        new("Movies & TV", ["Video.UI"], true),
-        new("Chrome", ["chrome"], false),
-        new("Edge", ["msedge"], false),
-        new("Spotify", ["Spotify"], false),
+        new("Steam", ["steam", "steamwebhelper", "steamservice"], TickedWhenUnset: true),
+        new("OneDrive", ["OneDrive", "OneDrive.Sync.Service"], TickedWhenUnset: true),
+        new("Voicemod", ["Voicemod"], TickedWhenUnset: true),
+        new("ChatGPT", ["ChatGPT"], TickedWhenUnset: true),
+        new("Photos", ["Photos"], TickedWhenUnset: true),
+        new("Movies & TV", ["Video.UI"], TickedWhenUnset: true),
+        new("Chrome", ["chrome"], TickedWhenUnset: false),
+        new("Edge", ["msedge"], TickedWhenUnset: false),
+        new("Spotify", ["Spotify"], TickedWhenUnset: false),
     ];
 
     public static string FiveMPath { get; } =
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FiveM", "FiveM.exe");
-
-    private const string FiveMArguments = "-pure_1";
 
     public static HashSet<string> RunningProcessNames()
     {
@@ -58,8 +56,82 @@ public static class PreLaunch
         return names;
     }
 
-    public static bool IsRunning(PreLaunchApp app, HashSet<string> runningNames) =>
+    public static bool IsRunning(PreLaunchAppEntry app, HashSet<string> runningNames) =>
         app.ProcessNames.Any(runningNames.Contains);
+
+    /// <summary>
+    /// Gives a settings file without its own list one built from <see cref="StarterApps"/>, ticked as
+    /// <see cref="DiagnosticsSettings.PreLaunchClose"/> says, and clears that field.
+    /// </summary>
+    /// <returns>Whether the settings changed and should be saved.</returns>
+    public static bool MigrateList(DiagnosticsSettings settings)
+    {
+        if (settings.PreLaunchApps is not null)
+        {
+            return false;
+        }
+
+        settings.PreLaunchApps = StarterApps
+            .Select(app => new PreLaunchAppEntry
+            {
+                Name = app.Name,
+                ProcessNames = [.. app.ProcessNames],
+                Close = settings.PreLaunchClose?.Contains(app.Name, StringComparer.OrdinalIgnoreCase) ?? app.TickedWhenUnset,
+            })
+            .ToList();
+        settings.PreLaunchClose = null;
+        return true;
+    }
+
+    /// <summary>
+    /// Programs running with a visible window that the player could close, one per process name, by name.
+    /// </summary>
+    public static IReadOnlyList<RunningProgram> RunningPrograms()
+    {
+        var programs = new Dictionary<string, RunningProgram>(StringComparer.OrdinalIgnoreCase);
+        foreach (var process in Process.GetProcesses())
+        {
+            try
+            {
+                if (NameOf(process) is not { } name
+                    || programs.ContainsKey(name)
+                    || !BackgroundProgram.IsCandidate(name)
+                    || process.MainWindowHandle == 0)
+                {
+                    continue;
+                }
+
+                programs[name] = new RunningProgram(DescriptionOf(process) ?? name, name);
+            }
+            catch (InvalidOperationException)
+            {
+                // Exited while being looked at.
+            }
+            finally
+            {
+                process.Dispose();
+            }
+        }
+
+        return programs.Values.OrderBy(program => program.Name, StringComparer.CurrentCultureIgnoreCase).ToArray();
+    }
+
+    /// <summary>
+    /// The executable's own description ("Spotify", "Google Chrome"). Null when it has none or cannot be
+    /// read, which is the case for a process running as administrator when this app is not.
+    /// </summary>
+    private static string? DescriptionOf(Process process)
+    {
+        try
+        {
+            var description = process.MainModule?.FileVersionInfo.FileDescription;
+            return string.IsNullOrWhiteSpace(description) ? null : description.Trim();
+        }
+        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or NotSupportedException)
+        {
+            return null;
+        }
+    }
 
     /// <summary>
     /// Whether any part of FiveM is up: the launcher, the game, or one of its helpers. The session's
@@ -69,8 +141,11 @@ public static class PreLaunch
         runningNames.Any(name => name.Equals("FiveM", StringComparison.OrdinalIgnoreCase)
             || name.StartsWith("FiveM_", StringComparison.OrdinalIgnoreCase));
 
-    /// <summary>Kills every process of the given apps and waits for them to be gone.</summary>
-    public static PreLaunchResult Close(IReadOnlyList<PreLaunchApp> apps)
+    /// <summary>
+    /// Closes every process of the given apps, asking a windowed process to close before killing it, and
+    /// waits for them to be gone.
+    /// </summary>
+    public static PreLaunchResult Close(IReadOnlyList<PreLaunchAppEntry> apps)
     {
         var closed = new List<string>();
         var failed = new List<string>();
@@ -88,8 +163,8 @@ public static class PreLaunch
                     continue;
                 }
 
-                // Count rather than All, which would stop killing at the first process that refuses.
-                (matching.Count(Kill) == matching.Length ? closed : failed).Add(app.Name);
+                // Count rather than All, which would stop at the first process that refuses.
+                (matching.Count(CloseOrKill) == matching.Length ? closed : failed).Add(app.Name);
             }
         }
         finally
@@ -113,8 +188,9 @@ public static class PreLaunch
     /// elevation, and a game running as administrator is a different evening from the ones it is
     /// compared against. A shortcut because Explorer passes no arguments to an exe it opens.
     /// </remarks>
+    /// <param name="arguments">Command-line arguments FiveM is started with; empty for none.</param>
     /// <returns>The shortcut to hand to <see cref="StartFiveM"/>.</returns>
-    public static string PrepareFiveMShortcut()
+    public static string PrepareFiveMShortcut(string arguments)
     {
         if (!File.Exists(FiveMPath))
         {
@@ -127,7 +203,7 @@ public static class PreLaunch
         dynamic shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell", throwOnError: true)!)!;
         var shortcut = shell.CreateShortcut(shortcutPath);
         shortcut.TargetPath = FiveMPath;
-        shortcut.Arguments = FiveMArguments;
+        shortcut.Arguments = arguments.Trim();
         shortcut.WorkingDirectory = Path.GetDirectoryName(FiveMPath);
         shortcut.Save();
 
@@ -139,10 +215,16 @@ public static class PreLaunch
         using var _ = Process.Start(new ProcessStartInfo("explorer.exe", $"\"{shortcutPath}\"") { UseShellExecute = false });
     }
 
-    private static bool Kill(Process process)
+    private static bool CloseOrKill(Process process)
     {
         try
         {
+            // A window that is asked first gets to save; one that has none, like a tray app, is killed.
+            if (process.CloseMainWindow() && process.WaitForExit(TimeSpan.FromSeconds(3)))
+            {
+                return true;
+            }
+
             process.Kill();
             return process.WaitForExit(TimeSpan.FromSeconds(5));
         }

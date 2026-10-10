@@ -86,6 +86,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
     /// <summary>What the previous session saw, read once at session start.</summary>
     private IReadOnlySet<string> _previousSessionProcessNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private HeavyProcessTally? _heavyProcesses;
     private DisplayCadenceMonitor? _displayCadence;
     private CaptureCostMonitor? _captureCost;
     private DeepCaptureLedger? _captureLedger;
@@ -460,9 +461,9 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _captureCost = new CaptureCostMonitor(_hitchThreshold);
             _captureLedger = new DeepCaptureLedger();
             _neighbourCpu = new NeighbourCpuTrendMonitor();
-            _obsVram = new ObsVramFootprintMonitor();
+            _obsVram = _settings.MeasuresStream ? new ObsVramFootprintMonitor() : null;
             _vramAccounting = new VramAccountingMonitor();
-            _vramBudget = new VramBudgetMonitor();
+            _vramBudget = new VramBudgetMonitor(_settings.MeasuresStream);
             _vramPressure = new VramPressureBandMonitor(_hitchThreshold);
             _postGameVram = new PostGameVramRelease();
             _slowFrameWaits = new SlowFrameWaitProfile();
@@ -476,6 +477,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _halfHourBreakdown = new HalfHourBreakdownMonitor(_hitchThreshold);
             _processNamesThisSession = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             _previousSessionProcessNames = PreviousSessionProcessLog.TryLoad(_settings.WorkingDirectory);
+            _heavyProcesses = new HeavyProcessTally();
             _previousSessionResources = PreviousSessionResourceLog.TryLoad(_settings.WorkingDirectory);
             _resourcesThisSession = [];
             _previousSessionTimeouts = PreviousSessionModelTimeoutLog.TryLoad(_settings.WorkingDirectory);
@@ -1416,6 +1418,12 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         if (_processNamesThisSession.Count > 0)
         {
             PreviousSessionProcessLog.Save(_settings.WorkingDirectory, _processNamesThisSession);
+        }
+
+        // Same rule: an empty tally would wipe the previous session's suggestions.
+        if (_heavyProcesses?.Results() is { Count: > 0 } heavy)
+        {
+            HeavyProcessTally.Save(_settings.WorkingDirectory, heavy);
         }
     }
 
@@ -2614,6 +2622,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _processNamesThisSession.Add(process.ProcessName);
         }
 
+        _heavyProcesses?.Observe(sample);
+
         if (_liveVram?.Observe(sample) is not { } snapshot)
         {
             return;
@@ -2679,6 +2689,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                     // this path had a cadence of its own that started in the same second and wrote the
                     // same sentence a second later, all evening.
                     _systemMemory?.Observe(systemSample);
+                    _heavyProcesses?.Observe(systemSample);
                     _diskLatency?.Observe(systemSample.Timestamp, systemSample.WorstDiskInstance, systemSample.DiskAverageLatencyMs);
                     SystemTelemetryUpdated?.Invoke(this, systemSample);
                 }
@@ -3014,9 +3025,9 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// says whether OBS was.
     /// </summary>
     /// <remarks>
-    /// The crash of 2026-09-12 had Steam's client loaded in the game, and closing Steam is the evening's
-    /// one change. Asked when the game appears rather than once at session start: the session outlives a
-    /// relaunch, and it is the state at launch that decides what FiveM loads.
+    /// A crash dump says whether Steam's client was loaded, and this is the same fact for an evening that
+    /// did not crash, so the two can be compared. Asked when the game appears rather than once at session
+    /// start: the session outlives a relaunch, and it is the state at launch that decides what FiveM loads.
     /// </remarks>
     private void ReportSteam(int gameProcessId)
     {
@@ -3030,11 +3041,9 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         if (running)
         {
             Report(
-                StatusLevel.Warning,
+                StatusLevel.Info,
                 "Steam",
-                $"Steam körs: steam.exe fanns när spelet (PID {gameProcessId}) hittades. FiveM laddar då in Steams "
-                + "klient, och det är den kombination som hör till den kända kraschen i citizen-devtools.dll "
-                + "efter ungefär 20 minuter.");
+                $"Steam körs: steam.exe fanns när spelet (PID {gameProcessId}) hittades, så FiveM laddar in Steams klient.");
             return;
         }
 

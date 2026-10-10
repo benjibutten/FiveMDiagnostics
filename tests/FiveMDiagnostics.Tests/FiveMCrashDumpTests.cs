@@ -28,7 +28,7 @@ public sealed class FiveMCrashDumpTests : IDisposable
     }
 
     [Fact]
-    public void TheWatchdogCrashWithSteamLoadedReadsAsTheNoteWroteIt()
+    public void TheWatchdogCrashWithSteamLoadedNamesTheWatchdogAndSteam()
     {
         var dump = MinidumpReader.Read(new MemoryStream(Dump(steamLoaded: true)), "3ab0bc5b.dmp");
 
@@ -40,16 +40,16 @@ public sealed class FiveMCrashDumpTests : IDisposable
         Assert.Contains("20 min efter start", line, StringComparison.Ordinal);
         Assert.Contains("skrivning till 0xDEED", line, StringComparison.Ordinal);
         Assert.Contains("\"Window Watchdog\"", line, StringComparison.Ordinal);
-        Assert.Contains("den kända Steam-kapplöpningen; Steam var inladdat", line, StringComparison.Ordinal);
+        Assert.Contains("FiveM:s watchdog", line, StringComparison.Ordinal);
+        Assert.Contains("Steam var inladdat", line, StringComparison.Ordinal);
     }
 
-    /// <summary>The question the next evening is judged on, so the answer has to read differently.</summary>
     [Fact]
-    public void TheSameCrashWithoutSteamSaysTheSteamExplanationDoesNotApply()
+    public void TheSameCrashWithoutSteamSaysSteamWasNotLoaded()
     {
         var dump = MinidumpReader.Read(new MemoryStream(Dump(steamLoaded: false)), "next.dmp");
 
-        Assert.Contains("Steam-förklaringen gäller inte", dump!.Describe(Crashed), StringComparison.Ordinal);
+        Assert.Contains("Steam var inte inladdat", dump!.Describe(Crashed), StringComparison.Ordinal);
     }
 
     /// <summary>

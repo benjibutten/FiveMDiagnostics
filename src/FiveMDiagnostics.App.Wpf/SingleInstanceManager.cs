@@ -12,15 +12,24 @@ public sealed class SingleInstanceManager : IAsyncDisposable
     private const string ActivationMessage = "ACTIVATE";
     private const int AllowAnyProcess = -1;
 
-    private readonly Mutex _mutex;
+    private readonly Mutex? _mutex;
     private readonly CancellationTokenSource _shutdown = new();
     private Task? _listenTask;
     private bool _released;
 
     public SingleInstanceManager()
     {
-        _mutex = new Mutex(true, MutexName, out var createdNew);
-        IsPrimaryInstance = createdNew;
+        try
+        {
+            _mutex = new Mutex(true, MutexName, out var createdNew);
+            IsPrimaryInstance = createdNew;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // The mutex exists but belongs to an instance running as administrator, whose security
+            // descriptor shuts this unelevated one out. That is still another instance.
+            IsPrimaryInstance = false;
+        }
     }
 
     public bool IsPrimaryInstance { get; }
@@ -81,11 +90,11 @@ public sealed class SingleInstanceManager : IAsyncDisposable
 
         if (IsPrimaryInstance && !_released)
         {
-            _mutex.ReleaseMutex();
+            _mutex!.ReleaseMutex();
             _released = true;
         }
 
-        _mutex.Dispose();
+        _mutex?.Dispose();
     }
 
     [DllImport("user32.dll", SetLastError = true)]

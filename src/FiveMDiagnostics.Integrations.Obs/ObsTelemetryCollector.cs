@@ -54,6 +54,13 @@ public sealed class ObsTelemetryCollector : ITelemetryCollector, IDisposable
 
     public async Task RunAsync(CollectorContext context, CancellationToken cancellationToken)
     {
+        // Before the try: its finally writes the log fallback and the stream totals, which are about a
+        // stream this player does not have.
+        if (!context.Settings.MeasuresStream)
+        {
+            return;
+        }
+
         var sessionStart = context.UtcNow();
         var everConnected = false;
 

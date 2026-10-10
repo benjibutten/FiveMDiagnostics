@@ -36,17 +36,17 @@ public partial class MainWindow : Window
         _trayIconService.ShowRequested += (_, _) => RestoreFromTray();
         _trayIconService.StartSessionRequested += (_, _) => ExecuteTrayCommand(_viewModel.StartSessionCommand, Strings.TraySessionStartingMessage);
         _trayIconService.StopSessionRequested += (_, _) => ExecuteTrayCommand(_viewModel.StopSessionCommand, Strings.TraySessionStoppedMessage);
-        _trayIconService.MarkStutterRequested += (_, _) => ExecuteTrayCommand(_viewModel.MarkStutterCommand, Strings.TrayMarkStutterMessage);
-        _trayIconService.MarkSevereRequested += (_, _) => ExecuteTrayCommand(_viewModel.MarkSevereStutterCommand, Strings.TrayMarkSevereMessage);
+        _trayIconService.MarkRequested += (_, _) => ExecuteTrayCommand(_viewModel.MarkSevereStutterCommand, Strings.TrayMarkSevereMessage);
         _trayIconService.ExportLatestRequested += (_, _) => ExecuteTrayCommand(_viewModel.ExportSelectedIncidentCommand, Strings.TrayExportStartingMessage);
         _trayIconService.CheckForUpdatesRequested += async (_, _) => await UpdateCoordinator.CheckAsync(this, manual: true);
         _trayIconService.ExitRequested += (_, _) => ExitApplication();
 
         _viewModel.TrayNoticeRequested += OnTrayNoticeRequested;
+        _viewModel.HotkeysChanged += OnHotkeysChanged;
+        _viewModel.ExitRequested += OnExitRequested;
 
         _viewModel.StartSessionCommand.CanExecuteChanged += OnCommandAvailabilityChanged;
         _viewModel.StopSessionCommand.CanExecuteChanged += OnCommandAvailabilityChanged;
-        _viewModel.MarkStutterCommand.CanExecuteChanged += OnCommandAvailabilityChanged;
         _viewModel.MarkSevereStutterCommand.CanExecuteChanged += OnCommandAvailabilityChanged;
         _viewModel.ExportSelectedIncidentCommand.CanExecuteChanged += OnCommandAvailabilityChanged;
     }
@@ -69,8 +69,21 @@ public partial class MainWindow : Window
 
     private void OnSourceInitialized(object? sender, EventArgs e)
     {
-        _hotkeys.Register(new WindowInteropHelper(this).Handle);
+        _hotkeys.Register(new WindowInteropHelper(this).Handle, _viewModel.Settings.Hotkeys);
     }
+
+    private void OnHotkeysChanged(object? sender, EventArgs e)
+    {
+        _hotkeys.Register(new WindowInteropHelper(this).Handle, _viewModel.Settings.Hotkeys);
+        if (_hotkeys.RegistrationProblem is { } problem)
+        {
+            _trayIconService.ShowBalloon(Strings.AppTitle, problem);
+        }
+    }
+
+    private void OnExitRequested(object? sender, EventArgs e) => ExitApplication();
+
+    private void OnRunningProgramsDropDownOpened(object? sender, EventArgs e) => _viewModel.RefreshRunningPrograms();
 
     private void OnHotkeyPressed(object? sender, HotkeyMark mark)
     {
@@ -79,8 +92,8 @@ public partial class MainWindow : Window
 
         if (!command.CanExecute(null))
         {
-            // Pressed with no session running. Worth a word: the key is on a stream deck, out of sight
-            // of the app, and the only feedback that the press did nothing is this.
+            // Pressed with no session running. Worth a word: the game has focus, the app is out of sight,
+            // and the only feedback that the press did nothing is this.
             _trayIconService.ShowBalloon(Strings.AppTitle, Strings.HotkeyNoSessionMessage);
             return;
         }
@@ -113,9 +126,10 @@ public partial class MainWindow : Window
     private void OnClosed(object? sender, EventArgs e)
     {
         _viewModel.TrayNoticeRequested -= OnTrayNoticeRequested;
+        _viewModel.HotkeysChanged -= OnHotkeysChanged;
+        _viewModel.ExitRequested -= OnExitRequested;
         _viewModel.StartSessionCommand.CanExecuteChanged -= OnCommandAvailabilityChanged;
         _viewModel.StopSessionCommand.CanExecuteChanged -= OnCommandAvailabilityChanged;
-        _viewModel.MarkStutterCommand.CanExecuteChanged -= OnCommandAvailabilityChanged;
         _viewModel.MarkSevereStutterCommand.CanExecuteChanged -= OnCommandAvailabilityChanged;
         _viewModel.ExportSelectedIncidentCommand.CanExecuteChanged -= OnCommandAvailabilityChanged;
         _hotkeys.Pressed -= OnHotkeyPressed;
@@ -184,7 +198,6 @@ public partial class MainWindow : Window
         _trayIconService.UpdateDiagnosticsActions(
             _viewModel.StartSessionCommand.CanExecute(null),
             _viewModel.StopSessionCommand.CanExecute(null),
-            _viewModel.MarkStutterCommand.CanExecute(null),
             _viewModel.MarkSevereStutterCommand.CanExecute(null),
             _viewModel.ExportSelectedIncidentCommand.CanExecute(null));
     }

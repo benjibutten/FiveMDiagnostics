@@ -13,8 +13,28 @@ public static class PresentMonLocator
 {
     private const string ExecutableName = "PresentMon.exe";
 
+    /// <summary>
+    /// Finds PresentMon: the configured path, then the copy shipped beside the app, then PATH and the
+    /// usual install folders.
+    /// </summary>
+    /// <remarks>
+    /// The shipped copy goes ahead of PATH because it is the version the CSV parser is verified
+    /// against; an older PresentMon elsewhere on the machine would produce a different column scheme.
+    /// </remarks>
     public static PresentMonDiscoveryResult Discover(string? configuredPath)
     {
+        var configured = Discover(configuredPath, null, []);
+        if (configured.Kind == PresentMonDiscoveryKind.Configured)
+        {
+            return configured;
+        }
+
+        var bundled = Path.Combine(AppContext.BaseDirectory, ExecutableName);
+        if (File.Exists(bundled))
+        {
+            return new PresentMonDiscoveryResult(bundled, PresentMonDiscoveryKind.AutoDetected);
+        }
+
         return Discover(configuredPath, Environment.GetEnvironmentVariable("PATH"), GetDefaultSearchPaths());
     }
 

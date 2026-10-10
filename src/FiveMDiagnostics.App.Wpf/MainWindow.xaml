@@ -6,60 +6,75 @@
         xmlns:props="clr-namespace:FiveMDiagnostics.App.Wpf.Properties"
         mc:Ignorable="d"
         Title="{x:Static props:Strings.AppTitle}"
-        Height="920"
-        Width="1500"
-        MinHeight="720"
-        MinWidth="1160"
+        Height="860"
+        Width="1280"
+        MinHeight="640"
+        MinWidth="980"
         WindowStartupLocation="CenterScreen"
-        Background="#0A1218"
+        Background="{StaticResource ShellBrush}"
         FontFamily="Bahnschrift SemiCondensed"
         Icon="AppIcon.ico">
     <Window.Resources>
-        <SolidColorBrush x:Key="ShellBrush" Color="#0A1218" />
-        <SolidColorBrush x:Key="PanelBrush" Color="#13202A" />
-        <SolidColorBrush x:Key="PanelAltBrush" Color="#162736" />
-        <SolidColorBrush x:Key="AccentBrush" Color="#7CD6C2" />
-        <SolidColorBrush x:Key="AccentMutedBrush" Color="#D6A05B" />
-        <SolidColorBrush x:Key="TextPrimaryBrush" Color="#F4F8FB" />
-        <SolidColorBrush x:Key="TextMutedBrush" Color="#9DB2C5" />
-
-        <Style TargetType="Border" x:Key="PanelStyle">
-            <Setter Property="CornerRadius" Value="18" />
-            <Setter Property="Padding" Value="18" />
-            <Setter Property="Margin" Value="0,0,0,14" />
-            <Setter Property="Background" Value="{StaticResource PanelBrush}" />
-            <Setter Property="BorderBrush" Value="#1E3343" />
-            <Setter Property="BorderThickness" Value="1" />
+        <!-- Shown only while the app runs without administrator rights. -->
+        <Style x:Key="NotElevatedOnly" TargetType="FrameworkElement">
+            <Setter Property="Visibility" Value="Collapsed" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsElevated}" Value="False">
+                    <Setter Property="Visibility" Value="Visible" />
+                </DataTrigger>
+            </Style.Triggers>
         </Style>
 
-        <Style TargetType="TextBlock" x:Key="SubHeaderStyle">
-            <Setter Property="FontSize" Value="14" />
-            <Setter Property="FontWeight" Value="SemiBold" />
-            <Setter Property="Foreground" Value="{StaticResource AccentMutedBrush}" />
-            <Setter Property="Margin" Value="0,14,0,6" />
+        <Style x:Key="ElevatedOnly" TargetType="FrameworkElement">
+            <Setter Property="Visibility" Value="Collapsed" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsElevated}" Value="True">
+                    <Setter Property="Visibility" Value="Visible" />
+                </DataTrigger>
+            </Style.Triggers>
         </Style>
 
-        <Style TargetType="TextBlock" x:Key="FieldHintStyle">
-            <Setter Property="FontSize" Value="12" />
+        <Style x:Key="PacingRow" TargetType="StackPanel">
+            <Setter Property="Orientation" Value="Horizontal" />
+            <Setter Property="Margin" Value="0,4,0,0" />
+            <Setter Property="Visibility" Value="Collapsed" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding HasPacingData}" Value="True">
+                    <Setter Property="Visibility" Value="Visible" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <!-- A small borderless button for removing a row; the label colour comes from Foreground. -->
+        <Style x:Key="RemoveButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Background" Value="Transparent" />
             <Setter Property="Foreground" Value="{StaticResource TextMutedBrush}" />
-            <Setter Property="TextWrapping" Value="Wrap" />
-            <Setter Property="Margin" Value="0,-4,0,10" />
+            <Setter Property="Padding" Value="8,2" />
+            <Setter Property="Margin" Value="0" />
+            <Setter Property="FontSize" Value="13" />
+            <Setter Property="VerticalAlignment" Value="Center" />
         </Style>
 
+        <Style x:Key="LiveLabel" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{StaticResource TextMutedBrush}" />
+            <Setter Property="Width" Value="110" />
+        </Style>
     </Window.Resources>
 
     <Grid Margin="20">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
-        <Border Grid.Row="0" Padding="24" CornerRadius="24" Margin="0,0,0,18">
+        <!-- Header: what the app is doing right now, and whether it can measure everything. -->
+        <Border Grid.Row="0" Padding="20,16" CornerRadius="16">
             <Border.Background>
                 <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
                     <GradientStop Color="#12324A" Offset="0" />
-                    <GradientStop Color="#1B5675" Offset="0.56" />
-                    <GradientStop Color="#7CD6C2" Offset="1" />
+                    <GradientStop Color="#1B5675" Offset="0.7" />
+                    <GradientStop Color="#236468" Offset="1" />
                 </LinearGradientBrush>
             </Border.Background>
             <Grid>
@@ -69,329 +84,613 @@
                 </Grid.ColumnDefinitions>
 
                 <StackPanel>
-                    <TextBlock Text="{x:Static props:Strings.AppTitle}" FontSize="34" FontWeight="Bold" Foreground="#F4F8FB" />
-                    <TextBlock Text="{x:Static props:Strings.AppSubtitle}" Foreground="#DBE9F4" FontSize="16" Margin="0,6,0,12" />
-                    <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="{x:Static props:Strings.AppTitle}" FontSize="28" FontWeight="Bold" />
+                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
                         <TextBlock Text="{x:Static props:Strings.StateLabel}" Foreground="#EAF4FB" FontWeight="SemiBold" />
                         <TextBlock Text="{Binding SessionStateText}" Foreground="#EAF4FB" Margin="4,0,0,0" />
                         <TextBlock Text="{x:Static props:Strings.ActiveProcessLabel}" Foreground="#EAF4FB" FontWeight="SemiBold" Margin="20,0,0,0" />
                         <TextBlock Text="{Binding ActiveProcessText}" Foreground="#EAF4FB" Margin="4,0,0,0" />
-                        <TextBlock Text="{x:Static props:Strings.LiveCpuLabel}" Foreground="#EAF4FB" FontWeight="SemiBold" Margin="20,0,0,0" />
-                        <TextBlock Text="{Binding LiveCpuText}" Foreground="#EAF4FB" Margin="4,0,0,0" />
-                        <TextBlock Text="{x:Static props:Strings.LiveMemoryLabel}" Foreground="#EAF4FB" FontWeight="SemiBold" Margin="20,0,0,0" />
-                        <TextBlock Text="{Binding LiveMemoryText}" Foreground="#EAF4FB" Margin="4,0,0,0" />
-                        <TextBlock Text="{x:Static props:Strings.LiveVramLabel}" Foreground="#EAF4FB" FontWeight="SemiBold" Margin="20,0,0,0" />
-                        <TextBlock Text="{Binding LiveVramText}" Foreground="#EAF4FB" Margin="4,0,0,0" />
-                        <TextBlock Text="{x:Static props:Strings.LiveVramOwnersLabel}" Foreground="#EAF4FB" FontWeight="SemiBold" Margin="20,0,0,0" />
-                        <TextBlock Text="{Binding LiveVramOwnersText}" Foreground="#EAF4FB" Margin="4,0,0,0" />
                     </StackPanel>
-
-                    <!-- A collector that cannot measure has to say so where the user is looking, not
-                         only in a status list that scrolls. The OBS WebSocket was down for a whole
-                         session and the missing render-lag data was discovered the next day. -->
-                    <Border Background="#4A2A1E" BorderBrush="#D96C47" BorderThickness="1" CornerRadius="12"
-                            Padding="12" Margin="0,12,0,0" MaxWidth="900" HorizontalAlignment="Left">
-                        <Border.Style>
-                            <Style TargetType="Border">
-                                <Setter Property="Visibility" Value="Collapsed" />
-                                <Style.Triggers>
-                                    <DataTrigger Binding="{Binding HasSessionAlerts}" Value="True">
-                                        <Setter Property="Visibility" Value="Visible" />
-                                    </DataTrigger>
-                                </Style.Triggers>
-                            </Style>
-                        </Border.Style>
-                        <StackPanel>
-                            <TextBlock Text="{x:Static props:Strings.SessionAlertsHeader}" Foreground="#FFD9C8" FontWeight="SemiBold" />
-                            <TextBlock Text="{Binding SessionAlertsText}" Foreground="#F4E4DC" TextWrapping="Wrap" Margin="0,6,0,0" />
-                        </StackPanel>
-                    </Border>
                 </StackPanel>
 
-                <Border Grid.Column="1" Background="#0F1A22" CornerRadius="16" Padding="16" Width="360">
-                    <StackPanel>
-                        <TextBlock Text="{x:Static props:Strings.QuickStartHeader}" FontSize="20" FontWeight="Bold" />
-                        <TextBlock Text="{x:Static props:Strings.QuickStartIntro}" Foreground="#DBE9F4" TextWrapping="Wrap" Margin="0,8,0,8" />
-                        <TextBlock Text="{x:Static props:Strings.QuickStartStepOne}" Foreground="{StaticResource AccentBrush}" FontWeight="SemiBold" Margin="0,4,0,0" />
-                        <TextBlock Text="{x:Static props:Strings.QuickStartStepTwo}" Foreground="#DBE9F4" TextWrapping="Wrap" Margin="0,4,0,0" />
-                        <TextBlock Text="{x:Static props:Strings.QuickStartStepThree}" Foreground="#DBE9F4" TextWrapping="Wrap" Margin="0,4,0,0" />
-                        <TextBlock Text="{x:Static props:Strings.QuickStartDeepNote}" Foreground="{StaticResource AccentMutedBrush}" TextWrapping="Wrap" Margin="0,10,0,0" />
-                        <TextBlock Text="{x:Static props:Strings.PresentMonStatusLabel}" Foreground="{StaticResource AccentMutedBrush}" FontWeight="SemiBold" Margin="0,12,0,0" />
-                        <TextBlock Text="{Binding PresentMonStatusText}" Foreground="#DBE9F4" TextWrapping="Wrap" Margin="0,4,0,0" />
-                    </StackPanel>
-                </Border>
+                <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                    <Border Background="#4A2A1E" BorderBrush="{StaticResource DangerBrush}" BorderThickness="1" CornerRadius="10"
+                            Padding="12,8" Style="{StaticResource NotElevatedOnly}">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="{x:Static props:Strings.NotElevatedBadge}" Foreground="#FFD9C8" VerticalAlignment="Center" Margin="0,0,12,0" />
+                            <Button Content="{x:Static props:Strings.RestartAsAdministrator}" Command="{Binding RestartAsAdministratorCommand}"
+                                    Margin="0" Padding="12,6" Background="{StaticResource AccentMutedBrush}" />
+                        </StackPanel>
+                    </Border>
+                    <TextBlock Text="{x:Static props:Strings.ElevatedBadge}" Foreground="#DBE9F4" Style="{StaticResource ElevatedOnly}" />
+                </StackPanel>
             </Grid>
         </Border>
 
-        <Grid Grid.Row="1">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="390" />
-                <ColumnDefinition Width="20" />
-                <ColumnDefinition Width="*" />
-            </Grid.ColumnDefinitions>
+        <!-- A collector that cannot measure has to say so where the user is looking, not only in a status
+             list that scrolls. -->
+        <Border Grid.Row="1" Background="#4A2A1E" BorderBrush="{StaticResource DangerBrush}" BorderThickness="1" CornerRadius="12"
+                Padding="12" Margin="0,12,0,0">
+            <Border.Style>
+                <Style TargetType="Border">
+                    <Setter Property="Visibility" Value="Collapsed" />
+                    <Style.Triggers>
+                        <DataTrigger Binding="{Binding HasSessionAlerts}" Value="True">
+                            <Setter Property="Visibility" Value="Visible" />
+                        </DataTrigger>
+                    </Style.Triggers>
+                </Style>
+            </Border.Style>
+            <StackPanel>
+                <TextBlock Text="{x:Static props:Strings.SessionAlertsHeader}" Foreground="#FFD9C8" FontWeight="SemiBold" />
+                <TextBlock Text="{Binding SessionAlertsText}" Foreground="#F4E4DC" TextWrapping="Wrap" Margin="0,6,0,0" />
+            </StackPanel>
+        </Border>
 
-            <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto" PanningMode="VerticalOnly">
-                <StackPanel>
-                    <Border Style="{StaticResource PanelStyle}">
+        <TabControl Grid.Row="2" Margin="0,8,0,0">
+
+            <!-- Overview -->
+            <TabItem Header="{x:Static props:Strings.TabOverview}">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="20" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+
+                    <ScrollViewer Grid.Column="2" VerticalScrollBarVisibility="Auto" PanningMode="VerticalOnly">
                         <StackPanel>
-                            <TextBlock Text="{x:Static props:Strings.ControlsHeader}" FontSize="22" FontWeight="Bold" />
-
-                            <TextBlock Text="{x:Static props:Strings.SessionGroup}" Style="{StaticResource SubHeaderStyle}" />
-                            <WrapPanel>
-                                <Button Content="{x:Static props:Strings.StartSession}" Command="{Binding StartSessionCommand}" />
-                                <Button Content="{x:Static props:Strings.StopSession}" Command="{Binding StopSessionCommand}" Background="#C97164" BorderBrush="#C97164" />
-                            </WrapPanel>
-
-                            <TextBlock Text="{x:Static props:Strings.PreLaunchGroup}" Style="{StaticResource SubHeaderStyle}" />
-                            <TextBlock Text="{x:Static props:Strings.PreLaunchHint}" Style="{StaticResource FieldHintStyle}" Margin="0,0,0,6" />
-                            <ItemsControl ItemsSource="{Binding PreLaunchApps}">
-                                <ItemsControl.ItemsPanel>
-                                    <ItemsPanelTemplate>
-                                        <UniformGrid Columns="2" />
-                                    </ItemsPanelTemplate>
-                                </ItemsControl.ItemsPanel>
-                                <ItemsControl.ItemTemplate>
-                                    <DataTemplate>
-                                        <CheckBox IsChecked="{Binding IsChecked}" Margin="0,2,0,2">
-                                            <StackPanel Orientation="Horizontal">
-                                                <TextBlock Text="{Binding Name}" />
-                                                <TextBlock Text="{x:Static props:Strings.PreLaunchRunning}" Foreground="{StaticResource AccentMutedBrush}"
-                                                           FontSize="11" Margin="6,1,0,0">
-                                                    <TextBlock.Style>
-                                                        <Style TargetType="TextBlock">
-                                                            <Setter Property="Visibility" Value="Collapsed" />
-                                                            <Style.Triggers>
-                                                                <DataTrigger Binding="{Binding IsRunning}" Value="True">
-                                                                    <Setter Property="Visibility" Value="Visible" />
-                                                                </DataTrigger>
-                                                            </Style.Triggers>
-                                                        </Style>
-                                                    </TextBlock.Style>
-                                                </TextBlock>
-                                            </StackPanel>
-                                        </CheckBox>
-                                    </DataTemplate>
-                                </ItemsControl.ItemTemplate>
-                            </ItemsControl>
-                            <Button Content="{x:Static props:Strings.PreLaunchButton}" Command="{Binding CloseAppsAndLaunchCommand}" HorizontalAlignment="Left" Margin="0,8,0,0" />
-
-                            <TextBlock Text="{x:Static props:Strings.CacheClearHint}" Style="{StaticResource FieldHintStyle}" Margin="0,10,0,0" />
-                            <Button Content="{x:Static props:Strings.CacheClearButton}" Command="{Binding ClearFiveMCacheCommand}"
-                                    Background="#C97164" BorderBrush="#C97164" HorizontalAlignment="Left" Margin="0,6,0,0" />
-
-                            <TextBlock Text="{x:Static props:Strings.IncidentActionsGroup}" Style="{StaticResource SubHeaderStyle}" />
-                            <WrapPanel>
-                                <Button Content="{x:Static props:Strings.MarkStutter}" Command="{Binding MarkStutterCommand}" Background="#6E9FA5" BorderBrush="#6E9FA5" />
-                                <Button Content="{x:Static props:Strings.MarkSevere}" Command="{Binding MarkSevereStutterCommand}" Background="#D96C47" BorderBrush="#D96C47" />
-                            </WrapPanel>
-
-                            <Border Background="#10212C" BorderBrush="#2A4356" BorderThickness="1" CornerRadius="12" Padding="12" Margin="0,8,0,4">
+                            <Border Style="{StaticResource PanelStyle}">
                                 <StackPanel>
-                                    <TextBlock Text="{x:Static props:Strings.CaptureFeedbackHeader}" Foreground="{StaticResource AccentBrush}" FontWeight="SemiBold" />
-                                    <TextBlock Text="{Binding CaptureFeedbackText}" TextWrapping="Wrap" Margin="0,6,0,0" />
+                                    <TextBlock Text="{x:Static props:Strings.SessionGroup}" Style="{StaticResource PanelHeaderStyle}" />
+                                    <WrapPanel>
+                                        <Button Content="{x:Static props:Strings.StartSession}" Command="{Binding StartSessionCommand}" />
+                                        <Button Content="{x:Static props:Strings.StopSession}" Command="{Binding StopSessionCommand}" Background="#C97164" />
+                                    </WrapPanel>
+                                    <TextBlock Text="{x:Static props:Strings.SessionAutoHint}" Style="{StaticResource FieldHintStyle}" Margin="0,0,0,8" />
+
+                                    <TextBlock Text="{x:Static props:Strings.IncidentActionsGroup}" Style="{StaticResource SubHeaderStyle}" />
+                                    <WrapPanel>
+                                        <Button Content="{x:Static props:Strings.MarkStutter}" Command="{Binding MarkSevereStutterCommand}" Background="{StaticResource DangerBrush}" />
+                                    </WrapPanel>
+                                    <TextBlock Text="{Binding HotkeyHintText}" Style="{StaticResource FieldHintStyle}" Margin="0,0,0,8" />
+
+                                    <Border Style="{StaticResource CardStyle}">
+                                        <StackPanel>
+                                            <TextBlock Text="{x:Static props:Strings.CaptureFeedbackHeader}" Foreground="{StaticResource AccentBrush}" FontWeight="SemiBold" />
+                                            <TextBlock Text="{Binding CaptureFeedbackText}" TextWrapping="Wrap" Margin="0,6,0,0" />
+                                        </StackPanel>
+                                    </Border>
                                 </StackPanel>
                             </Border>
 
                             <!-- The share of the evening that did not hold the frame rate is the number that
-                                 actually answers "how was it tonight". Three sessions of averages hid a
-                                 problem that this line makes obvious, so it sits next to the controls
-                                 rather than being reconstructed from the journal afterwards. -->
-                            <Border Background="#10212C" BorderBrush="#2A4356" BorderThickness="1" CornerRadius="12" Padding="12" Margin="0,4,0,4">
+                                 answers "how was it tonight", so it sits next to the controls. -->
+                            <Border Style="{StaticResource PanelStyle}">
                                 <StackPanel>
-                                    <TextBlock Text="{x:Static props:Strings.PacingHeader}" Foreground="{StaticResource AccentBrush}" FontWeight="SemiBold" />
-                                    <TextBlock Text="{Binding PacingSaturatedText}" TextWrapping="Wrap" Margin="0,6,0,0" />
-                                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
-                                        <StackPanel.Style>
-                                            <Style TargetType="StackPanel">
-                                                <Setter Property="Visibility" Value="Collapsed" />
-                                                <Style.Triggers>
-                                                    <DataTrigger Binding="{Binding HasPacingData}" Value="True">
-                                                        <Setter Property="Visibility" Value="Visible" />
-                                                    </DataTrigger>
-                                                </Style.Triggers>
-                                            </Style>
-                                        </StackPanel.Style>
+                                    <TextBlock Text="{x:Static props:Strings.PacingHeader}" Style="{StaticResource PanelHeaderStyle}" />
+                                    <TextBlock Text="{Binding PacingSaturatedText}" TextWrapping="Wrap" />
+                                    <StackPanel Style="{StaticResource PacingRow}">
                                         <TextBlock Text="{x:Static props:Strings.PacingWorstLabel}" Foreground="{StaticResource AccentMutedBrush}" FontWeight="SemiBold" />
                                         <TextBlock Text="{Binding PacingWorstText}" Margin="4,0,0,0" />
                                     </StackPanel>
-                                    <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
-                                        <StackPanel.Style>
-                                            <Style TargetType="StackPanel">
-                                                <Setter Property="Visibility" Value="Collapsed" />
-                                                <Style.Triggers>
-                                                    <DataTrigger Binding="{Binding HasPacingData}" Value="True">
-                                                        <Setter Property="Visibility" Value="Visible" />
-                                                    </DataTrigger>
-                                                </Style.Triggers>
-                                            </Style>
-                                        </StackPanel.Style>
+                                    <StackPanel Style="{StaticResource PacingRow}">
                                         <TextBlock Text="{x:Static props:Strings.PacingCurrentLabel}" Foreground="{StaticResource AccentMutedBrush}" FontWeight="SemiBold" />
                                         <TextBlock Text="{Binding PacingCurrentText}" Margin="4,0,0,0" />
                                     </StackPanel>
-                                    <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
-                                        <StackPanel.Style>
-                                            <Style TargetType="StackPanel">
-                                                <Setter Property="Visibility" Value="Collapsed" />
-                                                <Style.Triggers>
-                                                    <DataTrigger Binding="{Binding HasPacingData}" Value="True">
-                                                        <Setter Property="Visibility" Value="Visible" />
-                                                    </DataTrigger>
-                                                </Style.Triggers>
-                                            </Style>
-                                        </StackPanel.Style>
+                                    <StackPanel Style="{StaticResource PacingRow}">
                                         <TextBlock Text="{x:Static props:Strings.PacingCaptureBudgetLabel}" Foreground="{StaticResource AccentMutedBrush}" FontWeight="SemiBold" />
                                         <TextBlock Text="{Binding PacingCaptureBudgetText}" Margin="4,0,0,0" />
                                     </StackPanel>
                                 </StackPanel>
                             </Border>
 
-                            <TextBlock Text="{x:Static props:Strings.DataGroup}" Style="{StaticResource SubHeaderStyle}" />
-                            <WrapPanel>
-                                <Button Content="{x:Static props:Strings.ExportLatest}" Command="{Binding ExportSelectedIncidentCommand}" />
-                                <Button Content="{x:Static props:Strings.ImportArtifacts}" Command="{Binding ImportArtifactsCommand}" Background="#A2B86C" BorderBrush="#A2B86C" />
-                            </WrapPanel>
+                            <Border Style="{StaticResource PanelStyle}">
+                                <StackPanel>
+                                    <TextBlock Text="{x:Static props:Strings.LiveHeader}" Style="{StaticResource PanelHeaderStyle}" />
+                                    <StackPanel Orientation="Horizontal" Margin="0,2">
+                                        <TextBlock Text="{x:Static props:Strings.LiveCpuLabel}" Style="{StaticResource LiveLabel}" />
+                                        <TextBlock Text="{Binding LiveCpuText}" />
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Margin="0,2">
+                                        <TextBlock Text="{x:Static props:Strings.LiveMemoryLabel}" Style="{StaticResource LiveLabel}" />
+                                        <TextBlock Text="{Binding LiveMemoryText}" />
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Margin="0,2">
+                                        <TextBlock Text="{x:Static props:Strings.LiveVramLabel}" Style="{StaticResource LiveLabel}" />
+                                        <TextBlock Text="{Binding LiveVramText}" />
+                                    </StackPanel>
+                                    <DockPanel Margin="0,2">
+                                        <TextBlock Text="{x:Static props:Strings.LiveVramOwnersLabel}" Style="{StaticResource LiveLabel}" />
+                                        <TextBlock Text="{Binding LiveVramOwnersText}" TextWrapping="Wrap" />
+                                    </DockPanel>
+                                </StackPanel>
+                            </Border>
                         </StackPanel>
-                    </Border>
+                    </ScrollViewer>
 
-                    <Border Style="{StaticResource PanelStyle}">
+                    <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto" PanningMode="VerticalOnly">
                         <StackPanel>
-                            <TextBlock Text="{x:Static props:Strings.SettingsHeader}" FontSize="22" FontWeight="Bold" />
+                            <Border Style="{StaticResource PanelStyle}">
+                                <StackPanel>
+                                    <TextBlock Text="{x:Static props:Strings.PreLaunchGroup}" Style="{StaticResource PanelHeaderStyle}" />
+                                    <TextBlock Text="{x:Static props:Strings.PreLaunchHint}" Style="{StaticResource FieldHintStyle}" Margin="0,0,0,8" />
+                                    <TextBlock Text="{x:Static props:Strings.PreLaunchEmpty}" Margin="0,0,0,8">
+                                        <TextBlock.Style>
+                                            <Style TargetType="TextBlock" BasedOn="{StaticResource FieldHintStyle}">
+                                                <Setter Property="Visibility" Value="Collapsed" />
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding PreLaunchApps.Count}" Value="0">
+                                                        <Setter Property="Visibility" Value="Visible" />
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </TextBlock.Style>
+                                    </TextBlock>
+                                    <ItemsControl ItemsSource="{Binding PreLaunchApps}">
+                                        <ItemsControl.ItemsPanel>
+                                            <ItemsPanelTemplate>
+                                                <UniformGrid Columns="2" />
+                                            </ItemsPanelTemplate>
+                                        </ItemsControl.ItemsPanel>
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate>
+                                                <DockPanel Margin="0,2,12,2">
+                                                    <Button DockPanel.Dock="Right" Content="&#x2715;" Command="{Binding RemoveCommand}"
+                                                            Style="{StaticResource RemoveButton}"
+                                                            ToolTip="{x:Static props:Strings.PreLaunchRemove}"
+                                                            AutomationProperties.Name="{x:Static props:Strings.PreLaunchRemove}" />
+                                                    <CheckBox IsChecked="{Binding IsChecked}" Margin="0" VerticalAlignment="Center">
+                                                        <StackPanel Orientation="Horizontal">
+                                                            <TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" />
+                                                            <TextBlock Text="{x:Static props:Strings.PreLaunchRunning}" Foreground="{StaticResource AccentMutedBrush}"
+                                                                       FontSize="11" Margin="6,1,0,0"
+                                                                       Visibility="{Binding IsRunning, Converter={StaticResource BoolToVisibility}}" />
+                                                        </StackPanel>
+                                                    </CheckBox>
+                                                </DockPanel>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
 
-                            <Border Background="#0F1A22" BorderBrush="#254154" BorderThickness="1" CornerRadius="12" Padding="12" Margin="0,14,0,14">
-                                <TextBlock Text="{x:Static props:Strings.SettingsIntro}" TextWrapping="Wrap" />
+                                    <TextBlock Text="{x:Static props:Strings.PreLaunchAddLabel}" Style="{StaticResource FieldLabelStyle}" Margin="0,10,0,0" />
+                                    <DockPanel Margin="0,4,0,0">
+                                        <Button DockPanel.Dock="Right" Content="{x:Static props:Strings.PreLaunchAdd}" Command="{Binding AddRunningProgramCommand}"
+                                                Margin="10,0,0,0" Padding="12,6" Background="#6E9FA5" VerticalAlignment="Center" />
+                                        <ComboBox ItemsSource="{Binding RunningPrograms}" SelectedItem="{Binding SelectedRunningProgram}"
+                                                  DisplayMemberPath="Name" DropDownOpened="OnRunningProgramsDropDownOpened" Margin="0" />
+                                    </DockPanel>
+
+                                    <StackPanel Margin="0,6,0,0">
+                                        <StackPanel.Style>
+                                            <Style TargetType="StackPanel">
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding PreLaunchSuggestions.Count}" Value="0">
+                                                        <Setter Property="Visibility" Value="Collapsed" />
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </StackPanel.Style>
+                                        <TextBlock Text="{x:Static props:Strings.PreLaunchSuggestionsHeader}" Style="{StaticResource SubHeaderStyle}" />
+                                        <ItemsControl ItemsSource="{Binding PreLaunchSuggestions}">
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate>
+                                                    <DockPanel Margin="0,0,0,6">
+                                                        <Button DockPanel.Dock="Right" Content="{x:Static props:Strings.PreLaunchAdd}" Command="{Binding AddCommand}"
+                                                                Margin="10,0,0,0" Padding="10,4" Background="#6E9FA5" VerticalAlignment="Center" />
+                                                        <StackPanel VerticalAlignment="Center">
+                                                            <TextBlock Text="{Binding Name}" FontWeight="SemiBold" />
+                                                            <TextBlock Text="{Binding Reason}" Foreground="{StaticResource TextMutedBrush}" FontSize="13" TextWrapping="Wrap" />
+                                                        </StackPanel>
+                                                    </DockPanel>
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+                                    </StackPanel>
+
+                                    <WrapPanel Margin="0,8,0,0">
+                                        <Button Content="{x:Static props:Strings.PreLaunchButton}" Command="{Binding CloseAppsAndLaunchCommand}" />
+                                        <Button Content="{x:Static props:Strings.CacheClearButton}" Command="{Binding ClearFiveMCacheCommand}" Background="#C97164" />
+                                    </WrapPanel>
+                                    <TextBlock Text="{x:Static props:Strings.CacheClearHint}" Style="{StaticResource FieldHintStyle}" Margin="0,0,0,0" />
+                                </StackPanel>
                             </Border>
 
-                            <TextBlock Text="{x:Static props:Strings.ServerProfile}" Foreground="{StaticResource TextMutedBrush}" Margin="0,14,0,0" />
-                            <TextBox Text="{Binding ServerProfileName, UpdateSourceTrigger=PropertyChanged}" />
-                            <TextBlock Text="{x:Static props:Strings.ServerProfileHint}" Style="{StaticResource FieldHintStyle}" />
+                            <Border Style="{StaticResource PanelStyle}">
+                                <StackPanel>
+                                    <TextBlock Text="{x:Static props:Strings.ReadinessHeader}" Style="{StaticResource PanelHeaderStyle}" />
 
-                            <TextBlock Text="{x:Static props:Strings.LanguageLabel}" Foreground="{StaticResource TextMutedBrush}" Margin="0,6,0,0" />
-                            <ComboBox ItemsSource="{Binding AvailableLanguages}" SelectedValue="{Binding SelectedLanguage}" SelectedValuePath="Code" DisplayMemberPath="DisplayName" Margin="0,4,0,4" MinWidth="240" HorizontalAlignment="Stretch" />
-                            <TextBlock Text="{x:Static props:Strings.LanguageChangeHint}" Style="{StaticResource FieldHintStyle}" FontStyle="Italic" />
+                                    <Border Style="{StaticResource CardStyle}">
+                                        <StackPanel>
+                                            <TextBlock Text="{x:Static props:Strings.ReadinessAdminLabel}" Foreground="{StaticResource AccentMutedBrush}" FontWeight="SemiBold" />
+                                            <TextBlock Text="{x:Static props:Strings.ReadinessAdminOk}" Foreground="{StaticResource TextPrimaryBrush}" TextWrapping="Wrap" Margin="0,4,0,0" Style="{StaticResource ElevatedOnly}" />
+                                            <StackPanel Style="{StaticResource NotElevatedOnly}">
+                                                <TextBlock Text="{x:Static props:Strings.ReadinessAdminMissing}" TextWrapping="Wrap" Margin="0,4,0,8" />
+                                                <Button Content="{x:Static props:Strings.RestartAsAdministrator}" Command="{Binding RestartAsAdministratorCommand}" HorizontalAlignment="Left" Margin="0" />
+                                            </StackPanel>
+                                        </StackPanel>
+                                    </Border>
 
-                            <Expander Header="{x:Static props:Strings.NetworkHintsHeader}" Foreground="{StaticResource TextPrimaryBrush}" Margin="0,6,0,0">
-                                <StackPanel Margin="0,8,0,0">
-                                    <TextBlock Text="{x:Static props:Strings.NetworkHintsDescription}" Style="{StaticResource FieldHintStyle}" Margin="0,0,0,8" />
+                                    <Border Style="{StaticResource CardStyle}">
+                                        <StackPanel>
+                                            <TextBlock Text="{x:Static props:Strings.PresentMonStatusLabel}" Foreground="{StaticResource AccentMutedBrush}" FontWeight="SemiBold" />
+                                            <TextBlock Text="{Binding PresentMonStatusText}" TextWrapping="Wrap" Margin="0,4,0,0" />
+                                        </StackPanel>
+                                    </Border>
 
-                                    <TextBlock Text="{x:Static props:Strings.ProbeHost}" Foreground="{StaticResource TextMutedBrush}" />
-                                    <TextBox Text="{Binding ProbeHost, UpdateSourceTrigger=PropertyChanged}" ToolTip="{x:Static props:Strings.ProbeHostHint}" />
-                                    <TextBlock Text="{x:Static props:Strings.ProbeHostHint}" Style="{StaticResource FieldHintStyle}" />
-
-                                    <TextBlock Text="{x:Static props:Strings.EndpointHint}" Foreground="{StaticResource TextMutedBrush}" />
-                                    <TextBox Text="{Binding EndpointHint, UpdateSourceTrigger=PropertyChanged}" ToolTip="{x:Static props:Strings.EndpointHintDescription}" />
-                                    <TextBlock Text="{x:Static props:Strings.EndpointHintDescription}" Style="{StaticResource FieldHintStyle}" />
+                                    <Border Style="{StaticResource CardStyle}">
+                                        <StackPanel>
+                                            <TextBlock Text="{x:Static props:Strings.ReadinessStreamLabel}" Foreground="{StaticResource AccentMutedBrush}" FontWeight="SemiBold" />
+                                            <TextBlock TextWrapping="Wrap" Margin="0,4,0,0">
+                                                <TextBlock.Style>
+                                                    <Style TargetType="TextBlock" BasedOn="{StaticResource {x:Type TextBlock}}">
+                                                        <Setter Property="Text" Value="{x:Static props:Strings.ReadinessStreamOff}" />
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding Streams}" Value="True">
+                                                                <Setter Property="Text" Value="{x:Static props:Strings.ReadinessStreamOn}" />
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </TextBlock.Style>
+                                            </TextBlock>
+                                        </StackPanel>
+                                    </Border>
                                 </StackPanel>
-                            </Expander>
+                            </Border>
 
-                            <Expander Header="{x:Static props:Strings.AdvancedSettings}" Foreground="{StaticResource TextPrimaryBrush}" Margin="0,8,0,0">
+                            <Border Style="{StaticResource PanelStyle}" Background="{StaticResource PanelAltBrush}">
+                                <StackPanel>
+                                    <TextBlock Text="{x:Static props:Strings.QuickStartHeader}" Style="{StaticResource PanelHeaderStyle}" />
+                                    <TextBlock Text="{x:Static props:Strings.QuickStartIntro}" Foreground="#DBE9F4" TextWrapping="Wrap" Margin="0,0,0,8" />
+                                    <TextBlock Text="{x:Static props:Strings.QuickStartStepOne}" Foreground="#DBE9F4" TextWrapping="Wrap" Margin="0,4,0,0" />
+                                    <TextBlock Text="{x:Static props:Strings.QuickStartStepTwo}" Foreground="#DBE9F4" TextWrapping="Wrap" Margin="0,4,0,0" />
+                                    <TextBlock Text="{x:Static props:Strings.QuickStartStepThree}" Foreground="#DBE9F4" TextWrapping="Wrap" Margin="0,4,0,0" />
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                    </ScrollViewer>
+                </Grid>
+            </TabItem>
+
+            <!-- Incidents -->
+            <TabItem Header="{x:Static props:Strings.TabIncidents}">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="260" />
+                        <RowDefinition Height="14" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <Border Grid.Row="0" Style="{StaticResource PanelStyle}" Margin="0">
+                        <DockPanel>
+                            <DockPanel DockPanel.Dock="Top" Margin="0,0,0,10">
+                                <WrapPanel DockPanel.Dock="Right">
+                                    <Button Content="{x:Static props:Strings.ExportLatest}" Command="{Binding ExportSelectedIncidentCommand}" Margin="10,0,0,0" Padding="12,6" />
+                                    <Button Content="{x:Static props:Strings.ImportArtifacts}" Command="{Binding ImportArtifactsCommand}" Background="#A2B86C" Margin="10,0,0,0" Padding="12,6" />
+                                </WrapPanel>
+                                <TextBlock Text="{x:Static props:Strings.RecentIncidentsHeader}" Style="{StaticResource PanelHeaderStyle}" Margin="0" VerticalAlignment="Center" />
+                            </DockPanel>
+                            <ListView ItemsSource="{Binding Incidents}" SelectedItem="{Binding SelectedIncident}" HorizontalContentAlignment="Stretch" ItemContainerStyle="{StaticResource GridViewItemStyle}">
+                                <ListView.View>
+                                    <GridView>
+                                        <GridViewColumn Header="{x:Static props:Strings.MarkedColumn}" Width="150" DisplayMemberBinding="{Binding Marker.MarkedAt, StringFormat={}{0:yyyy-MM-dd HH:mm:ss}}" />
+                                        <GridViewColumn Header="{x:Static props:Strings.SeverityColumn}" Width="100" DisplayMemberBinding="{Binding Marker.Severity}" />
+                                        <GridViewColumn Header="{x:Static props:Strings.ServerColumn}" Width="110" DisplayMemberBinding="{Binding Environment.ServerProfileName}" />
+                                        <GridViewColumn Header="{x:Static props:Strings.SummaryColumn}" Width="760" DisplayMemberBinding="{Binding Analysis.Summary}" />
+                                    </GridView>
+                                </ListView.View>
+                            </ListView>
+                        </DockPanel>
+                    </Border>
+
+                    <Grid Grid.Row="2">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="1.2*" />
+                            <ColumnDefinition Width="20" />
+                            <ColumnDefinition Width="1*" />
+                        </Grid.ColumnDefinitions>
+
+                        <Border Grid.Column="0" Style="{StaticResource PanelStyle}" Margin="0">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="110" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="*" />
+                                </Grid.RowDefinitions>
+
+                                <TextBlock Text="{x:Static props:Strings.IncidentSummaryHeader}" Style="{StaticResource PanelHeaderStyle}" />
+                                <TextBox Grid.Row="1" Text="{Binding SelectedIncidentSummary, Mode=OneWay}" Margin="0,0,0,14" IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" />
+
+                                <TextBlock Grid.Row="2" Text="{x:Static props:Strings.RankedHypothesesHeader}" Style="{StaticResource PanelHeaderStyle}" />
+                                <ListView Grid.Row="3" ItemsSource="{Binding SelectedHypotheses}">
+                                    <ListView.ItemTemplate>
+                                        <DataTemplate>
+                                            <Border Background="#0F1B24" BorderBrush="#284052" BorderThickness="1" CornerRadius="10" Padding="14" Margin="0,0,0,10">
+                                                <StackPanel>
+                                                    <DockPanel>
+                                                        <TextBlock Text="{Binding Confidence, StringFormat={}{0:P0}}" Foreground="{StaticResource AccentBrush}" FontSize="18" DockPanel.Dock="Right" />
+                                                        <TextBlock Text="{Binding Category}" FontSize="18" FontWeight="Bold" />
+                                                    </DockPanel>
+                                                    <ItemsControl ItemsSource="{Binding Evidence}" Margin="0,10,0,0">
+                                                        <ItemsControl.ItemTemplate>
+                                                            <DataTemplate>
+                                                                <TextBlock Text="{Binding}" TextWrapping="Wrap" Margin="0,0,0,6" />
+                                                            </DataTemplate>
+                                                        </ItemsControl.ItemTemplate>
+                                                    </ItemsControl>
+                                                </StackPanel>
+                                            </Border>
+                                        </DataTemplate>
+                                    </ListView.ItemTemplate>
+                                </ListView>
+                            </Grid>
+                        </Border>
+
+                        <Border Grid.Column="2" Style="{StaticResource PanelStyle}" Background="{StaticResource PanelAltBrush}" Margin="0">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="*" />
+                                </Grid.RowDefinitions>
+
+                                <TextBlock Text="{x:Static props:Strings.TimelineHeader}" Style="{StaticResource PanelHeaderStyle}" />
+                                <ListView Grid.Row="1" ItemsSource="{Binding SelectedTimeline}">
+                                    <ListView.ItemTemplate>
+                                        <DataTemplate>
+                                            <Border Background="#0F1B24" BorderBrush="#284052" BorderThickness="1" CornerRadius="10" Padding="12" Margin="0,0,0,10">
+                                                <StackPanel>
+                                                    <DockPanel>
+                                                        <TextBlock Text="{Binding Category}" Foreground="{StaticResource AccentMutedBrush}" DockPanel.Dock="Right" />
+                                                        <TextBlock Text="{Binding Timestamp, StringFormat={}{0:HH:mm:ss}}" Foreground="{StaticResource AccentBrush}" FontWeight="Bold" />
+                                                    </DockPanel>
+                                                    <TextBlock Text="{Binding Summary}" TextWrapping="Wrap" Margin="0,8,0,0" />
+                                                </StackPanel>
+                                            </Border>
+                                        </DataTemplate>
+                                    </ListView.ItemTemplate>
+                                </ListView>
+                            </Grid>
+                        </Border>
+                    </Grid>
+                </Grid>
+            </TabItem>
+
+            <!-- Share -->
+            <TabItem Header="{x:Static props:Strings.TabShare}">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" PanningMode="VerticalOnly">
+                    <Border Style="{StaticResource PanelStyle}" MaxWidth="760" HorizontalAlignment="Left">
+                        <StackPanel>
+                            <TextBlock Text="{x:Static props:Strings.ShareHeader}" Style="{StaticResource PanelHeaderStyle}" />
+                            <TextBlock Text="{x:Static props:Strings.ShareIntro}" TextWrapping="Wrap" Foreground="#DBE9F4" Margin="0,0,0,14" />
+
+                            <TextBlock Text="{x:Static props:Strings.ShareSessionLabel}" Style="{StaticResource FieldLabelStyle}" />
+                            <DockPanel Margin="0,4,0,10">
+                                <Button DockPanel.Dock="Right" Content="{x:Static props:Strings.ShareRefresh}" Command="{Binding RefreshSessionsCommand}"
+                                        Margin="10,0,0,0" Padding="12,6" Background="#6E9FA5" />
+                                <ComboBox ItemsSource="{Binding Sessions}" SelectedItem="{Binding SelectedSession}" DisplayMemberPath="Label" />
+                            </DockPanel>
+                            <TextBlock Text="{x:Static props:Strings.ShareNoSessions}">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock" BasedOn="{StaticResource FieldHintStyle}">
+                                        <Setter Property="Visibility" Value="Collapsed" />
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding Sessions.Count}" Value="0">
+                                                <Setter Property="Visibility" Value="Visible" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+
+                            <CheckBox Content="{x:Static props:Strings.IncludeSensitiveFields}" IsChecked="{Binding ShareIncludeSensitive}" Margin="0,6,0,4" />
+                            <TextBlock Text="{x:Static props:Strings.ShareRedactHint}" Style="{StaticResource FieldHintStyle}" Margin="30,0,0,8" />
+                            <CheckBox Content="{x:Static props:Strings.ShareIncludeTraces}" IsChecked="{Binding ShareIncludeTraces}" Margin="0,0,0,4" />
+                            <TextBlock Text="{x:Static props:Strings.ShareIncludeTracesHint}" Style="{StaticResource FieldHintStyle}" Margin="30,0,0,12" />
+
+                            <WrapPanel>
+                                <Button Content="{x:Static props:Strings.ShareCreate}" Command="{Binding ExportSessionCommand}" />
+                                <Button Content="{x:Static props:Strings.ShareShowInExplorer}" Command="{Binding OpenSharedZipCommand}" Background="#6E9FA5" />
+                            </WrapPanel>
+                            <TextBlock Text="{Binding ShareResultText}" TextWrapping="Wrap" Margin="0,4,0,0" />
+                        </StackPanel>
+                    </Border>
+                </ScrollViewer>
+            </TabItem>
+
+            <!-- Settings -->
+            <TabItem Header="{x:Static props:Strings.TabSettings}">
+                <DockPanel>
+                <!-- Docked below the list so it is in view however far the settings are scrolled. -->
+                <Border DockPanel.Dock="Bottom" BorderBrush="#1E3343" BorderThickness="0,1,0,0" Padding="0,12,0,0">
+                    <Button Content="{x:Static props:Strings.SaveSettings}" Command="{Binding SaveSettingsCommand}" Width="200" HorizontalAlignment="Left" Margin="0" />
+                </Border>
+                <ScrollViewer VerticalScrollBarVisibility="Auto" PanningMode="VerticalOnly">
+                    <StackPanel MaxWidth="760" HorizontalAlignment="Left">
+                        <Border Style="{StaticResource PanelStyle}">
+                            <StackPanel>
+                                <TextBlock Text="{x:Static props:Strings.SettingsGeneralHeader}" Style="{StaticResource PanelHeaderStyle}" />
+
+                                <CheckBox Content="{x:Static props:Strings.StreamsLabel}" IsChecked="{Binding Streams}" />
+                                <TextBlock Text="{x:Static props:Strings.StreamsHint}" Style="{StaticResource FieldHintStyle}" Margin="30,0,0,10" />
+
+                                <CheckBox Content="{x:Static props:Strings.AutoSessionEnabled}" IsChecked="{Binding AutoSessionEnabled}" />
+                                <CheckBox Content="{x:Static props:Strings.StartWithWindows}" IsChecked="{Binding StartWithWindows}" />
+
+                                <TextBlock Text="{x:Static props:Strings.LanguageLabel}" Style="{StaticResource FieldLabelStyle}" Margin="0,10,0,0" />
+                                <ComboBox ItemsSource="{Binding AvailableLanguages}" SelectedValue="{Binding SelectedLanguage}" SelectedValuePath="Code" DisplayMemberPath="DisplayName" Margin="0,4,0,4" HorizontalAlignment="Stretch" />
+                                <TextBlock Text="{x:Static props:Strings.LanguageChangeHint}" Style="{StaticResource FieldHintStyle}" FontStyle="Italic" Margin="0,0,0,0" />
+                            </StackPanel>
+                        </Border>
+
+                        <Border Style="{StaticResource PanelStyle}">
+                            <StackPanel>
+                                <TextBlock Text="{x:Static props:Strings.HotkeysHeader}" Style="{StaticResource PanelHeaderStyle}" />
+                                <TextBlock Text="{x:Static props:Strings.HotkeysHint}" Style="{StaticResource FieldHintStyle}" Margin="0,0,0,8" />
+                                <TextBlock Text="{x:Static props:Strings.HotkeySevereLabel}" Style="{StaticResource FieldLabelStyle}" />
+                                <TextBox Text="{Binding SevereHotkey, UpdateSourceTrigger=PropertyChanged}" />
+                                <Expander Header="{x:Static props:Strings.HotkeyLightHeader}" Margin="0,4,0,0">
+                                    <StackPanel Margin="0,8,0,0">
+                                        <TextBlock Text="{x:Static props:Strings.HotkeyLightHint}" Style="{StaticResource FieldHintStyle}" Margin="0,0,0,4" />
+                                        <TextBlock Text="{x:Static props:Strings.HotkeyStutterLabel}" Style="{StaticResource FieldLabelStyle}" />
+                                        <TextBox Text="{Binding StutterHotkey, UpdateSourceTrigger=PropertyChanged}" />
+                                    </StackPanel>
+                                </Expander>
+                            </StackPanel>
+                        </Border>
+
+                        <Border Style="{StaticResource PanelStyle}">
+                            <StackPanel>
+                                <TextBlock Text="{x:Static props:Strings.SettingsMeasurementHeader}" Style="{StaticResource PanelHeaderStyle}" />
+                                <CheckBox Content="{x:Static props:Strings.AutoDetectEnabled}" IsChecked="{Binding AutoDetectEnabled}" />
+                                <CheckBox Content="{x:Static props:Strings.CaptureNormalManualIncidents}" IsChecked="{Binding CaptureNormalManualIncidents}" />
+                                <TextBlock Text="{x:Static props:Strings.QuickStartDeepNote}" Style="{StaticResource FieldHintStyle}" Margin="0,4,0,0" />
+                            </StackPanel>
+                        </Border>
+
+                        <Border Style="{StaticResource PanelStyle}">
+                            <StackPanel>
+                                <TextBlock Text="{x:Static props:Strings.SettingsFiveMHeader}" Style="{StaticResource PanelHeaderStyle}" />
+
+                                <TextBlock Text="{x:Static props:Strings.LaunchArgumentsLabel}" Style="{StaticResource FieldLabelStyle}" />
+                                <TextBox Text="{Binding FiveMLaunchArguments, UpdateSourceTrigger=PropertyChanged}" />
+                                <TextBlock Text="{x:Static props:Strings.LaunchArgumentsHint}" Style="{StaticResource FieldHintStyle}" />
+
+                                <TextBlock Text="{x:Static props:Strings.ServerProfile}" Style="{StaticResource FieldLabelStyle}" />
+                                <TextBox Text="{Binding ServerProfileName, UpdateSourceTrigger=PropertyChanged}" />
+                                <TextBlock Text="{x:Static props:Strings.ServerProfileHint}" Style="{StaticResource FieldHintStyle}" />
+
+                                <Expander Header="{x:Static props:Strings.NetworkHintsHeader}" Margin="0,6,0,0">
+                                    <StackPanel Margin="0,8,0,0">
+                                        <TextBlock Text="{x:Static props:Strings.NetworkHintsDescription}" Style="{StaticResource FieldHintStyle}" Margin="0,0,0,8" />
+                                        <TextBlock Text="{x:Static props:Strings.ProbeHost}" Style="{StaticResource FieldLabelStyle}" />
+                                        <TextBox Text="{Binding ProbeHost, UpdateSourceTrigger=PropertyChanged}" />
+                                        <TextBlock Text="{x:Static props:Strings.ProbeHostHint}" Style="{StaticResource FieldHintStyle}" />
+                                        <TextBlock Text="{x:Static props:Strings.EndpointHint}" Style="{StaticResource FieldLabelStyle}" />
+                                        <TextBox Text="{Binding EndpointHint, UpdateSourceTrigger=PropertyChanged}" />
+                                        <TextBlock Text="{x:Static props:Strings.EndpointHintDescription}" Style="{StaticResource FieldHintStyle}" />
+                                    </StackPanel>
+                                </Expander>
+                            </StackPanel>
+                        </Border>
+
+                        <Border Style="{StaticResource PanelStyle}">
+                            <StackPanel>
+                                <TextBlock Text="{x:Static props:Strings.SettingsPrivacyHeader}" Style="{StaticResource PanelHeaderStyle}" />
+                                <CheckBox Content="{x:Static props:Strings.IncludeSensitiveFields}" IsChecked="{Binding IncludeSensitiveFields}" />
+                                <CheckBox Content="{x:Static props:Strings.IncludeAttachedArtifacts}" IsChecked="{Binding IncludeAttachedArtifacts}" />
+                            </StackPanel>
+                        </Border>
+
+                        <Border Style="{StaticResource PanelStyle}">
+                            <Expander Header="{x:Static props:Strings.AdvancedSettings}">
                                 <StackPanel Margin="0,8,0,0">
                                     <TextBlock Text="{x:Static props:Strings.AdvancedSettingsDescription}" Style="{StaticResource FieldHintStyle}" Margin="0,0,0,8" />
-                                    <TextBlock Text="{x:Static props:Strings.PresentMonPath}" Foreground="{StaticResource TextMutedBrush}" />
+                                    <TextBlock Text="{x:Static props:Strings.PresentMonPath}" Style="{StaticResource FieldLabelStyle}" />
                                     <TextBox Text="{Binding PresentMonExecutablePath, UpdateSourceTrigger=PropertyChanged}" />
-                                    <TextBlock Text="{x:Static props:Strings.WorkingDirectory}" Foreground="{StaticResource TextMutedBrush}" />
+                                    <TextBlock Text="{x:Static props:Strings.WorkingDirectory}" Style="{StaticResource FieldLabelStyle}" />
                                     <TextBox Text="{Binding WorkingDirectory, UpdateSourceTrigger=PropertyChanged}" />
-                                    <TextBlock Text="{x:Static props:Strings.ExportDirectory}" Foreground="{StaticResource TextMutedBrush}" />
+                                    <TextBlock Text="{x:Static props:Strings.ExportDirectory}" Style="{StaticResource FieldLabelStyle}" />
                                     <TextBox Text="{Binding ExportDirectory, UpdateSourceTrigger=PropertyChanged}" />
-                                    <TextBlock Text="{x:Static props:Strings.ArtifactDirectory}" Foreground="{StaticResource TextMutedBrush}" />
+                                    <TextBlock Text="{x:Static props:Strings.ArtifactDirectory}" Style="{StaticResource FieldLabelStyle}" />
                                     <TextBox Text="{Binding ArtifactDirectory, UpdateSourceTrigger=PropertyChanged}" />
-                                    <TextBlock Text="{x:Static props:Strings.SessionRetentionLabel}" Foreground="{StaticResource TextMutedBrush}" Margin="0,8,0,0" />
+                                    <TextBlock Text="{x:Static props:Strings.SessionRetentionLabel}" Style="{StaticResource FieldLabelStyle}" />
                                     <TextBox Text="{Binding SessionRetentionDays, UpdateSourceTrigger=PropertyChanged}" Width="80" HorizontalAlignment="Left" />
                                     <TextBlock Text="{x:Static props:Strings.SessionRetentionHint}" Style="{StaticResource FieldHintStyle}" />
                                 </StackPanel>
                             </Expander>
+                        </Border>
+                    </StackPanel>
+                </ScrollViewer>
+                </DockPanel>
+            </TabItem>
 
-                            <CheckBox Content="{x:Static props:Strings.StartWithWindows}" IsChecked="{Binding StartWithWindows}" Margin="0,12,0,0" />
-                            <CheckBox Content="{x:Static props:Strings.AutoSessionEnabled}" IsChecked="{Binding AutoSessionEnabled}" />
-                            <CheckBox Content="{x:Static props:Strings.AutoDetectEnabled}" IsChecked="{Binding AutoDetectEnabled}" />
-                            <CheckBox Content="{x:Static props:Strings.CaptureNormalManualIncidents}" IsChecked="{Binding CaptureNormalManualIncidents}" />
-                            <CheckBox Content="{x:Static props:Strings.IncludeSensitiveFields}" IsChecked="{Binding IncludeSensitiveFields}" Margin="0,12,0,0" />
-                            <CheckBox Content="{x:Static props:Strings.IncludeAttachedArtifacts}" IsChecked="{Binding IncludeAttachedArtifacts}" />
-                            <Button Content="{x:Static props:Strings.SaveSettings}" Command="{Binding SaveSettingsCommand}" Width="180" Margin="0,10,0,0" />
+            <!-- Advanced -->
+            <TabItem Header="{x:Static props:Strings.TabAdvanced}">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="20" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+
+                    <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto" PanningMode="VerticalOnly">
+                        <StackPanel>
+                            <Border Style="{StaticResource PanelStyle}">
+                                <StackPanel>
+                                    <TextBlock Text="{x:Static props:Strings.LiveVramPanelHeader}" Style="{StaticResource PanelHeaderStyle}" />
+                                    <TextBlock Text="{x:Static props:Strings.LiveVramPanelDescription}"
+                                               Foreground="{StaticResource TextMutedBrush}" TextWrapping="Wrap" Margin="0,0,0,10" />
+
+                                    <Grid Margin="0,0,0,6">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="90" />
+                                            <ColumnDefinition Width="90" />
+                                            <ColumnDefinition Width="90" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Grid.Column="0" Text="{x:Static props:Strings.LiveVramColumnProcess}" Foreground="{StaticResource TextMutedBrush}" FontSize="12" />
+                                        <TextBlock Grid.Column="1" Text="{x:Static props:Strings.LiveVramColumnNow}" Foreground="{StaticResource TextMutedBrush}" FontSize="12" TextAlignment="Right" />
+                                        <TextBlock Grid.Column="2" Text="{x:Static props:Strings.LiveVramColumnTaken}" Foreground="{StaticResource TextMutedBrush}" FontSize="12" TextAlignment="Right" />
+                                        <TextBlock Grid.Column="3" Text="{x:Static props:Strings.LiveVramColumnPeak}" Foreground="{StaticResource TextMutedBrush}" FontSize="12" TextAlignment="Right" />
+                                    </Grid>
+
+                                    <ItemsControl ItemsSource="{Binding LiveVramRows}">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate>
+                                                <Grid Margin="0,0,0,4">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="90" />
+                                                        <ColumnDefinition Width="90" />
+                                                        <ColumnDefinition Width="90" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <StackPanel Grid.Column="0" Orientation="Horizontal">
+                                                        <TextBlock Text="{Binding ProcessName}" TextTrimming="CharacterEllipsis" />
+                                                        <TextBlock Text="{Binding NoteText}" Foreground="{StaticResource TextMutedBrush}" FontSize="11" Margin="8,1,0,0" />
+                                                    </StackPanel>
+                                                    <TextBlock Grid.Column="1" Text="{Binding NowText}" TextAlignment="Right" />
+                                                    <TextBlock Grid.Column="2" Text="{Binding TakenText}" TextAlignment="Right" Foreground="{StaticResource AccentBrush}" />
+                                                    <TextBlock Grid.Column="3" Text="{Binding PeakText}" TextAlignment="Right" Foreground="{StaticResource TextMutedBrush}" />
+                                                </Grid>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+
+                                    <TextBlock Text="{x:Static props:Strings.LiveVramPanelEmpty}" Foreground="{StaticResource TextMutedBrush}" TextWrapping="Wrap" Margin="0,4,0,0">
+                                        <TextBlock.Style>
+                                            <Style TargetType="TextBlock">
+                                                <Setter Property="Visibility" Value="Collapsed" />
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding LiveVramRows.Count}" Value="0">
+                                                        <Setter Property="Visibility" Value="Visible" />
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </TextBlock.Style>
+                                    </TextBlock>
+                                </StackPanel>
+                            </Border>
+
+                            <Border Style="{StaticResource PanelStyle}" Background="{StaticResource PanelAltBrush}">
+                                <StackPanel>
+                                    <TextBlock Text="{x:Static props:Strings.FakeDataHeader}" Style="{StaticResource PanelHeaderStyle}" />
+                                    <TextBlock Text="{x:Static props:Strings.FakeDataDescription}" Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,14" TextWrapping="Wrap" />
+                                    <WrapPanel>
+                                        <Button Content="{x:Static props:Strings.SimulateObs}" Command="{Binding SimulateObsScenarioCommand}"
+                                                Visibility="{Binding Streams, Converter={StaticResource BoolToVisibility}}" />
+                                        <Button Content="{x:Static props:Strings.SimulateResource}" Command="{Binding SimulateResourceScenarioCommand}" Background="#A2B86C" />
+                                        <Button Content="{x:Static props:Strings.SimulateNetwork}" Command="{Binding SimulateNetworkScenarioCommand}" Background="#6E9FA5" />
+                                    </WrapPanel>
+                                </StackPanel>
+                            </Border>
                         </StackPanel>
-                    </Border>
+                    </ScrollViewer>
 
-                    <Border Style="{StaticResource PanelStyle}">
-                        <Expander Foreground="{StaticResource TextPrimaryBrush}" IsExpanded="True">
-                            <Expander.Header>
-                                <TextBlock Text="{x:Static props:Strings.LiveVramPanelHeader}" FontSize="22" FontWeight="Bold" />
-                            </Expander.Header>
-                            <StackPanel Margin="0,14,0,0">
-                                <TextBlock Text="{x:Static props:Strings.LiveVramPanelDescription}"
-                                           Foreground="{StaticResource TextMutedBrush}" TextWrapping="Wrap" Margin="0,0,0,10" />
-
-                                <Grid Margin="0,0,0,6">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="90" />
-                                        <ColumnDefinition Width="90" />
-                                        <ColumnDefinition Width="90" />
-                                    </Grid.ColumnDefinitions>
-                                    <TextBlock Grid.Column="0" Text="{x:Static props:Strings.LiveVramColumnProcess}" Foreground="{StaticResource TextMutedBrush}" FontSize="12" />
-                                    <TextBlock Grid.Column="1" Text="{x:Static props:Strings.LiveVramColumnNow}" Foreground="{StaticResource TextMutedBrush}" FontSize="12" TextAlignment="Right" />
-                                    <TextBlock Grid.Column="2" Text="{x:Static props:Strings.LiveVramColumnTaken}" Foreground="{StaticResource TextMutedBrush}" FontSize="12" TextAlignment="Right" />
-                                    <TextBlock Grid.Column="3" Text="{x:Static props:Strings.LiveVramColumnPeak}" Foreground="{StaticResource TextMutedBrush}" FontSize="12" TextAlignment="Right" />
-                                </Grid>
-
-                                <ItemsControl ItemsSource="{Binding LiveVramRows}">
-                                    <ItemsControl.ItemTemplate>
-                                        <DataTemplate>
-                                            <Grid Margin="0,0,0,4">
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="*" />
-                                                    <ColumnDefinition Width="90" />
-                                                    <ColumnDefinition Width="90" />
-                                                    <ColumnDefinition Width="90" />
-                                                </Grid.ColumnDefinitions>
-                                                <StackPanel Grid.Column="0" Orientation="Horizontal">
-                                                    <TextBlock Text="{Binding ProcessName}" TextTrimming="CharacterEllipsis" />
-                                                    <TextBlock Text="{Binding NoteText}" Foreground="{StaticResource TextMutedBrush}"
-                                                               FontSize="11" Margin="8,1,0,0" />
-                                                </StackPanel>
-                                                <TextBlock Grid.Column="1" Text="{Binding NowText}" TextAlignment="Right" />
-                                                <TextBlock Grid.Column="2" Text="{Binding TakenText}" TextAlignment="Right" Foreground="{StaticResource AccentBrush}" />
-                                                <TextBlock Grid.Column="3" Text="{Binding PeakText}" TextAlignment="Right" Foreground="{StaticResource TextMutedBrush}" />
-                                            </Grid>
-                                        </DataTemplate>
-                                    </ItemsControl.ItemTemplate>
-                                </ItemsControl>
-
-                                <TextBlock Text="{x:Static props:Strings.LiveVramPanelEmpty}" Foreground="{StaticResource TextMutedBrush}"
-                                           TextWrapping="Wrap" Margin="0,4,0,0">
-                                    <TextBlock.Style>
-                                        <Style TargetType="TextBlock">
-                                            <Setter Property="Visibility" Value="Collapsed" />
-                                            <Style.Triggers>
-                                                <DataTrigger Binding="{Binding LiveVramRows.Count}" Value="0">
-                                                    <Setter Property="Visibility" Value="Visible" />
-                                                </DataTrigger>
-                                            </Style.Triggers>
-                                        </Style>
-                                    </TextBlock.Style>
-                                </TextBlock>
-                            </StackPanel>
-                        </Expander>
-                    </Border>
-
-                    <Border Style="{StaticResource PanelStyle}" Background="{StaticResource PanelAltBrush}">
-                        <Expander Foreground="{StaticResource TextPrimaryBrush}" IsExpanded="False">
-                            <Expander.Header>
-                                <TextBlock Text="{x:Static props:Strings.FakeDataHeader}" FontSize="22" FontWeight="Bold" />
-                            </Expander.Header>
-                            <StackPanel Margin="0,14,0,0">
-                                <TextBlock Text="{x:Static props:Strings.FakeDataDescription}" Foreground="{StaticResource TextMutedBrush}" Margin="0,0,0,14" TextWrapping="Wrap" />
-                                <Button Content="{x:Static props:Strings.SimulateObs}" Command="{Binding SimulateObsScenarioCommand}" />
-                                <Button Content="{x:Static props:Strings.SimulateResource}" Command="{Binding SimulateResourceScenarioCommand}" Background="#A2B86C" BorderBrush="#A2B86C" />
-                                <Button Content="{x:Static props:Strings.SimulateNetwork}" Command="{Binding SimulateNetworkScenarioCommand}" Background="#6E9FA5" BorderBrush="#6E9FA5" />
-                            </StackPanel>
-                        </Expander>
-                    </Border>
-
-                    <Border Style="{StaticResource PanelStyle}">
-                        <Expander Foreground="{StaticResource TextPrimaryBrush}" IsExpanded="False">
-                            <Expander.Header>
-                                <TextBlock Text="{x:Static props:Strings.StatusLogHeader}" FontSize="22" FontWeight="Bold" />
-                            </Expander.Header>
-                            <ListView ItemsSource="{Binding StatusEntries}" Height="220" Margin="0,14,0,0">
+                    <Border Grid.Column="2" Style="{StaticResource PanelStyle}" Margin="0">
+                        <DockPanel>
+                            <TextBlock DockPanel.Dock="Top" Text="{x:Static props:Strings.StatusLogHeader}" Style="{StaticResource PanelHeaderStyle}" />
+                            <ListView ItemsSource="{Binding StatusEntries}">
                                 <ListView.ItemTemplate>
                                     <DataTemplate>
                                         <StackPanel Margin="0,0,0,8">
@@ -402,105 +701,10 @@
                                     </DataTemplate>
                                 </ListView.ItemTemplate>
                             </ListView>
-                        </Expander>
-                    </Border>
-                </StackPanel>
-            </ScrollViewer>
-
-            <Grid Grid.Column="2">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="290" />
-                    <RowDefinition Height="20" />
-                    <RowDefinition Height="*" />
-                </Grid.RowDefinitions>
-
-                <Border Grid.Row="0" Style="{StaticResource PanelStyle}">
-                    <DockPanel>
-                        <TextBlock DockPanel.Dock="Top" Text="{x:Static props:Strings.RecentIncidentsHeader}" FontSize="22" FontWeight="Bold" Margin="0,0,0,14" />
-                        <ListView ItemsSource="{Binding Incidents}" SelectedItem="{Binding SelectedIncident}" HorizontalContentAlignment="Stretch" ItemContainerStyle="{StaticResource GridViewItemStyle}">
-                            <ListView.View>
-                                <GridView>
-                                    <GridViewColumn Header="{x:Static props:Strings.MarkedColumn}" Width="150" DisplayMemberBinding="{Binding Marker.MarkedAt, StringFormat={}{0:yyyy-MM-dd HH:mm:ss}}" />
-                                    <GridViewColumn Header="{x:Static props:Strings.SeverityColumn}" Width="110" DisplayMemberBinding="{Binding Marker.Severity}" />
-                                    <GridViewColumn Header="{x:Static props:Strings.ServerColumn}" Width="110" DisplayMemberBinding="{Binding Environment.ServerProfileName}" />
-                                    <GridViewColumn Header="{x:Static props:Strings.SummaryColumn}" Width="680" DisplayMemberBinding="{Binding Analysis.Summary}" />
-                                </GridView>
-                            </ListView.View>
-                        </ListView>
-                    </DockPanel>
-                </Border>
-
-                <Grid Grid.Row="2">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="1.2*" />
-                        <ColumnDefinition Width="20" />
-                        <ColumnDefinition Width="1*" />
-                    </Grid.ColumnDefinitions>
-
-                    <Border Grid.Column="0" Style="{StaticResource PanelStyle}">
-                        <Grid>
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="120" />
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="*" />
-                            </Grid.RowDefinitions>
-
-                            <TextBlock Text="{x:Static props:Strings.IncidentSummaryHeader}" FontSize="22" FontWeight="Bold" />
-                            <TextBox Grid.Row="1" Text="{Binding SelectedIncidentSummary, Mode=OneWay}" Margin="0,14,0,18" IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" />
-
-                            <TextBlock Grid.Row="2" Text="{x:Static props:Strings.RankedHypothesesHeader}" FontSize="22" FontWeight="Bold" />
-                            <ListView Grid.Row="3" ItemsSource="{Binding SelectedHypotheses}" Margin="0,14,0,0">
-                                <ListView.ItemTemplate>
-                                    <DataTemplate>
-                                        <Border Background="#0F1B24" BorderBrush="#284052" BorderThickness="1" CornerRadius="12" Padding="14" Margin="0,0,0,10">
-                                            <StackPanel>
-                                                <DockPanel>
-                                                    <TextBlock Text="{Binding Category}" FontSize="18" FontWeight="Bold" />
-                                                    <TextBlock Text="{Binding Confidence, StringFormat={}{0:P0}}" Foreground="{StaticResource AccentBrush}" FontSize="18" HorizontalAlignment="Right" DockPanel.Dock="Right" />
-                                                </DockPanel>
-                                                <ItemsControl ItemsSource="{Binding Evidence}" Margin="0,10,0,0">
-                                                    <ItemsControl.ItemTemplate>
-                                                        <DataTemplate>
-                                                            <TextBlock Text="{Binding}" TextWrapping="Wrap" Margin="0,0,0,6" />
-                                                        </DataTemplate>
-                                                    </ItemsControl.ItemTemplate>
-                                                </ItemsControl>
-                                            </StackPanel>
-                                        </Border>
-                                    </DataTemplate>
-                                </ListView.ItemTemplate>
-                            </ListView>
-                        </Grid>
-                    </Border>
-
-                    <Border Grid.Column="2" Style="{StaticResource PanelStyle}" Background="{StaticResource PanelAltBrush}">
-                        <Grid>
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="*" />
-                            </Grid.RowDefinitions>
-
-                            <TextBlock Text="{x:Static props:Strings.TimelineHeader}" FontSize="22" FontWeight="Bold" />
-                            <ListView Grid.Row="1" ItemsSource="{Binding SelectedTimeline}" Margin="0,14,0,0">
-                                <ListView.ItemTemplate>
-                                    <DataTemplate>
-                                        <Border Background="#0F1B24" BorderBrush="#284052" BorderThickness="1" CornerRadius="12" Padding="12" Margin="0,0,0,10">
-                                            <StackPanel>
-                                                <DockPanel>
-                                                    <TextBlock Text="{Binding Timestamp, StringFormat={}{0:HH:mm:ss}}" Foreground="{StaticResource AccentBrush}" FontWeight="Bold" />
-                                                    <TextBlock Text="{Binding Category}" Foreground="{StaticResource AccentMutedBrush}" DockPanel.Dock="Right" />
-                                                </DockPanel>
-                                                <TextBlock Text="{Binding Summary}" TextWrapping="Wrap" Margin="0,8,0,0" />
-                                            </StackPanel>
-                                        </Border>
-                                    </DataTemplate>
-                                </ListView.ItemTemplate>
-                            </ListView>
-                        </Grid>
+                        </DockPanel>
                     </Border>
                 </Grid>
-            </Grid>
-        </Grid>
+            </TabItem>
+        </TabControl>
     </Grid>
 </Window>

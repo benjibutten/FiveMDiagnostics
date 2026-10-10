@@ -15,9 +15,8 @@ namespace FiveMDiagnostics.Integrations.Etw;
 /// </para>
 /// <para>
 /// Deliberately short. This is not a symbol server and it is not a list of every DLL on Windows; it is
-/// the six or seven names that decided an investigation, and each one earns its line by having been
-/// looked up during it. A module not in the list is printed as it comes, which is what the line did
-/// before.
+/// the names that decided an investigation, plus the AMD and Intel counterparts of its NVIDIA driver.
+/// A module not in the list is printed as it comes.
 /// </para>
 /// </remarks>
 internal static class ModuleGlossary
@@ -27,6 +26,12 @@ internal static class ModuleGlossary
         ["adhesive.dll"] = "FiveM:s anti-cheat",
         ["nvlddmkm.sys"] = "NVIDIA kärndrivrutin",
         ["nvwgf2umx.dll"] = "NVIDIA D3D-drivrutin",
+        ["amdkmdag.sys"] = "AMD kärndrivrutin",
+        ["atidxx64.dll"] = "AMD D3D-drivrutin",
+        ["amdxx64.dll"] = "AMD D3D-drivrutin",
+        ["igdkmd64.sys"] = "Intel kärndrivrutin",
+        ["igdkmdn64.sys"] = "Intel kärndrivrutin",
+        ["igd10iumd64.dll"] = "Intel D3D-drivrutin",
         ["d3d11.dll"] = "Direct3D 11 i användarläge",
         ["dxgkrnl.sys"] = "DirectX-kärnschemaläggare",
         ["dxgmms2.sys"] = "DirectX minneshanterare",

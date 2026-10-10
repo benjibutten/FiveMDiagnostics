@@ -1,7 +1,11 @@
 namespace FiveMDiagnostics.App.Wpf.Services;
 
 using System.Runtime.InteropServices;
+using System.Windows.Input;
 using System.Windows.Interop;
+
+using FiveMDiagnostics.App.Wpf.Properties;
+using FiveMDiagnostics.Core;
 
 /// <summary>Which mark a hotkey asked for.</summary>
 public enum HotkeyMark
@@ -18,19 +22,9 @@ public enum HotkeyMark
 /// </summary>
 /// <remarks>
 /// <para>
-/// The investigation's standing problem is that its main measurement does not measure what is
-/// experienced: seven evenings between 33 and 97 hitches per hour were all described as fine, and the
-/// evening that was visibly bad on stream had an ordinary hitch rate and an extraordinary tail. A mark
-/// pressed at the moment it stutters is the only reading that carries the experience, and it cannot be
-/// made from the app's own window — the game has focus, and alt-tabbing to click a button is itself a
-/// stutter.
-/// </para>
-/// <para>
-/// F13 and F14 are chosen because no keyboard has them. They exist in the virtual key table, Windows
-/// routes them, a stream deck can be told to send them, and nothing on the machine produces them by
-/// accident — which matters for a key that spends a few hundred megabytes of trace when it is pressed.
-/// Registered without modifiers for the same reason: a stream deck sends one key, and a combination
-/// would have to be held.
+/// A mark pressed at the moment it stutters is the only reading that carries what the player
+/// experienced, and it cannot be made from the app's own window — the game has focus, and alt-tabbing to
+/// click a button is itself a stutter.
 /// </para>
 /// <para>
 /// A registration can fail because another program holds the key, and that is reported rather than
@@ -41,10 +35,6 @@ public enum HotkeyMark
 public sealed class GlobalHotkeyService : IDisposable
 {
     private const int WmHotkey = 0x0312;
-
-    /// <summary>VK_F13 and VK_F14.</summary>
-    private const uint VkF13 = 0x7C;
-    private const uint VkF14 = 0x7D;
 
     /// <summary>MOD_NOREPEAT, so holding the key marks once rather than sixty times.</summary>
     private const uint ModNoRepeat = 0x4000;
@@ -65,53 +55,100 @@ public sealed class GlobalHotkeyService : IDisposable
     public string? RegistrationProblem { get; private set; }
 
     /// <summary>
-    /// Claims the keys against a window that already exists.
+    /// Claims <paramref name="keys"/> against a window that already exists, releasing any keys an
+    /// earlier call claimed. Problems are left in <see cref="RegistrationProblem"/>.
     /// </summary>
     /// <remarks>
     /// The handle has to be a real one, so this belongs after <c>SourceInitialized</c> — a WPF window
     /// has no HWND before that and <c>RegisterHotKey</c> would bind to zero, which registers a
     /// thread-wide hotkey whose messages nothing in this process ever pumps.
     /// </remarks>
-    public void Register(nint windowHandle)
+    public void Register(nint windowHandle, HotkeyOptions keys)
     {
-        if (_source is not null || windowHandle == 0)
+        if (windowHandle == 0)
         {
             return;
         }
 
-        _source = HwndSource.FromHwnd(windowHandle);
         if (_source is null)
         {
-            RegistrationProblem = "Snabbtangenterna kunde inte kopplas till fönstret.";
-            return;
+            _source = HwndSource.FromHwnd(windowHandle);
+            if (_source is null)
+            {
+                RegistrationProblem = Strings.HotkeyNoWindow;
+                return;
+            }
+
+            _source.AddHook(OnMessage);
         }
 
-        _source.AddHook(OnMessage);
+        Unregister();
 
-        var failed = new List<string>();
-
-        if (RegisterHotKey(windowHandle, StutterId, ModNoRepeat, VkF13))
+        var problems = new[]
         {
-            _registered.Add(StutterId);
-        }
-        else
+            Claim(windowHandle, StutterId, keys.Stutter),
+            Claim(windowHandle, SevereId, keys.Severe),
+        };
+
+        var said = problems.OfType<string>().ToArray();
+        RegistrationProblem = said.Length == 0 ? null : string.Join(" ", said);
+    }
+
+    /// <summary>
+    /// Reads a key gesture such as <c>Ctrl+Shift+F9</c> or <c>F13</c> into the modifier flags and
+    /// virtual key <c>RegisterHotKey</c> takes. False for text that is not a gesture.
+    /// </summary>
+    public static bool TryParse(string? text, out uint modifiers, out uint virtualKey)
+    {
+        modifiers = 0;
+        virtualKey = 0;
+        if (string.IsNullOrWhiteSpace(text))
         {
-            failed.Add("F13");
+            return false;
         }
 
-        if (RegisterHotKey(windowHandle, SevereId, ModNoRepeat, VkF14))
+        try
         {
-            _registered.Add(SevereId);
+            if (new KeyGestureConverter().ConvertFromInvariantString(text.Trim()) is not KeyGesture gesture)
+            {
+                return false;
+            }
+
+            // WPF's ModifierKeys and the MOD_ flags RegisterHotKey takes share their values.
+            modifiers = (uint)gesture.Modifiers;
+            virtualKey = (uint)KeyInterop.VirtualKeyFromKey(gesture.Key);
+            return virtualKey != 0;
         }
-        else
+        catch (NotSupportedException)
         {
-            failed.Add("F14");
+            return false;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    /// <returns>A sentence about what went wrong, or null when the key was claimed or none was set.</returns>
+    private string? Claim(nint windowHandle, int id, string gesture)
+    {
+        if (string.IsNullOrWhiteSpace(gesture))
+        {
+            return null;
         }
 
-        RegistrationProblem = failed.Count == 0
-            ? null
-            : $"Snabbtangent {string.Join(" och ", failed)} kunde inte registreras — någon annan app "
-                + "håller den. Markering från StreamDeck fungerar inte förrän den släpps.";
+        if (!TryParse(gesture, out var modifiers, out var virtualKey))
+        {
+            return string.Format(Strings.HotkeyUnparseableFormat, gesture);
+        }
+
+        if (!RegisterHotKey(windowHandle, id, modifiers | ModNoRepeat, virtualKey))
+        {
+            return string.Format(Strings.HotkeyTakenFormat, gesture);
+        }
+
+        _registered.Add(id);
+        return null;
     }
 
     private nint OnMessage(nint hwnd, int msg, nint wParam, nint lParam, ref bool handled)
@@ -138,7 +175,7 @@ public sealed class GlobalHotkeyService : IDisposable
         return 0;
     }
 
-    public void Dispose()
+    private void Unregister()
     {
         if (_source is null)
         {
@@ -151,6 +188,16 @@ public sealed class GlobalHotkeyService : IDisposable
         }
 
         _registered.Clear();
+    }
+
+    public void Dispose()
+    {
+        if (_source is null)
+        {
+            return;
+        }
+
+        Unregister();
         _source.RemoveHook(OnMessage);
         _source = null;
     }

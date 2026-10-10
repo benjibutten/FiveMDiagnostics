@@ -1,0 +1,52 @@
+<Window x:Class="FiveMDiagnostics.App.Wpf.SetupWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:props="clr-namespace:FiveMDiagnostics.App.Wpf.Properties"
+        Title="{x:Static props:Strings.SetupTitle}"
+        Width="620"
+        SizeToContent="Height"
+        ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner"
+        Background="{StaticResource ShellBrush}"
+        FontFamily="Bahnschrift SemiCondensed"
+        Icon="AppIcon.ico">
+    <StackPanel Margin="24">
+        <TextBlock Text="{x:Static props:Strings.SetupTitle}" FontSize="26" FontWeight="Bold" />
+        <TextBlock Text="{x:Static props:Strings.SetupIntro}" Foreground="#DBE9F4" TextWrapping="Wrap" Margin="0,8,0,18" />
+
+        <Border Style="{StaticResource CardStyle}">
+            <StackPanel>
+                <TextBlock Text="{x:Static props:Strings.SetupStreamQuestion}" FontWeight="SemiBold" FontSize="16" Margin="0,0,0,10" />
+                <RadioButton x:Name="StreamsYes" Content="{x:Static props:Strings.SetupStreamYes}" GroupName="Streams" />
+                <RadioButton x:Name="StreamsNo" Content="{x:Static props:Strings.SetupStreamNo}" GroupName="Streams" />
+                <TextBlock Text="{x:Static props:Strings.SetupStreamHint}" Style="{StaticResource FieldHintStyle}" Margin="0,2,0,0" />
+            </StackPanel>
+        </Border>
+
+        <Border Style="{StaticResource CardStyle}">
+            <StackPanel>
+                <TextBlock Text="{x:Static props:Strings.ReadinessAdminLabel}" Foreground="{StaticResource AccentMutedBrush}" FontWeight="SemiBold" />
+                <TextBlock x:Name="AdminText" TextWrapping="Wrap" Margin="0,4,0,0" />
+                <Button x:Name="RestartButton" Content="{x:Static props:Strings.RestartAsAdministrator}" Click="OnRestartClicked"
+                        HorizontalAlignment="Left" Margin="0,8,0,0" />
+            </StackPanel>
+        </Border>
+
+        <Border Style="{StaticResource CardStyle}">
+            <StackPanel>
+                <TextBlock Text="{x:Static props:Strings.PresentMonStatusLabel}" Foreground="{StaticResource AccentMutedBrush}" FontWeight="SemiBold" />
+                <TextBlock Text="{Binding PresentMonStatusText}" TextWrapping="Wrap" Margin="0,4,0,0" />
+            </StackPanel>
+        </Border>
+
+        <Border Style="{StaticResource CardStyle}">
+            <StackPanel>
+                <TextBlock Text="{x:Static props:Strings.HotkeysHeader}" Foreground="{StaticResource AccentMutedBrush}" FontWeight="SemiBold" />
+                <TextBlock Text="{Binding HotkeyHintText}" TextWrapping="Wrap" Margin="0,4,0,0" />
+                <TextBlock Text="{x:Static props:Strings.SetupHotkeysHint}" Style="{StaticResource FieldHintStyle}" Margin="0,4,0,0" />
+            </StackPanel>
+        </Border>
+
+        <Button Content="{x:Static props:Strings.SetupDone}" Click="OnDoneClicked" HorizontalAlignment="Right" Margin="0,8,0,0" />
+    </StackPanel>
+</Window>
