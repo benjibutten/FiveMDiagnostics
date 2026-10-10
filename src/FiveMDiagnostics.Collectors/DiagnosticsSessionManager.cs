@@ -86,6 +86,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
 
     /// <summary>What the previous session saw, read once at session start.</summary>
     private IReadOnlySet<string> _previousSessionProcessNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private HeavyProcessTally? _heavyProcesses;
     private DisplayCadenceMonitor? _displayCadence;
     private CaptureCostMonitor? _captureCost;
     private DeepCaptureLedger? _captureLedger;
@@ -476,6 +477,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _halfHourBreakdown = new HalfHourBreakdownMonitor(_hitchThreshold);
             _processNamesThisSession = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             _previousSessionProcessNames = PreviousSessionProcessLog.TryLoad(_settings.WorkingDirectory);
+            _heavyProcesses = new HeavyProcessTally();
             _previousSessionResources = PreviousSessionResourceLog.TryLoad(_settings.WorkingDirectory);
             _resourcesThisSession = [];
             _previousSessionTimeouts = PreviousSessionModelTimeoutLog.TryLoad(_settings.WorkingDirectory);
@@ -1416,6 +1418,12 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         if (_processNamesThisSession.Count > 0)
         {
             PreviousSessionProcessLog.Save(_settings.WorkingDirectory, _processNamesThisSession);
+        }
+
+        // Same rule: an empty tally would wipe the previous session's suggestions.
+        if (_heavyProcesses?.Results() is { Count: > 0 } heavy)
+        {
+            HeavyProcessTally.Save(_settings.WorkingDirectory, heavy);
         }
     }
 
@@ -2614,6 +2622,8 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _processNamesThisSession.Add(process.ProcessName);
         }
 
+        _heavyProcesses?.Observe(sample);
+
         if (_liveVram?.Observe(sample) is not { } snapshot)
         {
             return;
@@ -2679,6 +2689,7 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
                     // this path had a cadence of its own that started in the same second and wrote the
                     // same sentence a second later, all evening.
                     _systemMemory?.Observe(systemSample);
+                    _heavyProcesses?.Observe(systemSample);
                     _diskLatency?.Observe(systemSample.Timestamp, systemSample.WorstDiskInstance, systemSample.DiskAverageLatencyMs);
                     SystemTelemetryUpdated?.Invoke(this, systemSample);
                 }

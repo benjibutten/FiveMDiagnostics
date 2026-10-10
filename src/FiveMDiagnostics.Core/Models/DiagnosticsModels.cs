@@ -1,4 +1,5 @@
-﻿using System.Text.Json.Serialization;
+﻿using System.Globalization;
+using System.Text.Json.Serialization;
 
 namespace FiveMDiagnostics.Core;
 
@@ -1100,6 +1101,42 @@ public sealed record PrivacyOptions
     public bool IncludeAttachedArtifactsInExport { get; set; }
 }
 
+/// <summary>A program the launch button can close before FiveM starts.</summary>
+public sealed record PreLaunchAppEntry
+{
+    public string Name { get; set; } = string.Empty;
+
+    /// <summary>Every process name the program runs under; all of them are closed.</summary>
+    public List<string> ProcessNames { get; set; } = [];
+
+    /// <summary>Whether the program is ticked to be closed.</summary>
+    public bool Close { get; set; }
+}
+
+/// <summary>
+/// The global keys that mark a stutter while the game has focus, written as key gestures such as
+/// <c>F9</c> or <c>Ctrl+Shift+F9</c>. An empty key is not registered.
+/// </summary>
+/// <remarks>
+/// The initializers are what a settings file without this section gets: F13 and F14, which no keyboard
+/// has and a stream deck can send. A new install is given <see cref="DiagnosticsSettings.CreateDefault"/>'s
+/// single key.
+/// </remarks>
+public sealed record HotkeyOptions
+{
+    /// <summary>A light mark: the incident is recorded without a deep capture.</summary>
+    public string Stutter { get; set; } = "F13";
+
+    /// <summary>The mark the app offers by default: the incident and a deep capture of the seconds before it.</summary>
+    public string Severe { get; set; } = "F14";
+}
+
+/// <remarks>
+/// Where a property's initializer and <see cref="CreateDefault"/> disagree, the initializer is what a
+/// settings file written before the property existed is read with, and <see cref="CreateDefault"/> is a
+/// new install. An install that has been running keeps behaving as it did; a new one gets the defaults
+/// meant for someone starting out.
+/// </remarks>
 public sealed record DiagnosticsSettings
 {
     public string WorkingDirectory { get; set; } = string.Empty;
@@ -1136,21 +1173,44 @@ public sealed record DiagnosticsSettings
     public bool AutoSession { get; set; } = true;
 
     /// <summary>
-    /// The apps ticked for closing before FiveM is launched, by name. Null until the list is first
-    /// touched, so the app's own defaults apply rather than an empty choice nobody made.
+    /// Whether the player streams with OBS. Null until the setup guide has asked.
     /// </summary>
+    public bool? Streams { get; set; }
+
+    /// <summary>
+    /// Whether OBS and the stream stack are measured: true unless the player has said they do not
+    /// stream, so a settings file written before the question was asked keeps measuring them.
+    /// </summary>
+    [JsonIgnore]
+    public bool MeasuresStream => Streams != false;
+
+    /// <summary>
+    /// The player's own list of programs the launch button can close. Null in a settings file that only
+    /// has <see cref="PreLaunchClose"/>; the app then builds it from its starter list.
+    /// </summary>
+    public List<PreLaunchAppEntry>? PreLaunchApps { get; set; }
+
+    /// <summary>
+    /// Which of the starter list's programs were ticked, by name, in a settings file without
+    /// <see cref="PreLaunchApps"/>. Read once to build that list and then cleared.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<string>? PreLaunchClose { get; set; }
+
+    /// <summary>Extra command-line arguments FiveM is started with from the launch button.</summary>
+    public string FiveMLaunchArguments { get; set; } = "-pure_1";
+
+    public HotkeyOptions Hotkeys { get; set; } = new();
 
     /// <summary>
     /// Days of this app's own session output to keep in <see cref="WorkingDirectory"/>. Zero keeps
-    /// everything, which is what every version before this one did.
+    /// everything.
     /// </summary>
     /// <remarks>
-    /// Three days because the evening's files are copied to FindTheproblem the morning after, so the
-    /// originals have served their purpose by the second day — and because a session leaves several
-    /// gigabytes of deep captures behind, which is what makes the folder grow at all.
+    /// A session leaves several gigabytes of deep captures behind, which is what makes the folder grow
+    /// at all; a week leaves room to share an evening a few days after it happened.
     /// </remarks>
-    public int SessionRetentionDays { get; set; } = 3;
+    public int SessionRetentionDays { get; set; } = 7;
 
     public string Language { get; set; } = "en";
 
@@ -1162,6 +1222,10 @@ public sealed record DiagnosticsSettings
             WorkingDirectory = Path.Combine(root, "Sessions"),
             ExportDirectory = Path.Combine(root, "Exports"),
             ArtifactDirectory = Path.Combine(root, "Artifacts"),
+            PreLaunchApps = [],
+            FiveMLaunchArguments = string.Empty,
+            Hotkeys = new HotkeyOptions { Stutter = string.Empty, Severe = "F9" },
+            Language = CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "sv" ? "sv" : "en",
         };
     }
 }
