@@ -229,7 +229,7 @@ public sealed record FiveMClientConfig(string Path, DateTimeOffset LastWriteTime
 
         return $"Texturbudgeten är större än vad kortet klarar: spelet behöver "
             + $"{Gigabytes(needBytes)} ({Gigabytes(TextureBudgetBytes)} streamingbudget{overhead}), "
-            + $"men med {Gigabytes(reservedBytes)} upptaget av skrivbord och streamstack ryms bara "
+            + $"men med {Gigabytes(reservedBytes)} upptaget av skrivbordet och andra program ryms bara "
             + $"{Gigabytes(roomForGame)} under {bandPercent:F0} %. Det är "
             + $"{Gigabytes(needBytes - roomForGame)} för mycket, och spelet kommer att ta dem. "
             + $"{SuggestScale(roomForGame, overheadBytes)}";

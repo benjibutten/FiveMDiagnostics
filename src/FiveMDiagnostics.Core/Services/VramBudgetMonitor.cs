@@ -98,6 +98,8 @@ public sealed class VramBudgetMonitor
     /// </remarks>
     private const ulong MaterialOverheadBytes = 256UL * 1024 * 1024;
 
+    private readonly bool _measuresStream;
+
     private GpuTelemetrySample? _lastAdapter;
     private FiveMClientConfig? _clientConfig;
     private bool _reported;
@@ -217,6 +219,15 @@ public sealed class VramBudgetMonitor
     /// <summary>The state the recent samples agree on, which becomes the reported one once it holds.</summary>
     private bool _candidatePresent;
     private int _candidateSamples;
+
+    /// <param name="measuresStream">
+    /// Whether OBS's rows are split out as the stream stack. False counts them as desktop like any other
+    /// program, and the lines then never mention a stream.
+    /// </param>
+    public VramBudgetMonitor(bool measuresStream = true)
+    {
+        _measuresStream = measuresStream;
+    }
 
     /// <summary>Notes the most recent adapter reading, which the next process table is measured against.</summary>
     /// <remarks>
@@ -548,9 +559,10 @@ public sealed class VramBudgetMonitor
 
             // No stream stack transition can be pending here: TrackStreamStack was told to hold above,
             // so this branch never has one to prefix.
+            var parts = _measuresStream ? "spel, skrivbord och streamstack" : "spel och skrivbord";
             return new VramBudgetReport(
-                $"VRAM-budget: kan inte delas upp. {why}, och uppdelningen mellan spel, "
-                + $"skrivbord och streamstack finns inte att göra. Kortet står på {Gigabytes(usedBytes)} "
+                $"VRAM-budget: kan inte delas upp. {why}, och uppdelningen mellan {parts} "
+                + $"finns inte att göra. Kortet står på {Gigabytes(usedBytes)} "
                 + $"av {Gigabytes(totalBytes)} och den siffran gäller; rekommendationen om texturbudgeten "
                 + "hålls inne tills tabellen går ihop igen.",
                 DesktopBytes: 0,
@@ -572,7 +584,8 @@ public sealed class VramBudgetMonitor
         // The split is being made over a row the drift check still objects to, so the line has to say
         // which reading it rests on. It rests on the card.
         var offsetNote = gameRowDrifting
-            ? " Spelets rad räknas som driftande, men det den lämnar över — skrivbordet och streamstacken "
+            ? " Spelets rad räknas som driftande, men det den lämnar över — "
+                + (_measuresStream ? "skrivbordet och streamstacken " : "skrivbordet ")
                 + $"— har legat still inom {StableResidualSpreadBytes / 1024d / 1024 / 1024:F1} GB i "
                 + $"{StableResidualWindow.TotalMinutes:F0} minuter. En stabil differens är en känd offset "
                 + "och inte en drift, så uppdelningen görs mot kortets egen siffra."
@@ -619,14 +632,18 @@ public sealed class VramBudgetMonitor
             ? "Uppdelningen fungerar igen: processumman stämmer mot kortets egen siffra igen. "
             : string.Empty;
 
+        var reservedSplit = _measuresStream
+            ? $"skrivbordet håller {Gigabytes(desktopBytes)} och streamstacken {Gigabytes(streamBytes)}"
+            : $"skrivbordet och övriga program håller {Gigabytes(desktopBytes)}";
+        var stepUpSource = _measuresStream ? "de två första posterna" : "den första posten";
         var message =
-            $"{transition}{resumedNote}VRAM-budget: skrivbordet håller {Gigabytes(desktopBytes)} och streamstacken "
-            + $"{Gigabytes(streamBytes)}. Spelet håller nu {Gigabytes(gameBytes)} och ryms utan tryck upp till "
+            $"{transition}{resumedNote}VRAM-budget: {reservedSplit}. "
+            + $"Spelet håller nu {Gigabytes(gameBytes)} och ryms utan tryck upp till "
             + $"{Gigabytes(bandHeadroomBytes)}; kortets fysiska tak ger {Gigabytes(headroomBytes)}, men mätningarna "
             + $"säger att det börjar hacka redan när kortet passerar {VramPressureBandMonitor.BandPercent:F0} %. "
             + $"Kortet rapporterar {Gigabytes(usedBytes)} av {Gigabytes(totalBytes)} använt, alltså "
             + $"{Gigabytes(freeNowBytes)} ledigt just nu. Spelets tak sätts av texturinställningen; utrymme för "
-            + "ett steg upp tas ur de två första posterna, inte ur kortet.";
+            + $"ett steg upp tas ur {stepUpSource}, inte ur kortet.";
 
         // The ceiling the game was configured with, said next to the room it has. Six sessions inferred
         // this number from a plateau hours after the fact; it is a line in fivem.cfg and it can be
@@ -800,8 +817,8 @@ public sealed class VramBudgetMonitor
     /// The capture stack: the encoder and the browser sources it hosts, which are separate processes and
     /// separate rows.
     /// </summary>
-    private static bool IsStreamStack(GpuProcessMemoryUsage process) =>
-        process.ProcessName.StartsWith("obs", StringComparison.OrdinalIgnoreCase);
+    private bool IsStreamStack(GpuProcessMemoryUsage process) =>
+        _measuresStream && process.ProcessName.StartsWith("obs", StringComparison.OrdinalIgnoreCase);
 
     private static string Gigabytes(ulong bytes) => $"{bytes / 1024d / 1024 / 1024:F1} GB";
 }

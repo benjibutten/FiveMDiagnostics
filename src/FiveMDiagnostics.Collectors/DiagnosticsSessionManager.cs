@@ -461,9 +461,9 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
             _captureCost = new CaptureCostMonitor(_hitchThreshold);
             _captureLedger = new DeepCaptureLedger();
             _neighbourCpu = new NeighbourCpuTrendMonitor();
-            _obsVram = new ObsVramFootprintMonitor();
+            _obsVram = _settings.MeasuresStream ? new ObsVramFootprintMonitor() : null;
             _vramAccounting = new VramAccountingMonitor();
-            _vramBudget = new VramBudgetMonitor();
+            _vramBudget = new VramBudgetMonitor(_settings.MeasuresStream);
             _vramPressure = new VramPressureBandMonitor(_hitchThreshold);
             _postGameVram = new PostGameVramRelease();
             _slowFrameWaits = new SlowFrameWaitProfile();
