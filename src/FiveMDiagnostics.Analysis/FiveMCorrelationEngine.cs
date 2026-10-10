@@ -76,10 +76,11 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
     /// Short on purpose, like the glossary the traces' own summaries use. Two of these were measured on
     /// the blocking thread of 6 September — <c>d3d11.dll</c> at 12 % of its samples and
     /// <c>nvwgf2umx.dll</c> at 5 % — and the other two are where the same thread runs on a machine
-    /// presenting through D3D12 or DXGI. A module outside the list carries no signal either way.
+    /// presenting through D3D12 or DXGI. The vendor modules after them are the D3D11 user-mode drivers of
+    /// NVIDIA, AMD and Intel. A module outside the list carries no signal either way.
     /// </remarks>
     private static readonly string[] GraphicsDriverModules =
-        ["d3d11.dll", "d3d12.dll", "dxgi.dll", "nvwgf2umx.dll"];
+        ["d3d11.dll", "d3d12.dll", "dxgi.dll", "nvwgf2umx.dll", "atidxx64.dll", "amdxx64.dll", "igd10iumd64.dll"];
 
     /// <summary>Ceiling for a storage verdict backed by the disk counters that were supposed to measure it.</summary>
     private const double MeasuredConfidenceCeiling = 0.88;
