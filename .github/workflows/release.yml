@@ -89,6 +89,27 @@ jobs:
             throw "Expected published executable not found in $publishDir"
           }
 
+      - name: Bundle PresentMon
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $publishDir = Join-Path $PWD "artifacts/publish/$env:RUNTIME_ID"
+
+          # The version the CSV parser is verified against, pinned by hash so a changed upload
+          # cannot reach players.
+          $version = "2.4.1"
+          $expectedHash = "d74183e7ae630f72cd3690be0373ecbfdc6cbb86578148aab8fa2a7166068f34"
+          $exePath = Join-Path $publishDir "PresentMon.exe"
+
+          Invoke-WebRequest "https://github.com/GameTechDev/PresentMon/releases/download/v$version/PresentMon-$version-x64.exe" -OutFile $exePath
+          $hash = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $expectedHash)
+          {
+            throw "PresentMon $version hash mismatch: $hash"
+          }
+
+          Invoke-WebRequest "https://raw.githubusercontent.com/GameTechDev/PresentMon/v$version/LICENSE.txt" -OutFile (Join-Path $publishDir "PresentMon-LICENSE.txt")
+
       - name: Code sign executable (optional)
         if: ${{ env.WINDOWS_CODESIGN_CERT_PFX_BASE64 != '' && env.WINDOWS_CODESIGN_CERT_PASSWORD != '' }}
         shell: pwsh
