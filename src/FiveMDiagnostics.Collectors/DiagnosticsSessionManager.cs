@@ -3014,9 +3014,9 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
     /// says whether OBS was.
     /// </summary>
     /// <remarks>
-    /// The crash of 2026-09-12 had Steam's client loaded in the game, and closing Steam is the evening's
-    /// one change. Asked when the game appears rather than once at session start: the session outlives a
-    /// relaunch, and it is the state at launch that decides what FiveM loads.
+    /// A crash dump says whether Steam's client was loaded, and this is the same fact for an evening that
+    /// did not crash, so the two can be compared. Asked when the game appears rather than once at session
+    /// start: the session outlives a relaunch, and it is the state at launch that decides what FiveM loads.
     /// </remarks>
     private void ReportSteam(int gameProcessId)
     {
@@ -3030,11 +3030,9 @@ public sealed class DiagnosticsSessionManager : IDiagnosticStatusSink, IAsyncDis
         if (running)
         {
             Report(
-                StatusLevel.Warning,
+                StatusLevel.Info,
                 "Steam",
-                $"Steam körs: steam.exe fanns när spelet (PID {gameProcessId}) hittades. FiveM laddar då in Steams "
-                + "klient, och det är den kombination som hör till den kända kraschen i citizen-devtools.dll "
-                + "efter ungefär 20 minuter.");
+                $"Steam körs: steam.exe fanns när spelet (PID {gameProcessId}) hittades, så FiveM laddar in Steams klient.");
             return;
         }
 

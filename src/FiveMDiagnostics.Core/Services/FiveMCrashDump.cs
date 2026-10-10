@@ -77,16 +77,11 @@ public sealed record FiveMCrashDump(
 
         var thread = ThreadName is null ? string.Empty : $" (tråden \"{ThreadName}\")";
 
-        var verdict = (IsWatchdog, SteamClientLoaded) switch
-        {
-            (true, true) => " Det är FiveM:s watchdog och den kända Steam-kapplöpningen; Steam var inladdat.",
-
-            // The case the evening after 2026-09-12 is judged on, so it has to read as a different answer
-            // rather than as the same line with one word missing.
-            (true, false) => " Det är FiveM:s watchdog, men Steam var inte inladdat — Steam-förklaringen gäller inte den här kraschen.",
-            (false, true) => " Steam var inladdat.",
-            (false, false) => " Steam var inte inladdat.",
-        };
+        var watchdog = IsWatchdog
+            ? " Det är FiveM:s watchdog: spelet slutade svara och FiveM avslutade det med flit."
+            : string.Empty;
+        var steam = SteamClientLoaded ? " Steam var inladdat." : " Steam var inte inladdat.";
+        var verdict = watchdog + steam;
 
         var trap = IsEarlyExitTrap
             ? " Det är formen av FiveM:s early-exit trap: spelkoden gick själv in i sin avslutningsväg och "

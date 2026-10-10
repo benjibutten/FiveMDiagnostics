@@ -114,7 +114,7 @@ public sealed record AntiCheatCostReport(
     /// </remarks>
     public const double UnusualCores = 1.7;
 
-    /// <summary>True when the module held more than any measured session has shown it holding.</summary>
+    /// <summary>True when the module held more than the calibration traces ever showed it holding.</summary>
     public bool IsUnusual => MaxCores >= UnusualCores;
 
     public string Message
@@ -128,9 +128,8 @@ public sealed record AntiCheatCostReport(
                 : string.Empty;
 
             var verdict = IsUnusual
-                ? " Det är högre än någon tidigare mätt session och är värt att titta på."
-                : " Det är en fast avgift för att köra FiveM och ingen orsak till hitcharna — den ligger "
-                    + "lika högt i de lugna spåren som i de dåliga. Posten är därmed avförd.";
+                ? " Det är ovanligt högt för den modulen och värt att titta på."
+                : " Det är en fast avgift för att köra FiveM snarare än en orsak till hitchar.";
 
             return $"FiveM:s anti-cheat ({AntiCheatCostMonitor.Module}) höll {MinCores:F2}–{MaxCores:F2} "
                 + $"kärnor i {TracesWithModule} av {Traces} traces, median {MedianCores:F2}.{operations}{verdict}";
