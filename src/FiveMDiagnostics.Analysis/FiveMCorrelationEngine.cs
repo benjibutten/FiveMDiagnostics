@@ -1637,12 +1637,13 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
             }
         }
 
-        // A gateway probe is not a measurement of the path to the server. It is taken because the server
-        // refuses ICMP and something is better than four sessions of nothing, but every figure derived
-        // from it would be a claim about the wrong hop — so it is scored separately and never as the
-        // server.
+        // A reference probe is not a measurement of the path to the server. It is taken because the server
+        // usually refuses ICMP and something is better than four sessions of nothing, but every figure
+        // derived from it would be a claim about the wrong hop — so it is scored separately and never as
+        // the server.
         var serverProbes = probes.Where(item => !item.IsReferenceHost).ToArray();
-        var referenceProbes = probes.Where(item => item.IsReferenceHost).ToArray();
+        var referenceProbes = GatewayProbes(probes);
+        var internetProbes = InternetProbes(probes);
 
         var successfulProbes = serverProbes.Where(item => item.Success && item.RoundTripTimeMs is not null).ToArray();
         var failedProbes = serverProbes.Count(item => !item.Success);
@@ -1657,23 +1658,34 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         // CPU bound, so the probes are allowed to say nothing rather than to say the wrong thing.
         var probesNeverAnswered = serverProbes.Length > 0 && successfulProbes.Length == 0;
 
-        // The one thing the reference host can settle, and only in the negative direction: a gateway
-        // that stopped answering means the machine's own link went away, which is a far larger event
-        // than a game server hiccuping and is worth saying out loud.
-        var referenceFailures = referenceProbes.Count(item => !item.Success);
-        if (referenceFailures > 0 && referenceProbes.Length > 0)
+        // A lost connection is a far larger event than a game server hiccuping and is worth saying out loud,
+        // but only sustained silence counts. Scored on the longest stretch and not the share of the window:
+        // half a minute of nothing is a lost connection however calm the rest of the 90 seconds was, and one
+        // echo lost on a 300 ms timeout is not.
+        var gatewayFailures = referenceProbes.Count(item => !item.Success);
+        var gatewayWentSilent = ConnectionFaultReading.LongestFailureRun(referenceProbes) >= ConnectionFaultReading.SustainedFailures;
+        if (ConnectionFaultReading.ReadInternetLoss(referenceProbes, internetProbes) is { } loss)
         {
-            confidence += referenceFailures == referenceProbes.Length ? 0.35 : 0.2;
+            confidence += LostConnectionWeight(loss.LongestSilence);
             evidence.Add(
-                $"{referenceFailures} av {referenceProbes.Length} prober mot nätets egen gateway misslyckades under "
-                + "incidenten. Gatewayen är på samma kabel som datorn, så det gäller hela anslutningen och inte "
-                + "bara vägen till spelservern.");
+                $"{loss.Failures} av {loss.Probes} prober mot en extern adress misslyckades under incidenten, som mest "
+                + $"{loss.LongestRun} i rad. {ConnectionFaultReading.Describe(loss.Place)}");
         }
-        else if (referenceProbes.Length > 0)
+        else if (gatewayWentSilent && internetProbes.Length > 0)
         {
+            // Not scored. The connection demonstrably worked, so this says something about the gateway: one
+            // that has stopped answering ICMP, or an address the machine has moved away from.
             evidence.Add(
-                $"Alla {referenceProbes.Length} prober mot nätets egen gateway svarade, så det lokala nätet var uppe. "
-                + "Det säger ingenting om vägen till spelservern, som inte svarar på ICMP.");
+                $"{gatewayFailures} av {referenceProbes.Length} prober mot nätets egen gateway misslyckades, men en "
+                + "extern adress svarade under tiden, så det säger ingenting om anslutningen.");
+        }
+        else if (gatewayWentSilent)
+        {
+            confidence += LostConnectionWeight(ConnectionFaultReading.LongestSilence(referenceProbes));
+            evidence.Add(
+                $"{gatewayFailures} av {referenceProbes.Length} prober mot nätets egen gateway misslyckades under "
+                + "incidenten. Gatewayen är första steget ut från datorn, så det pekar på hela anslutningen och inte "
+                + "bara vägen till spelservern.");
         }
 
         if (maxRtt >= 120)
@@ -1698,6 +1710,22 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         {
             confidence += 0.05;
             evidence.Add("Aktiva remote endpoints fanns under incidenten.");
+        }
+
+        // Last, because the first line is what a verdict quotes as its reason, and "the gateway answered" is
+        // not a reason for anything.
+        if (referenceProbes.Length > 0 && gatewayFailures == 0)
+        {
+            evidence.Add(
+                $"Alla {referenceProbes.Length} prober mot nätets egen gateway svarade, så det lokala nätet var uppe. "
+                + "Det säger ingenting om vägen till spelservern.");
+        }
+
+        if (internetProbes.Length > 0 && internetProbes.All(item => item.Success))
+        {
+            evidence.Add(
+                $"Alla {internetProbes.Length} prober mot en extern adress svarade, så inget tyder på att "
+                + "internetanslutningen föll bort. Det säger ingenting om just vägen till spelservern.");
         }
 
         // A network incident should look like a healthy local machine that is nonetheless hitching.
@@ -2470,10 +2498,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         // the gateway's, and "RTT mot 192.168.1.1 nådde 41 ms" on the Network line reads as a
         // measurement of the connection to the server — which is the one thing it is not.
         AddProbeHighlight(highlights, probes.Where(item => !item.IsReferenceHost).ToArray(), "spelservern");
-        AddProbeHighlight(
-            highlights,
-            probes.Where(item => item.IsReferenceHost).ToArray(),
-            "nätets gateway (referens, inte spelservern)");
+        AddProbeHighlight(highlights, GatewayProbes(probes), GatewayProbeLabel);
+        AddProbeHighlight(highlights, InternetProbes(probes), InternetProbeLabel);
 
         var suspect = suspectedProcesses.FirstOrDefault();
         if (suspect is not null)
@@ -2703,12 +2729,19 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
     }
 
     /// <summary>Adds the worst probe of one host class to the timeline, named as that class.</summary>
+    /// <remarks>
+    /// A failed probe comes before any slow one. It has no round trip time, so ordering on that alone put
+    /// it below every probe that answered: a window where the connection went away for half a minute said
+    /// "RTT nådde 1 ms" and nothing else, and the failures only showed if not one probe had got through.
+    /// </remarks>
     private static void AddProbeHighlight(
         List<TimelineHighlight> highlights,
         IReadOnlyList<NetworkProbeSample> probes,
         string label)
     {
-        var probe = probes.OrderByDescending(item => item.RoundTripTimeMs ?? 0).FirstOrDefault();
+        var failed = probes.Where(item => !item.Success).OrderBy(item => item.Timestamp).ToArray();
+        var slowest = probes.Where(item => item.Success).MaxBy(item => item.RoundTripTimeMs ?? 0);
+        var probe = failed.FirstOrDefault() ?? slowest;
         if (probe is null)
         {
             return;
@@ -2716,7 +2749,8 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
 
         highlights.Add(new(probe.Timestamp, "Network", probe.Success
             ? $"RTT mot {label} ({probe.Host}) nådde {probe.RoundTripTimeMs:F0} ms."
-            : $"Probe mot {label} ({probe.Host}) misslyckades: {probe.FailureReason ?? "okänt fel"}."));
+            : $"{failed.Length} av {probes.Count} prober mot {label} ({probe.Host}) misslyckades: {probe.FailureReason ?? "okänt fel"}."
+                + (slowest is null ? string.Empty : $" De som svarade toppade på {slowest.RoundTripTimeMs:F0} ms.")));
     }
 
     /// <param name="secondPlace">
@@ -2908,9 +2942,52 @@ public sealed class FiveMCorrelationEngine : IAnalysisEngine, IWindowModeAwareAn
         // Said apart, always. A sentence that folds a gateway's RTT in with the server's reads as a
         // measurement of the connection to the server, and it is not one.
         var server = probes.Where(item => !item.IsReferenceHost).ToArray();
-        var reference = probes.Where(item => item.IsReferenceHost).ToArray();
+        var gateway = GatewayProbes(probes);
+        var internet = InternetProbes(probes);
 
-        return DescribeProbes(server, "nätprober") + DescribeProbes(reference, "prober mot nätets gateway (referens, inte spelservern)");
+        // The reference hosts only speak up when something failed. "Everything answered" goes on the timeline
+        // and in the evidence; here it would be two more sentences under every incident of an evening with a
+        // healthy connection, now that they are probed all session.
+        var gatewayFailed = gateway.Any(item => !item.Success);
+        var gatewayHint = gatewayFailed ? DescribeProbes(gateway, $"prober mot {GatewayProbeLabel}") : string.Empty;
+
+        // A silent gateway needs its answer beside it: on its own the sentence reads as a lost connection.
+        var internetHint = gatewayFailed || internet.Any(item => !item.Success)
+            ? DescribeProbes(internet, $"prober mot {InternetProbeLabel}")
+            : string.Empty;
+        var location = ConnectionFaultReading.ReadInternetLoss(gateway, internet) is { } loss
+            ? $" {ConnectionFaultReading.Describe(loss.Place)}"
+            : string.Empty;
+
+        return DescribeProbes(server, "nätprober") + gatewayHint + internetHint + location;
+    }
+
+    private const string GatewayProbeLabel = "nätets gateway (referens, inte spelservern)";
+
+    private const string InternetProbeLabel = "en extern adress (referens, inte spelservern)";
+
+    /// <summary>
+    /// What a lost connection adds to the network hypothesis, by how long it lasted.
+    /// </summary>
+    /// <remarks>
+    /// The long weight, with the endpoints that are nearly always present, clears the floor for a verdict,
+    /// which 20 seconds of total silence should. FiveM itself gives up after about 30. Three missed echoes
+    /// are six seconds and can be a full upload: at full weight they took the verdict from a window of
+    /// CPU-bound hitches, with the silence 40 seconds after the frame. They are evidence and not a verdict.
+    /// </remarks>
+    private static double LostConnectionWeight(TimeSpan silence)
+    {
+        return silence >= TimeSpan.FromSeconds(20) ? 0.35 : 0.2;
+    }
+
+    private static NetworkProbeSample[] GatewayProbes(IReadOnlyList<NetworkProbeSample> probes)
+    {
+        return probes.Where(item => item.IsReferenceHost && !item.IsInternetReference).ToArray();
+    }
+
+    private static NetworkProbeSample[] InternetProbes(IReadOnlyList<NetworkProbeSample> probes)
+    {
+        return probes.Where(item => item.IsInternetReference).ToArray();
     }
 
     private static string DescribeProbes(IReadOnlyList<NetworkProbeSample> probes, string label)

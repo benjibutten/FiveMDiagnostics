@@ -107,6 +107,8 @@ Clear it?</value></data>
   <data name="NetworkHintsDescription" xml:space="preserve"><value>Use these only if you want extra network context in the incident timeline.</value></data>
   <data name="ProbeHost" xml:space="preserve"><value>Ping host or IP (optional)</value></data>
   <data name="ProbeHostHint" xml:space="preserve"><value>Fill this in only if you know the game server host or IP and want ping samples. Otherwise leave it blank.</value></data>
+  <data name="InternetReferenceHost" xml:space="preserve"><value>Internet reference address</value></data>
+  <data name="InternetReferenceHostHint" xml:space="preserve"><value>A public IP address pinged during a session so a lost connection can be placed before or after your router, for example 1.1.1.1. Leave it empty to turn these pings off. Takes effect at the next session.</value></data>
   <data name="EndpointHint" xml:space="preserve"><value>Endpoint label (optional host:port)</value></data>
   <data name="EndpointHintDescription" xml:space="preserve"><value>Optional readable host:port label for detected connections. Leave blank if you are unsure.</value></data>
   <data name="AdvancedSettings" xml:space="preserve"><value>Advanced paths and tools</value></data>

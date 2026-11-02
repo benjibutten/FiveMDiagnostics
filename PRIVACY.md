@@ -13,6 +13,20 @@ FiveM Diagnostics is local-first by default.
 
 The app does not upload data to a cloud service by default.
 
+## What leaves your computer
+
+During a session the app pings (ICMP echo) about every two seconds. The pings carry no data about you, but
+whoever receives one over the internet sees your public IP address. They go to:
+
+- the game server the game is connected to, or the probe host you set
+- your network's own gateway, which is normally your router
+- the *Internet reference address* under the optional network hints, so a lost connection can be placed
+  before or after your router. A new install starts with `1.1.1.1`, Cloudflare's public DNS address, and an
+  install updated from an earlier version starts with it empty. To stop these pings, empty the field and
+  save the settings. The change takes effect at the next session.
+
+The app also asks GitHub whether a newer version exists, at most once every 12 hours.
+
 ## What can be collected
 
 - local machine metadata such as OS version, CPU, GPU, memory and display refresh rate

@@ -32,7 +32,7 @@ stopped until that game process exits.
 | NVML (NVIDIA only) | GPU load, memory bandwidth, VRAM used, encoder and decoder load, temperature, throttle reasons |
 | Windows performance counters | CPU per core, memory, paging, disk latency and queue length, VRAM per process on any GPU |
 | Process table | The game's CPU and memory, and the busiest other processes |
-| Network | The game's TCP endpoints and UDP ports, and ping to the server |
+| Network | The game's TCP endpoints and UDP ports, and ping to the server, the gateway and an internet address |
 | Window focus | Whether the game had focus, and which window took it |
 | OBS WebSocket (when streaming) | Render and encoding lag, skipped frames, stream drops |
 | WPR (administrator) | Deep capture traces around incidents |
@@ -417,6 +417,31 @@ to the same host, preferring port 30120. Set `ServerProfile.ProbeHost` if it pic
 
 Many game servers do not answer ping. After 30 failures in a row the app stops pinging that host for the
 session and says so once, rather than in every incident.
+
+Two more hosts are pinged for reference for the whole session, including while the game restarts: the
+gateway on the route out to the internet, and the *Internet reference address* under the optional network
+hints. That address has to be a public IP address. A new install starts with `1.1.1.1`, an install updated
+from an earlier version starts with it empty, and an empty field turns those pings off. Neither host says
+anything about the path to the server, and every report labels them so.
+
+Three missed pings in a row against the internet address count as a lost connection. The session log gets
+a warning, and a second line gives the length when it answers again. What the gateway did during those
+same seconds says where it points:
+
+| Gateway during the silence | Points to |
+|---|---|
+| Kept answering, apart from a stray miss | The router's internet connection, the modem, the operator, or the way to that address |
+| Three misses in a row, or at least half of them | The computer, the way to the router, or the router itself |
+| Not measured, or the route goes through a VPN | Cannot say |
+
+Incidents read it by the same rule. A silence of 20 seconds or more weighs enough to reach a verdict, and a
+shorter one is evidence only. It points rather than proves: one address cannot tell a lost connection from a
+fault on the way to that address, or from an upload so full that echoes take over a second.
+
+A reference host that has never answered is not evidence, because plenty of routers and firewalls drop
+ping. Its failures are not recorded, and after 30 it is only tried now and then, since the other reason for
+the silence is a session started during an outage. Gateway failures count against the connection only when
+there is no internet address to compare with: if that address answered, the connection was working.
 
 For better network evidence, import a `net_statsFile` CSV on the *Incidents* tab. Its ping, jitter and loss
 outweigh the ping probe, and a healthy file counts as evidence against a network cause. An incident that

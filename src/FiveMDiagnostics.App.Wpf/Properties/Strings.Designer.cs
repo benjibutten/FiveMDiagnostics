@@ -80,6 +80,8 @@ public static class Strings
     public static string ServerProfileHint => ResourceManager.GetString("ServerProfileHint", Culture) ?? "Only used as a label in the incident list and exports.";
     public static string ProbeHost => ResourceManager.GetString("ProbeHost", Culture) ?? "Probe host / IP";
     public static string ProbeHostHint => ResourceManager.GetString("ProbeHostHint", Culture) ?? "Fill this in only if you know the game server host or IP and want ping samples.";
+    public static string InternetReferenceHost => ResourceManager.GetString("InternetReferenceHost", Culture) ?? "Internet reference address";
+    public static string InternetReferenceHostHint => ResourceManager.GetString("InternetReferenceHostHint", Culture) ?? "A public IP address pinged during a session so a lost connection can be placed before or after your router, for example 1.1.1.1. Leave it empty to turn these pings off.";
     public static string EndpointHint => ResourceManager.GetString("EndpointHint", Culture) ?? "Endpoint hint (optional host:port)";
     public static string EndpointHintDescription => ResourceManager.GetString("EndpointHintDescription", Culture) ?? "Optional readable host:port label for detected connections. Leave blank if you are unsure.";
     public static string NetworkHintsHeader => ResourceManager.GetString("NetworkHintsHeader", Culture) ?? "Optional network hints";

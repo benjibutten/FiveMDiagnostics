@@ -566,6 +566,9 @@
                                         <TextBlock Text="{x:Static props:Strings.ProbeHost}" Style="{StaticResource FieldLabelStyle}" />
                                         <TextBox Text="{Binding ProbeHost, UpdateSourceTrigger=PropertyChanged}" />
                                         <TextBlock Text="{x:Static props:Strings.ProbeHostHint}" Style="{StaticResource FieldHintStyle}" />
+                                        <TextBlock Text="{x:Static props:Strings.InternetReferenceHost}" Style="{StaticResource FieldLabelStyle}" />
+                                        <TextBox Text="{Binding InternetReferenceHost, UpdateSourceTrigger=PropertyChanged}" />
+                                        <TextBlock Text="{x:Static props:Strings.InternetReferenceHostHint}" Style="{StaticResource FieldHintStyle}" />
                                         <TextBlock Text="{x:Static props:Strings.EndpointHint}" Style="{StaticResource FieldLabelStyle}" />
                                         <TextBox Text="{Binding EndpointHint, UpdateSourceTrigger=PropertyChanged}" />
                                         <TextBlock Text="{x:Static props:Strings.EndpointHintDescription}" Style="{StaticResource FieldHintStyle}" />

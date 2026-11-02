@@ -1157,6 +1157,17 @@ public sealed record DiagnosticsSettings
     public TimeSpan ProcessPollingInterval { get; set; } = TimeSpan.FromMilliseconds(500);
     public TimeSpan SystemPollingInterval { get; set; } = TimeSpan.FromMilliseconds(750);
     public TimeSpan NetworkPollingInterval { get; set; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// IP address on the internet pinged during a session, so a lost connection can be placed on one side
+    /// of the router or the other. Empty turns the pings off. Read when a session starts.
+    /// </summary>
+    /// <remarks>
+    /// Empty for a settings file written before this existed and set by <see cref="CreateDefault"/>: an
+    /// update must not start contacting a third party on its own. PRIVACY.md says what the pings send.
+    /// </remarks>
+    public string? InternetReferenceHost { get; set; }
+
     public ServerProfile ServerProfile { get; set; } = new();
     public PresentMonOptions PresentMon { get; set; } = new();
     public GpuOptions Gpu { get; set; } = new();
@@ -1225,6 +1236,7 @@ public sealed record DiagnosticsSettings
             PreLaunchApps = [],
             FiveMLaunchArguments = string.Empty,
             Hotkeys = new HotkeyOptions { Stutter = string.Empty, Severe = "F9" },
+            InternetReferenceHost = "1.1.1.1",
             Language = CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "sv" ? "sv" : "en",
         };
     }
@@ -1674,9 +1686,14 @@ public sealed record NetworkEndpointSample(
     IReadOnlyList<int> UdpLocalPorts) : TelemetryEvent(Timestamp, "Network");
 
 /// <param name="IsReferenceHost">
-/// True when the host is a stand-in rather than the game server — the default gateway, probed because
-/// the server does not answer ICMP at all. Such a probe says whether the local network was healthy and
-/// nothing whatsoever about the path to the server, and every report that quotes it has to say so.
+/// True when the host is a stand-in rather than the game server — the default gateway or an address on
+/// the internet. Such a probe says whether the connection was healthy and nothing whatsoever about the
+/// path to the server, and every report that quotes it has to say so.
+/// </param>
+/// <param name="IsInternetReference">
+/// True when that stand-in is the address on the internet rather than the gateway, always together with
+/// <paramref name="IsReferenceHost"/>. Read against the gateway it says which side of the router a fault
+/// is on, and in a redacted export this flag is all that tells the two apart.
 /// </param>
 public sealed record NetworkProbeSample(
     DateTimeOffset Timestamp,
@@ -1684,7 +1701,8 @@ public sealed record NetworkProbeSample(
     double? RoundTripTimeMs,
     bool Success,
     string? FailureReason = null,
-    bool IsReferenceHost = false) : TelemetryEvent(Timestamp, "Probe");
+    bool IsReferenceHost = false,
+    bool IsInternetReference = false) : TelemetryEvent(Timestamp, "Probe");
 
 /// <summary>
 /// Which window owned the foreground, and therefore whether the frames around this moment were frames

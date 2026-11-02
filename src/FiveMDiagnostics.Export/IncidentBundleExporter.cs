@@ -336,6 +336,7 @@ public sealed class IncidentBundleExporter : IIncidentExporter
                 // Which host this was. Without it the export is a column of RTTs against hostnames the
                 // reader has to recognise, and the gateway reads as one more measurement of the server.
                 ("isReferenceHost", probe.IsReferenceHost.ToString()),
+                ("isInternetReference", probe.IsInternetReference.ToString()),
             ],
             ArtifactEvidence artifact =>
             [

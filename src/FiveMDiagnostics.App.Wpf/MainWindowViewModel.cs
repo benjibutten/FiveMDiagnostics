@@ -86,6 +86,7 @@ public sealed class MainWindowViewModel : ObservableObject
     private string _activeProcessText = Strings.WaitingForProcess;
     private string _serverProfileName = string.Empty;
     private string? _probeHost;
+    private string? _internetReferenceHost;
     private string? _endpointHint;
     private string? _presentMonExecutablePath;
     private string _exportDirectory = string.Empty;
@@ -140,6 +141,7 @@ public sealed class MainWindowViewModel : ObservableObject
 
         _serverProfileName = settings.ServerProfile.Name;
         _probeHost = settings.ServerProfile.ProbeHost;
+        _internetReferenceHost = settings.InternetReferenceHost;
         _endpointHint = settings.ServerProfile.EndpointHint;
         _presentMonExecutablePath = settings.PresentMon.ExecutablePath;
         _exportDirectory = settings.ExportDirectory;
@@ -540,6 +542,18 @@ public sealed class MainWindowViewModel : ObservableObject
             if (SetProperty(ref _probeHost, value))
             {
                 Settings.ServerProfile.ProbeHost = value;
+            }
+        }
+    }
+
+    public string? InternetReferenceHost
+    {
+        get => _internetReferenceHost;
+        set
+        {
+            if (SetProperty(ref _internetReferenceHost, value))
+            {
+                Settings.InternetReferenceHost = value;
             }
         }
     }

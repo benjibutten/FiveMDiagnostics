@@ -107,6 +107,8 @@ Rensa?</value></data>
   <data name="NetworkHintsDescription" xml:space="preserve"><value>Använd bara de här om du vill få extra nätverkskontext i incidenttidslinjen.</value></data>
   <data name="ProbeHost" xml:space="preserve"><value>Pingvärd eller IP (valfritt)</value></data>
   <data name="ProbeHostHint" xml:space="preserve"><value>Fyll bara i detta om du känner till spelserverns värdnamn eller IP och vill samla pingprov. Annars lämnar du det tomt.</value></data>
+  <data name="InternetReferenceHost" xml:space="preserve"><value>Referensadress på internet</value></data>
+  <data name="InternetReferenceHostHint" xml:space="preserve"><value>En publik IP-adress som pingas under sessionen så att ett tappat nät kan placeras före eller efter routern, till exempel 1.1.1.1. Lämna fältet tomt för att stänga av de här pingarna. Gäller från nästa session.</value></data>
   <data name="EndpointHint" xml:space="preserve"><value>Endpoint-etikett (valfritt värd:port)</value></data>
   <data name="EndpointHintDescription" xml:space="preserve"><value>Valfri läsbar värd:port-etikett för upptäckta anslutningar. Lämna tomt om du är osäker.</value></data>
   <data name="AdvancedSettings" xml:space="preserve"><value>Avancerade sökvägar och verktyg</value></data>
